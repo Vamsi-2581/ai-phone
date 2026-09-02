@@ -57,8 +57,10 @@ class TurnController:
 
     # ---- generation bookkeeping ---------------------------------------------------------------
     def _new_gen(self) -> int:
-        g = self.stt.next_gen()
-        assert self.llm.next_gen() == g and self.tts.next_gen() == g
+        """One shared generation across all three workers (their counters may differ: cached phrases use TTS alone)."""
+        g = max(self.stt.current_gen, self.llm.current_gen, self.tts.current_gen) + 1
+        for c in (self.stt, self.llm, self.tts):
+            c.set_gen(g)
         return g
 
     def request_end(self, reason: str) -> None:

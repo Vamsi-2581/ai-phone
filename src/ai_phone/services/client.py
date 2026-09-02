@@ -30,6 +30,10 @@ class WorkerClient:
     def gen_is_current(self, gen: int) -> bool:
         return gen == self._gen
 
+    def set_gen(self, gen: int) -> None:
+        """Align this worker's current generation with the others (the controller owns the shared counter)."""
+        self._gen = gen
+
     async def start(self) -> dict:
         self._proc = self._ctx.Process(
             target=run_worker, name=f"{self.kind}-worker", daemon=True,
