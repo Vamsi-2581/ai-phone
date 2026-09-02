@@ -1,0 +1,44 @@
+"""AudioMediaPort → rings. Runs on PJSIP's media thread: copy bytes, stamp times, nothing else."""
+from __future__ import annotations
+
+import time
+
+from ai_phone.telephony.pj import pj
+from ai_phone.telephony.rings import FRAME_BYTES, SILENCE, FrameRing
+
+
+class RingMediaPort(pj.AudioMediaPort):
+    def __init__(self, rx: FrameRing, tx: FrameRing, echo: bool = False):
+        super().__init__()
+        self.rx, self.tx, self.echo = rx, tx, echo
+        self.last_rx_ns = 0
+        self.first_nonsilent_ns: int | None = None
+        self._armed = False
+        fmt = pj.MediaFormatAudio()
+        fmt.type = pj.PJMEDIA_TYPE_AUDIO
+        fmt.clockRate = 16000
+        fmt.channelCount = 1
+        fmt.bitsPerSample = 16
+        fmt.frameTimeUsec = 20000
+        fmt.avgBps = fmt.maxBps = 16000 * 16
+        self.createPort("ai-phone", fmt)
+
+    def arm_t5(self) -> None:
+        self.first_nonsilent_ns = None
+        self._armed = True
+
+    def onFrameReceived(self, frame) -> None:
+        data = bytes(frame.buf)
+        if len(data) != FRAME_BYTES:
+            data = (data + SILENCE)[:FRAME_BYTES]
+        self.last_rx_ns = time.monotonic_ns()
+        (self.tx if self.echo else self.rx).push(data)
+
+    def onFrameRequested(self, frame) -> None:
+        data = self.tx.pop_or_silence()
+        if self._armed and data != SILENCE:
+            self.first_nonsilent_ns = time.monotonic_ns()
+            self._armed = False
+        frame.type = pj.PJMEDIA_FRAME_TYPE_AUDIO
+        frame.buf = pj.ByteVector(data)
+        frame.size = len(data)
