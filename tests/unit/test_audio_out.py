@@ -18,4 +18,6 @@ def test_framer_carries_remainder_between_feeds():
     a = f.feed(np.zeros(100, np.float32))
     b = f.feed(np.zeros(500, np.float32))
     c = f.flush()
-    assert a == [] and len(b) == 1 and len(c) == 1
+    # 600 samples at 24 kHz -> 400 at 16 kHz -> one full frame plus one padded frame; a streaming
+    # resampler may hold samples back (filter delay), so only the total is invariant
+    assert a == [] and len(b) + len(c) == 2 and all(len(x) == 640 for x in b + c)
