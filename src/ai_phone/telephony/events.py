@@ -31,3 +31,10 @@ class RegState:
     active: bool
     code: int
     reason: str
+
+
+@dataclass(frozen=True)
+class CallRejected:
+    call_id: int
+    source_ip: str
+    code: int  # 403 Forbidden or 486 Busy Here

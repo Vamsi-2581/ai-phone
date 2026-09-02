@@ -59,10 +59,12 @@ class AiAccount(pj.Account):
         if not source_allowed(t.cfg.sip.accept_invites_from, source_ip, t.cfg.sip.trusted_peers, t.registrar_ip):
             op.statusCode = pj.PJSIP_SC_FORBIDDEN
             call.hangup(op)
+            _post(self.loop, self.events, ev.CallRejected(prm.callId, source_ip, 403))
             return
         if t.current_call is not None:
             op.statusCode = pj.PJSIP_SC_BUSY_HERE
             call.hangup(op)
+            _post(self.loop, self.events, ev.CallRejected(prm.callId, source_ip, 486))
             return
         t.current_call = call
         op.statusCode = pj.PJSIP_SC_RINGING
