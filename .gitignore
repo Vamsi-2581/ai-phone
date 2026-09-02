@@ -1,0 +1,45 @@
+# Runtime state lives in ~/.ai-phone by default; never commit it if it lands here
+.ai-phone/
+config.yaml
+*.local.yaml
+
+# Model weights (fetched by `ai-phone doctor --fetch`)
+models/
+*.safetensors
+*.gguf
+*.npz
+*.onnx
+*.bin
+
+# Logs and per-turn latency records
+logs/
+*.log
+turns.jsonl
+
+# Audio captures and test recordings
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# Build output (the SIP extension is built into the wheel, not committed)
+build/
+dist/
+*.egg-info/
+*.so
+*.dylib
+native/pjsua2/pjproject-*/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# Review records are kept locally, outside the repository
+docs/reviews/
