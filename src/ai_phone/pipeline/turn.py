@@ -1,0 +1,172 @@
+"""TurnController: owns one call's conversation. GREETING → LISTENING → THINKING → SPEAKING → LISTENING.
+
+Runs a 5 ms asyncio loop that drains caller audio into the endpointer, pumps TTS frames to the
+outbound ring, and applies worker events. Every generation carries a gen_id shared by all three
+workers; anything tagged with a stale gen_id is dropped on receipt by the WorkerClient.
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import Callable, Protocol
+
+import numpy as np
+
+from ai_phone.config import ConversationConfig
+from ai_phone.pipeline.chunker import ClauseChunker
+from ai_phone.pipeline.timing import TurnTimer
+from ai_phone.pipeline.vad import Endpointer, SpeechChunk, SpeechEnd, SpeechStart
+from ai_phone.services.client import WorkerClient
+from ai_phone.telephony.rings import FrameRing
+
+
+class PortLike(Protocol):
+    first_nonsilent_ns: int | None
+
+    def arm_t5(self) -> None: ...
+
+
+class TurnController:
+    def __init__(self, cfg: ConversationConfig, port: PortLike, stt: WorkerClient, llm: WorkerClient, tts: WorkerClient,
+                 rx: FrameRing, tx: FrameRing, stt_in: FrameRing, tts_out: FrameRing, endpointer: Endpointer,
+                 greeting_frames: list[bytes], system_prompt: str, on_turn: Callable[[TurnTimer], None]):
+        self.cfg, self.port, self.stt, self.llm, self.tts = cfg, port, stt, llm, tts
+        self.rx, self.tx, self.stt_in, self.tts_out, self.ep = rx, tx, stt_in, tts_out, endpointer
+        self.greeting, self.system_prompt, self.on_turn = greeting_frames, system_prompt, on_turn
+        self.state = "GREETING"
+        self.history: list[dict] = []
+        self.timer: TurnTimer | None = None
+        self.chunker = ClauseChunker()
+        self._pending_stt = 0
+        self._seq = 0
+        self._tts_done_seq = -1
+        self._llm_done = False
+        self._reply_parts: list[str] = []
+        self.end_reason: str | None = None
+        self.last_activity_ns = time.monotonic_ns()
+        self.hangup_requested = asyncio.Event()
+
+    # ---- generation bookkeeping ---------------------------------------------------------------
+    def _new_gen(self) -> int:
+        g = self.stt.next_gen()
+        assert self.llm.next_gen() == g and self.tts.next_gen() == g
+        return g
+
+    def request_end(self, reason: str) -> None:
+        self.end_reason = reason
+        self.state = "ENDING"
+        self.hangup_requested.set()
+
+    # ---- main loop ----------------------------------------------------------------------------
+    async def run(self, stop: asyncio.Event) -> None:
+        for f in self.greeting:
+            self.tx.push(f)
+        self._new_gen()
+        while not stop.is_set() and self.state != "ENDING":
+            now = time.monotonic_ns()
+            while (f := self.rx.pop()) is not None:
+                self._on_frame(f, now)
+            self._pump_tts_out()
+            self._drain_worker_events()
+            if self.state == "GREETING" and self.tx.available() == 0:
+                self.state = "LISTENING"
+                self.last_activity_ns = now
+            if self.state == "SPEAKING" and self._llm_done and self._tts_done_seq >= self._seq - 1 and self.tx.available() == 0:
+                self._finish_turn()
+            await asyncio.sleep(0.005)
+
+    # ---- inbound audio ------------------------------------------------------------------------
+    def _on_frame(self, frame: bytes, t_ns: int) -> None:
+        for e in self.ep.feed(frame, t_ns):
+            if isinstance(e, SpeechStart):
+                self.last_activity_ns = t_ns
+                if self.state == "LISTENING":
+                    self.timer = TurnTimer(gen=self.stt.current_gen)
+            elif isinstance(e, SpeechChunk) and self.state == "LISTENING":
+                self.stt_in.push((np.clip(e.pcm_f32, -1, 1) * 32767).astype("<i2").tobytes())
+                self._pending_stt += 1
+                if self._pending_stt >= 10:
+                    self._flush_stt_push()
+            elif isinstance(e, SpeechEnd) and self.state == "LISTENING":
+                self._flush_stt_push()
+                if self.timer is None:
+                    self.timer = TurnTimer(gen=self.stt.current_gen)
+                self.timer.t0 = e.t0_ns
+                self.stt.send({"op": "stt.finalize", "gen": self.stt.current_gen})
+                self.state = "THINKING"
+
+    def _flush_stt_push(self) -> None:
+        if self._pending_stt:
+            self.stt.send({"op": "stt.push", "gen": self.stt.current_gen, "nframes": self._pending_stt})
+            self._pending_stt = 0
+
+    # ---- worker events ------------------------------------------------------------------------
+    def _drain_worker_events(self) -> None:
+        for client in (self.stt, self.llm, self.tts):
+            while not client.events.empty():
+                self._on_event(client.events.get_nowait())
+
+    def _on_event(self, m: dict) -> None:
+        ev, now = m["ev"], time.monotonic_ns()
+        if ev == "error":
+            self.request_end(f"worker error: {m['message'][:200]}")
+            return
+        if self.timer is None or m.get("gen") != self.timer.gen:
+            return
+        if ev == "final":
+            self.timer.t1 = now
+            self.timer.stt_text = m["text"]
+            self.timer.worker_timings.update(m.get("timings", {}))
+            if not m["text"].strip():
+                self.state = "LISTENING"
+                self.timer = None
+                return
+            self.history.append({"role": "user", "content": m["text"]})
+            msgs = [{"role": "system", "content": self.system_prompt}] + self.history[-2 * self.cfg.history_turns:]
+            self._seq, self._tts_done_seq, self._llm_done, self._reply_parts = 0, -1, False, []
+            self.chunker = ClauseChunker()
+            self.port.arm_t5()
+            self.llm.send({"op": "llm.generate", "gen": self.timer.gen, "messages": msgs, "max_tokens": self.cfg.max_tokens})
+        elif ev == "token":
+            if self.timer.t2 is None:
+                self.timer.t2 = now
+            self._reply_parts.append(m["text"])
+            for unit in self.chunker.feed(m["text"]):
+                self._send_tts(unit, now)
+        elif ev == "done" and m["kind"] == "llm":
+            self.timer.worker_timings.update({f"llm_{k}": v for k, v in m.get("timings", {}).items()})
+            for unit in self.chunker.flush():
+                self._send_tts(unit, now)
+            self._llm_done = True
+            if self._seq == 0:
+                self._finish_turn()  # the model said nothing
+        elif ev == "chunk":
+            if self.timer.t4 is None:
+                self.timer.t4 = now
+            self.state = "SPEAKING"
+        elif ev == "done" and m["kind"] == "tts":
+            self._tts_done_seq = max(self._tts_done_seq, m["seq"])
+
+    def _send_tts(self, unit: str, now: int) -> None:
+        if self.timer.t3 is None:
+            self.timer.t3 = now
+        self.tts.send({"op": "tts.synth", "gen": self.timer.gen, "seq": self._seq, "text": unit})
+        self._seq += 1
+
+    def _pump_tts_out(self) -> None:
+        while (f := self.tts_out.pop()) is not None:
+            self.tx.push(f)
+        if self.timer is not None and self.timer.t5 is None and self.port.first_nonsilent_ns:
+            self.timer.t5 = self.port.first_nonsilent_ns
+
+    def _finish_turn(self) -> None:
+        t = self.timer
+        t.reply_text = "".join(self._reply_parts).strip()
+        t.rx_overruns, t.tx_underruns = self.rx.overruns, self.tx.underruns
+        if t.reply_text:
+            self.history.append({"role": "assistant", "content": t.reply_text})
+        self.on_turn(t)
+        self.timer = None
+        self.last_activity_ns = time.monotonic_ns()
+        self._new_gen()
+        self.state = "LISTENING"
