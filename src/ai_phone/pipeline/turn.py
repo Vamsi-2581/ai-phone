@@ -225,7 +225,9 @@ class TurnController:
     def _pump_tts_out(self) -> None:
         while (f := self.tts_out.pop()) is not None:
             self.tx.push(f)
-        if self.timer is not None and self.timer.t5 is None and self.port.first_nonsilent_ns:
+        # accept the port's stamp only once this turn has sent TTS (t3), so a previous turn's stamp is never reused
+        if (self.timer is not None and self.timer.t5 is None and self.timer.t3 is not None
+                and self.port.first_nonsilent_ns and self.port.first_nonsilent_ns >= self.timer.t3):
             self.timer.t5 = self.port.first_nonsilent_ns
 
     def _finish_turn(self) -> None:
