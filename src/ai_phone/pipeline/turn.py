@@ -13,6 +13,7 @@ from typing import Callable, Protocol
 import numpy as np
 
 from ai_phone.config import ConversationConfig
+from ai_phone.pipeline.bargein import BargeInDetector
 from ai_phone.pipeline.chunker import ClauseChunker
 from ai_phone.pipeline.timing import TurnTimer
 from ai_phone.pipeline.vad import Endpointer, SpeechChunk, SpeechEnd, SpeechStart
@@ -45,6 +46,8 @@ class TurnController:
         self.end_reason: str | None = None
         self.last_activity_ns = time.monotonic_ns()
         self.hangup_requested = asyncio.Event()
+        self.bargein = BargeInDetector(cfg.bargein_min_speech_ms, cfg.bargein_playback_gain)
+        self._interrupt_t: int | None = None
 
     # ---- generation bookkeeping ---------------------------------------------------------------
     def _new_gen(self) -> int:
@@ -78,6 +81,19 @@ class TurnController:
     # ---- inbound audio ------------------------------------------------------------------------
     def _on_frame(self, frame: bytes, t_ns: int) -> None:
         for e in self.ep.feed(frame, t_ns):
+            if isinstance(e, SpeechChunk):
+                rms = float(np.sqrt(np.mean(e.pcm_f32 * e.pcm_f32)))
+                playing = self.tx.available() > 0 or self.state == "SPEAKING"
+                if self.state in ("THINKING", "SPEAKING"):
+                    if self._interrupt_t is None:
+                        self._interrupt_t = e.t_ns
+                    if self.bargein.update(True, rms, self.ep.noise_rms, playing):
+                        self._interrupt(t_ns)  # this chunk now belongs to the next utterance
+                else:
+                    self.bargein.update(True, rms, self.ep.noise_rms, playing)
+            else:
+                self.bargein.update(False, 0.0, self.ep.noise_rms, False)
+                self._interrupt_t = None
             if isinstance(e, SpeechStart):
                 self.last_activity_ns = t_ns
                 if self.state == "LISTENING":
@@ -94,6 +110,27 @@ class TurnController:
                 self.timer.t0 = e.t0_ns
                 self.stt.send({"op": "stt.finalize", "gen": self.stt.current_gen})
                 self.state = "THINKING"
+
+    def _interrupt(self, now: int) -> None:
+        """Caller talked over us: cancel everything for this generation, flush audio, keep the partial reply."""
+        t = self.timer
+        g = t.gen
+        for c in (self.stt, self.llm, self.tts):
+            c.cancel(g)
+        self.tx.flush()
+        self.tts_out.flush()
+        t.bargein = True
+        t.bargein_stop_ns = now - (self._interrupt_t or now)
+        t.reply_text = "".join(self._reply_parts).strip()
+        self.history.append({"role": "assistant", "content": (t.reply_text + " [interrupted]").strip()})
+        t.rx_overruns, t.tx_underruns = self.rx.overruns, self.tx.underruns
+        self.on_turn(t)
+        self._new_gen()
+        self.bargein.reset()
+        self._interrupt_t = None
+        self.timer = TurnTimer(gen=self.stt.current_gen)
+        self.state = "LISTENING"
+        self._pending_stt = 0
 
     def _flush_stt_push(self) -> None:
         if self._pending_stt:

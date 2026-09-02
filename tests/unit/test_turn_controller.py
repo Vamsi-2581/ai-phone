@@ -90,3 +90,34 @@ async def test_full_turn_with_fake_backends():
         assert tc.state == "LISTENING"
     finally:
         await teardown(stop, runner, rings, clients)
+
+
+@pytest.mark.asyncio
+async def test_bargein_cancels_and_flushes():
+    loop = asyncio.get_running_loop()
+    tc, port, turns, rings, clients = await make_stack(loop)
+    rx, tx = rings[0], rings[1]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        for f in speech_frames(0.6):
+            rx.push(f)
+            await asyncio.sleep(0.02)
+        for _ in range(20):
+            rx.push(SILENCE)
+            await asyncio.sleep(0.02)
+        for _ in range(100):  # wait until the agent is speaking, without draining tx, so frames pile up
+            if tc.state == "SPEAKING":
+                break
+            await asyncio.sleep(0.02)
+        assert tc.state == "SPEAKING" and tx.available() > 0
+        for f in speech_frames(0.4, amp=0.8):  # caller talks over it, loudly, for 0.4 s
+            rx.push(f)
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
+        assert turns and turns[0].bargein and turns[0].bargein_stop_ns is not None
+        assert tx.available() == 0, "tx not flushed"
+        assert tc.history[-1]["content"].endswith("[interrupted]")
+        assert tc.state in ("LISTENING", "THINKING")
+    finally:
+        await teardown(stop, runner, rings, clients)
