@@ -125,11 +125,13 @@ class Daemon:
                 log.info("rejected %s with %s", e.source_ip, e.code)
         call_stop.set()
         await runner
+        for c in (stt, llm, tts):  # abandon anything still queued for this call before touching the rings
+            c.cancel(c.current_gen)
         if tc.timer is not None and tc.timer.t0 is not None:  # the caller hung up mid-turn: log what we have
             rec = tc.timer.to_record(str(call_id), n[0])
             rec["incomplete"] = True
             rec["state_at_end"] = tc.state
             turn_log.write(rec)
             log.info("turn %s incomplete at call end (state=%s)", n[0] + 1, tc.state)
-        for r in (rx, tx, stt_in, tts_out):
+        for r in (rx, tx, tts_out):  # stt_in is drained by the STT worker itself (a queued push may still own frames)
             r.flush()

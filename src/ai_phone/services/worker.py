@@ -57,15 +57,19 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 backend.cancel(msg["gen"])
                 continue
             gen = msg.get("gen")
-            if gen in cancelled:
-                continue
             if op == "stt.push":
+                # always consume the frames this push owns, even for a cancelled gen, so the ring stays in step
                 frames = b"".join(ain.pop() or b"" for _ in range(msg["nframes"]))
+                if gen in cancelled:
+                    continue
                 pcm = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
                 partial = backend.push(gen, pcm)
                 if partial:
                     ipc.send(conn, {"ev": "partial", "gen": gen, "text": partial})
-            elif op == "stt.finalize":
+                continue
+            if gen in cancelled:
+                continue
+            if op == "stt.finalize":
                 text, t = backend.finalize(gen)
                 ipc.send(conn, {"ev": "final", "gen": gen, "text": text, "timings": t})
             elif op == "llm.generate":
