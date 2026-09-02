@@ -41,6 +41,7 @@ def test_echo_call_round_trips_audio(tmp_path: Path):
     rx, tx = FrameRing(None, 100), FrameRing(None, 100)
     tel = Telephony(cfg, loop, events, rx, tx, echo_mode=True)
     seen = []
+    stats = {}
 
     async def drive():
         tel.start()
@@ -63,6 +64,7 @@ def test_echo_call_round_trips_audio(tmp_path: Path):
             except Exception:
                 peer.terminate()
                 peer.wait(timeout=5)
+            stats["last_rx_ns"] = tel.port.last_rx_ns  # read before stop() releases the port
             tel.stop()
 
     try:
@@ -77,4 +79,4 @@ def test_echo_call_round_trips_audio(tmp_path: Path):
     assert any(isinstance(e, ev.IncomingCall) for e in seen)
     assert any(isinstance(e, ev.MediaActive) for e in seen)
     assert rec.exists() and _rms(rec) > 500, "peer recorded silence: echo path is broken"
-    assert tel.port.last_rx_ns > 0
+    assert stats["last_rx_ns"] > 0
