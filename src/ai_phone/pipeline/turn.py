@@ -30,7 +30,9 @@ class PortLike(Protocol):
 class TurnController:
     def __init__(self, cfg: ConversationConfig, port: PortLike, stt: WorkerClient, llm: WorkerClient, tts: WorkerClient,
                  rx: FrameRing, tx: FrameRing, stt_in: FrameRing, tts_out: FrameRing, endpointer: Endpointer,
-                 greeting_frames: list[bytes], system_prompt: str, on_turn: Callable[[TurnTimer], None]):
+                 greeting_frames: list[bytes], system_prompt: str, on_turn: Callable[[TurnTimer], None],
+                 prompt_frames: list[bytes] = (), warning_frames: list[bytes] = (),
+                 rtp_last_rx_ns: Callable[[], int] | None = None):
         self.cfg, self.port, self.stt, self.llm, self.tts = cfg, port, stt, llm, tts
         self.rx, self.tx, self.stt_in, self.tts_out, self.ep = rx, tx, stt_in, tts_out, endpointer
         self.greeting, self.system_prompt, self.on_turn = greeting_frames, system_prompt, on_turn
@@ -48,6 +50,10 @@ class TurnController:
         self.hangup_requested = asyncio.Event()
         self.bargein = BargeInDetector(cfg.bargein_min_speech_ms, cfg.bargein_playback_gain)
         self._interrupt_t: int | None = None
+        self.prompt_frames, self.warning_frames, self.rtp_last_rx_ns = list(prompt_frames), list(warning_frames), rtp_last_rx_ns
+        self._prompted = False
+        self._warned = False
+        self._start_ns = 0
 
     # ---- generation bookkeeping ---------------------------------------------------------------
     def _new_gen(self) -> int:
@@ -65,6 +71,7 @@ class TurnController:
         for f in self.greeting:
             self.tx.push(f)
         self._new_gen()
+        self._start_ns = time.monotonic_ns()
         while not stop.is_set() and self.state != "ENDING":
             now = time.monotonic_ns()
             while (f := self.rx.pop()) is not None:
@@ -76,7 +83,29 @@ class TurnController:
                 self.last_activity_ns = now
             if self.state == "SPEAKING" and self._llm_done and self._tts_done_seq >= self._seq - 1 and self.tx.available() == 0:
                 self._finish_turn()
+            self._check_timers(now)
             await asyncio.sleep(0.005)
+
+    def _check_timers(self, now: int) -> None:
+        """All call timers live here, none in PJSIP. Warning fires 30 s before the cap (0.5 s for caps <= 30 s)."""
+        idle_s = (now - self.last_activity_ns) / 1e9
+        if self.state == "LISTENING" and not self._prompted and idle_s >= self.cfg.silence_prompt_sec:
+            for f in self.prompt_frames:
+                self.tx.push(f)
+            self._prompted = True
+            self.last_activity_ns = now
+        elif self.state == "LISTENING" and self._prompted and idle_s >= self.cfg.silence_hangup_sec:
+            self.request_end("silence")
+        elapsed_s = (now - self._start_ns) / 1e9
+        warn_at = self.cfg.max_call_sec - (30 if self.cfg.max_call_sec > 30 else 0.5)
+        if not self._warned and elapsed_s >= warn_at:
+            for f in self.warning_frames:
+                self.tx.push(f)
+            self._warned = True
+        if elapsed_s >= self.cfg.max_call_sec:
+            self.request_end("max_duration")
+        if self.rtp_last_rx_ns is not None and (now - self.rtp_last_rx_ns()) / 1e9 >= self.cfg.rtp_timeout_sec:
+            self.request_end("rtp_timeout")
 
     # ---- inbound audio ------------------------------------------------------------------------
     def _on_frame(self, frame: bytes, t_ns: int) -> None:
@@ -96,6 +125,7 @@ class TurnController:
                 self._interrupt_t = None
             if isinstance(e, SpeechStart):
                 self.last_activity_ns = t_ns
+                self._prompted = False  # the caller is back
                 if self.state == "LISTENING":
                     self.timer = TurnTimer(gen=self.stt.current_gen)
             elif isinstance(e, SpeechChunk) and self.state == "LISTENING":
