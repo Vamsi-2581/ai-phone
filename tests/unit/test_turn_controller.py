@@ -121,3 +121,27 @@ async def test_bargein_cancels_and_flushes():
         assert tc.state in ("LISTENING", "THINKING")
     finally:
         await teardown(stop, runner, rings, clients)
+
+
+@pytest.mark.asyncio
+async def test_speech_during_greeting_stops_it_and_is_heard():
+    loop = asyncio.get_running_loop()
+    tc, port, turns, rings, clients = await make_stack(loop, greeting=[b"\x10\x00" * 320] * 150)  # 3 s greeting
+    rx, tx = rings[0], rings[1]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await asyncio.sleep(0.1)
+        assert tc.state == "GREETING" and tx.available() > 100
+        for f in speech_frames(0.6):  # caller talks over the greeting
+            rx.push(f)
+            await asyncio.sleep(0.02)
+        assert tx.available() < 100, "greeting was not cut"
+        for _ in range(25):
+            rx.push(SILENCE)
+            await asyncio.sleep(0.02)
+        await _drain_tx(tx, port, 2.0)
+        assert turns and turns[0].stt_text.startswith("fake utterance")
+        assert turns[0].t0_end and turns[0].t0_end > turns[0].t0
+    finally:
+        await teardown(stop, runner, rings, clients)

@@ -83,6 +83,9 @@ class TurnController:
             if self.state == "GREETING" and self.tx.available() == 0:
                 self.state = "LISTENING"
                 self.last_activity_ns = now
+            playing = getattr(self.port, "playing", None)
+            if playing is not None:
+                self.port.playing = self.state in ("GREETING", "SPEAKING")
             if self.state == "SPEAKING" and self._llm_done and self._tts_done_seq >= self._seq - 1 and self.tx.available() == 0:
                 self._finish_turn()
             self._check_timers(now)
@@ -128,6 +131,9 @@ class TurnController:
             if isinstance(e, SpeechStart):
                 self.last_activity_ns = t_ns
                 self._prompted = False  # the caller is back
+                if self.state == "GREETING":  # the caller talks over the greeting: stop it and listen
+                    self.tx.flush()
+                    self.state = "LISTENING"
                 if self.state == "LISTENING":
                     self.timer = TurnTimer(gen=self.stt.current_gen)
             elif isinstance(e, SpeechChunk) and self.state == "LISTENING":
@@ -140,6 +146,7 @@ class TurnController:
                 if self.timer is None:
                     self.timer = TurnTimer(gen=self.stt.current_gen)
                 self.timer.t0 = e.t0_ns
+                self.timer.t0_end = t_ns
                 self.stt.send({"op": "stt.finalize", "gen": self.stt.current_gen})
                 self.state = "THINKING"
 

@@ -14,6 +14,7 @@ class RingMediaPort(pj.AudioMediaPort):
         self.last_rx_ns = 0
         self.first_nonsilent_ns: int | None = None
         self._armed = False
+        self.playing = False  # set by the controller; silence while listening is not an underrun
         fmt = pj.MediaFormatAudio()
         fmt.type = pj.PJMEDIA_TYPE_AUDIO
         fmt.clockRate = 16000
@@ -35,7 +36,7 @@ class RingMediaPort(pj.AudioMediaPort):
         (self.tx if self.echo else self.rx).push(data)
 
     def onFrameRequested(self, frame) -> None:
-        data = self.tx.pop_or_silence()
+        data = self.tx.pop_or_silence() if self.playing else (self.tx.pop() or SILENCE)
         if self._armed and data != SILENCE:
             self.first_nonsilent_ns = time.monotonic_ns()
             self._armed = False

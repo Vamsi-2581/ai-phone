@@ -19,7 +19,7 @@ def q(v, p):
 print(f"turns: {len(rows)}   incomplete (caller hung up mid-turn): {len(incomplete)}   bargeins: {sum(1 for r in rows if r.get('bargein'))}")
 for r in incomplete:
     print(f"  incomplete: state={r.get('state_at_end')} stt_ms={r.get('stt_ms')} stt_text={r.get('stt_text')!r}")
-for k in ("stt_ms", "llm_prompt_eval_ms", "llm_first_clause_ms", "tts_first_chunk_ms", "egress_ms", "first_audible_ms"):
+for k in ("endpoint_ms", "stt_ms", "llm_prompt_eval_ms", "llm_first_clause_ms", "tts_first_chunk_ms", "egress_ms", "first_audible_ms"):
     v = [r[k] for r in rows if r.get(k) is not None]
     if v:
         print(f"{k:22s} p50={q(v, 50):7.1f}  p95={q(v, 95):7.1f}  n={len(v)}")

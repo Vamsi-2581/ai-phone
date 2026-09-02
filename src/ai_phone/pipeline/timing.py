@@ -14,6 +14,7 @@ def _ms(a, b):
 class TurnTimer:
     gen: int
     t0: int | None = None  # last VAD-positive chunk
+    t0_end: int | None = None  # endpointer fired (t0 + silence window); STT finalize sent here
     t1: int | None = None  # STT final received
     t2: int | None = None  # first LLM token
     t3: int | None = None  # first clause sent to TTS
@@ -36,7 +37,8 @@ class TurnTimer:
             "call_id": call_id, "turn": turn, "gen": self.gen,
             "t0_speech_end_ns": self.t0, "t1_stt_final_ns": self.t1, "t2_llm_first_token_ns": self.t2,
             "t3_first_clause_ns": self.t3, "t4_tts_first_chunk_ns": self.t4, "t5_rtp_first_nonsilent_ns": self.t5,
-            "stt_ms": _ms(self.t0, self.t1), "llm_prompt_eval_ms": wt.get("llm_prompt_eval_ms"),
+            "endpoint_ms": _ms(self.t0, self.t0_end), "stt_ms": _ms(self.t0_end or self.t0, self.t1),
+            "llm_prompt_eval_ms": wt.get("llm_prompt_eval_ms"),
             "llm_first_clause_ms": _ms(self.t1, self.t3), "tts_first_chunk_ms": _ms(self.t3, self.t4),
             "egress_ms": _ms(self.t4, self.t5), "first_audible_ms": self.first_audible_ms(),
             "bargein": self.bargein,
