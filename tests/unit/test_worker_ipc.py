@@ -41,6 +41,10 @@ async def test_cancel_drops_stale_generation():
     await asyncio.sleep(0.05)
     g2 = c.next_gen()
     c.cancel(g1)
+    # tokens that arrived before next_gen() are legitimately g1 and already queued; from now on the
+    # client drops anything tagged g1 on receipt, so only events after this drain matter
+    while not c.events.empty():
+        c.events.get_nowait()
     c.send({"op": "llm.generate", "gen": g2, "messages": [{"role": "user", "content": "again"}], "max_tokens": 50})
     evs = await _collect(c, "done", g2)
     assert all(e["gen"] == g2 for e in evs if e["ev"] in ("token", "done")), "stale g1 events leaked"
