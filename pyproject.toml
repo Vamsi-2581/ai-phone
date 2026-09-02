@@ -19,7 +19,12 @@ dependencies = [
 ai-phone = "ai_phone.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  # Kokoro's phonemizer needs this spaCy model; pinning it here keeps `uv sync` from removing it
+  "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
 
 [build-system]
 requires = ["hatchling"]
