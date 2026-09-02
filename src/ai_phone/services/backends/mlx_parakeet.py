@@ -22,6 +22,9 @@ class ParakeetSTT:
         self._mx = mx
         t = time.monotonic_ns()
         self._model = load_model(self.model_id)
+        # the checkpoint loads as float32 (2.5 GB); float16 halves it with identical transcripts and speed
+        self._model.set_dtype(mx.float16)
+        mx.eval(self._model.parameters())
         self._transcribe(np.zeros(16000, dtype=np.float32))
         return {"warm_ms": (time.monotonic_ns() - t) / 1e6}
 
