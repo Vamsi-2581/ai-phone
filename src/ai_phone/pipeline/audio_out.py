@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import soxr
 
-from ai_phone.telephony.rings import FRAME_BYTES
+FRAME_BYTES = 640  # 320 int16 samples at 16 kHz = 20 ms; must equal telephony.rings.FRAME_BYTES
 
 
 class Framer:
