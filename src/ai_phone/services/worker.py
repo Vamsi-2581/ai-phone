@@ -22,13 +22,16 @@ def _load(factory: str):
     return getattr(importlib.import_module(mod), name)()
 
 
-def _drain_cancel(conn, cancelled: set[int], backend, gen: int) -> bool:
-    """Apply any cancel messages waiting on the pipe; return True if `gen` is now cancelled."""
+def _drain_cancel(conn, cancelled: set[int], backend, gen: int, pending: list[dict]) -> bool:
+    """Apply any cancel messages waiting on the pipe; queue every other message for the main loop.
+    Returns True if `gen` is now cancelled."""
     while conn.poll(0):
         m = ipc.recv(conn)
         if m.get("op") == "cancel":
             cancelled.add(m["gen"])
             backend.cancel(m["gen"])
+        else:
+            pending.append(m)
     return gen in cancelled
 
 
@@ -39,12 +42,13 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
     ain = FrameRing.attach(audio_in_name, frame_bytes=STT_FRAME_BYTES if kind == "stt" else 640) if audio_in_name else None
     aout = FrameRing.attach(audio_out_name) if audio_out_name else None
     cancelled: set[int] = set()
+    pending: list[dict] = []  # messages read during a mid-stream cancel check, processed next
     try:
         backend = _load(backend_factory)
         timings = backend.warmup(**warm_args) if warm_args else backend.warmup()
         ipc.send(conn, {"ev": "ready", "timings": timings})
         while True:
-            msg = ipc.recv(conn)
+            msg = pending.pop(0) if pending else ipc.recv(conn)
             op = msg.get("op")
             if op == "shutdown":
                 break
@@ -66,14 +70,14 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 ipc.send(conn, {"ev": "final", "gen": gen, "text": text, "timings": t})
             elif op == "llm.generate":
                 for tok in backend.stream(gen, msg["messages"], msg["max_tokens"]):
-                    if gen in cancelled or (conn.poll(0) and _drain_cancel(conn, cancelled, backend, gen)):
+                    if gen in cancelled or (conn.poll(0) and _drain_cancel(conn, cancelled, backend, gen, pending)):
                         break
                     ipc.send(conn, {"ev": "token", "gen": gen, "text": tok})
                 ipc.send(conn, {"ev": "done", "gen": gen, "timings": getattr(backend, "last_timings", {})})
             elif op == "tts.synth":
                 n = 0
                 for frame in backend.stream(gen, msg["seq"], msg["text"]):
-                    if gen in cancelled or (conn.poll(0) and _drain_cancel(conn, cancelled, backend, gen)):
+                    if gen in cancelled or (conn.poll(0) and _drain_cancel(conn, cancelled, backend, gen, pending)):
                         break
                     aout.push(frame)
                     n += 1
