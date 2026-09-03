@@ -29,10 +29,13 @@ class KokoroTTS:
     def _to_np(self, x) -> np.ndarray:
         return np.array(self._mx.array(x).astype(self._mx.float32)).reshape(-1)  # bf16-safe conversion
 
+    LEAD_IN_THRESHOLD = 200  # int16 units; Kokoro starts every utterance with ~200 ms of digital silence
+
     def stream(self, gen_id: int, seq: int, text: str):
         framer = Framer(24000)
         t0 = time.monotonic_ns()
         first = None
+        speech_started = False
         for res in self._model.generate(text=text, voice=self.voice, speed=1.0, lang_code="a"):
             if gen_id in self._cancelled:
                 break
@@ -40,6 +43,11 @@ class KokoroTTS:
             for frame in framer.feed(self._to_np(res.audio)):
                 if gen_id in self._cancelled:
                     break
+                if not speech_started:
+                    # drop the leading silence: it is pure latency in the caller's ear
+                    if np.abs(np.frombuffer(frame, dtype="<i2")).max() < self.LEAD_IN_THRESHOLD:
+                        continue
+                    speech_started = True
                 if first is None:
                     first = time.monotonic_ns()
                 yield frame
