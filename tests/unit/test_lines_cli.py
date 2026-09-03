@@ -90,3 +90,33 @@ def test_list(home: Path, capsys):
     main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"])
     assert main(["lines", "list"]) == 0
     assert "main" in capsys.readouterr().out
+
+
+def test_manual_duplicate_id_keeps_the_existing_line(home: Path, capsys):
+    main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"])
+    assert main(["lines", "add", "sip", "--id", "main", "--user", "agents", "--host", "home.example.org"]) == 3
+    cfg = load_config(home / "config.yaml")
+    assert cfg.lines["main"].kind == "trunk" and cfg.lines["main"].provider.name == "fake"
+
+
+def test_manual_trunk_without_registrar_is_a_clean_error(home: Path, capsys):
+    assert main(["lines", "add", "trunk", "--id", "byo", "--number", "+442079460001", "--user", "byouser1"]) == 3
+    assert "--registrar" in capsys.readouterr().out
+
+
+def test_resume_after_a_crash_mid_provision(home: Path, monkeypatch):
+    monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "connection")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 3
+    assert "main" not in (load_config(home / "config.yaml").lines)
+    monkeypatch.delenv("AI_PHONE_FAKE_CRASH_AFTER")
+    assert main(["lines", "resume", "main", "--key-env", "FAKE_KEY"]) == 0
+    ln = load_config(home / "config.yaml").lines["main"]
+    assert ln.provider.state == "ready" and ln.number == "+442079460000"
+    j = Journal.open(home / "lines", "main")
+    assert "carrier_ready" in j.steps_done() and "local_committed" in j.steps_done()
+
+
+def test_provider_errors_exit_3_not_traceback(home: Path, monkeypatch, capsys):
+    monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "profile")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 3
+    assert "error:" in capsys.readouterr().out

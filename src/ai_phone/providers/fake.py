@@ -1,6 +1,10 @@
 """In-memory carrier for tests: same step structure as the real ones, with crash and pending injection."""
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 from ai_phone.lines.journal import Journal
 from ai_phone.providers.base import Number, ProviderError, ProvisionResult, ReleaseResult, VerificationStep
 
@@ -16,6 +20,16 @@ class FakeProvider:
         self.carrier: dict[str, dict] = {}      # kind -> {"id": …, "name": …}
         self.created: dict[str, int] = {}
         self.verified: set[str] = set()
+        self._store = None
+        if os.environ.get("AI_PHONE_HOME"):  # under the CLI the fake carrier persists between invocations, like a real one
+            self._store = Path(os.environ["AI_PHONE_HOME"]) / "fake-carrier.json"
+            if self._store.exists():
+                d = json.loads(self._store.read_text())
+                self.carrier, self.created = d.get("carrier", {}), d.get("created", {})
+
+    def _persist(self) -> None:
+        if self._store is not None:
+            self._store.write_text(json.dumps({"carrier": self.carrier, "created": self.created}))
 
     def search_numbers(self, country, area, limit):
         return [Number(f"+4420794600{i:02d}", 1.0, "GBP", False, f"src-{i}") for i in range(limit)]
@@ -27,6 +41,7 @@ class FakeProvider:
     def _create(self, kind: str, name: str) -> dict:
         self.created[kind] = self.created.get(kind, 0) + 1
         self.carrier[kind] = {"id": f"{kind}-{self.created[kind]}", "name": name}
+        self._persist()
         return self.carrier[kind]
 
     def provision(self, journal: Journal, number: Number, line_id: str, sip_user: str, sip_password: str) -> ProvisionResult:
@@ -66,6 +81,7 @@ class FakeProvider:
     def release(self, journal: Journal) -> ReleaseResult:
         for step in reversed(STEPS):
             self.carrier.pop(step, None)
+        self._persist()
         journal.set_state("pending")
         return ReleaseResult(True, {})
 

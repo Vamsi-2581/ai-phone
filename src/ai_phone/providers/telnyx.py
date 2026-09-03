@@ -124,26 +124,32 @@ class TelnyxProvider:
             status = order.get("status", "pending")
             if status == "failure":
                 journal.set_state("failed")
-                return ProvisionResult("failed", f"Telnyx rejected the order for {e164}: {order.get('requirements_met', '')}".strip())
+                return ProvisionResult("failed", f"Telnyx rejected the order for {e164}: {order.get('requirements_met', '')}".strip(), self._line(journal, e164, "failed"))
             if status != "success":
                 journal.set_state("pending")
                 why = "regulatory documents required (see the Telnyx portal → Numbers → Orders)" if order.get("requirements_met") is False else "order pending"
-                return ProvisionResult("pending", f"{e164}: {why}; run `ai-phone lines resume` later")
+                return ProvisionResult("pending", f"{e164}: {why}; run `ai-phone lines resume` later", self._line(journal, e164, "pending"))
         if not res.get("number_id"):  # delivered (now or at order time): the number's own id is what release deletes
             owned = self._call("GET", "/phone_numbers", params={"filter[phone_number]": e164}) or []
             if not owned:  # the order says success but the number is not listed yet: not ready until it is
                 journal.set_state("pending")
-                return ProvisionResult("pending", f"{e164}: the order succeeded but the number is not listed on the account yet; run `ai-phone lines resume` in a minute")
+                return ProvisionResult("pending", f"{e164}: the order succeeded but the number is not listed on the account yet; run `ai-phone lines resume` in a minute",
+                                       self._line(journal, e164, "pending"))
             journal.finish("order", order_id=res.get("order_id", ""), order_status="success", number_id=owned[0]["id"])
         journal.set_state("ready")
+        return ProvisionResult("ready", f"{e164} is provisioned", self._line(journal, e164, "ready"))
+
+    def _line(self, journal: Journal, e164: str | None, state: str) -> dict:
+        """The line as far as it is known: a pending order still yields a loadable trunk line with the registrar and user."""
         r = journal.resources()
-        sip_user = next(s["planned"]["user_name"] for s in journal.doc["steps"] if s["name"] == "connection")
+        sip_user = next((s["planned"].get("user_name") for s in journal.doc["steps"] if s["name"] == "connection"), None)
         line = {"kind": "trunk", "number": e164, "caller_id": e164, "registrar": REGISTRAR, "dial_domain": DIAL_DOMAIN,
-                "register_via_proxy": True, "transport": "udp", "user": sip_user, "trusted_cidrs": list(SIGNALLING_CIDRS),
-                "provider": {"name": self.name, "state": "ready",
-                             "resources": {"outbound_voice_profile_id": r["outbound_voice_profile_id"], "connection_id": r["connection_id"],
-                                           "order_id": r["order_id"], "number_id": r.get("number_id", "")}}}
-        return ProvisionResult("ready", f"{e164} is provisioned", line)
+                "register_via_proxy": True, "transport": "udp", "trusted_cidrs": list(SIGNALLING_CIDRS),
+                "provider": {"name": self.name, "state": state,
+                             "resources": {k: r[k] for k in ("outbound_voice_profile_id", "connection_id", "order_id", "number_id") if r.get(k)}}}
+        if sip_user:
+            line["user"] = sip_user
+        return line
 
     def release(self, journal: Journal) -> ReleaseResult:
         r = journal.resources()

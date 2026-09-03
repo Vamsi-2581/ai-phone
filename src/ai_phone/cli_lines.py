@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -13,8 +12,8 @@ from ai_phone.lines.credentials import generate_sip_password, generate_sip_user
 from ai_phone.lines.forward import WHEN, divert_codes
 from ai_phone.lines.journal import Journal
 from ai_phone.providers import PROVIDERS, load_provider
-from ai_phone.providers.base import ProviderError
-from ai_phone.secrets import remove_secret, write_secret
+from ai_phone.providers.base import Number, ProviderError
+from ai_phone.secrets import SecretsError, load_secrets, remove_secret, write_secret
 
 EXIT_OK, EXIT_PENDING, EXIT_ERROR = 0, 2, 3
 
@@ -42,6 +41,7 @@ def _provider(a):
     kw = {}
     if a.provider == "fake":  # test hooks for the in-memory carrier
         kw["pending_polls"] = int(os.environ.get("AI_PHONE_FAKE_PENDING", "0"))
+        kw["crash_after"] = os.environ.get("AI_PHONE_FAKE_CRASH_AFTER") or None
     return load_provider(a.provider, key=_env(a.key_env, "--key-env") or "", secret=_env(getattr(a, "secret_env", None), "--secret-env"), **kw)
 
 
@@ -82,15 +82,15 @@ def _fail(msg: str):
     raise SystemExit(EXIT_ERROR)
 
 
-def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, number, persona: str, yes: bool) -> int:
-    raw = read_raw(config_path)
+def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, number, persona: str) -> int:
+    journal.start("target", phone_number=number.e164, persona=persona)  # first thing in the journal, so resume always knows the number
+    journal.finish("target")
     env_name = line_password_env(line_id)
     pw_step, planned = journal.start("credentials", user=generate_sip_user(line_id), password_env=env_name)
     if pw_step == "new":
         write_secret(env_name, generate_sip_password(), paths.secrets_path())
         journal.finish("credentials", **planned)
     creds = journal.resources() if pw_step == "done" else planned
-    from ai_phone.secrets import load_secrets
     password = load_secrets(paths.secrets_path())[env_name]
     try:
         result = provider.provision(journal, number, line_id, creds["user"], password)
@@ -101,23 +101,31 @@ def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, 
 
 
 def _commit(journal: Journal, config_path: Path, line_id: str, result, persona: str, env_name: str) -> int:
+    if result.state == "failed":
+        _say(f"error: {result.message}\nRun `ai-phone lines remove {line_id} --key-env <NAME>` to release what was created.")
+        return EXIT_ERROR
+    if not result.line:  # nothing loadable to write yet; the journal keeps the state
+        _say(f"{result.message}\nResume with: ai-phone lines resume {line_id} --key-env <NAME>")
+        return EXIT_PENDING
+    if result.state == "ready":
+        journal.start("carrier_ready")
+        journal.finish("carrier_ready")
     line = dict(result.line)
     line.update({"password_env": env_name, "persona": persona, "accept_invites_from": "registered_trunk"})
-    line["provider"] = dict(line.get("provider") or {"name": journal.doc["provider"], "resources": journal.resources()})
-    line["provider"]["state"] = result.state if result.state != "failed" else "failed"
+    line["provider"] = dict(line.get("provider") or {"name": journal.doc["provider"], "resources": {}})
+    line["provider"]["state"] = result.state
     raw = read_raw(config_path)
     if line_id in (raw.get("lines") or {}):
         update_line(config_path, line_id, **line)
     else:
         add_line(config_path, line_id, line)
-    journal.start("local_committed")
-    journal.finish("local_committed")  # the step's own timestamp records when; no result keys, so resources() stays carrier ids
+    load_config(config_path)  # what we wrote must load, pending or ready
+    if result.state == "ready":
+        journal.start("local_committed")
+        journal.finish("local_committed")  # the step's own timestamp records when; no result keys, so resources() stays carrier ids
     if result.state == "pending":
         _say(f"{result.message}\nLine {line_id} is written but pending. Resume with: ai-phone lines resume {line_id} --key-env <NAME>")
         return EXIT_PENDING
-    if result.state == "failed":
-        _say(f"error: {result.message}\nRun `ai-phone lines remove {line_id} --key-env <NAME>` to release what was created.")
-        return EXIT_ERROR
     number = line.get("number", line_id)
     if paths.socket_path().exists():
         _say(f"Line {line_id} is ready: {number}. Restart ai-phone to bring it live.")
@@ -143,15 +151,20 @@ def cmd_add(a) -> int:
     if not _ask(f"Buy {number.e164} for {cost} on your {provider.name} account?", a.yes):
         return EXIT_ERROR
     journal = Journal.open(paths.lines_dir(), line_id, provider.name)
-    return provision_flow(provider, journal, config_path, line_id, number, a.persona, a.yes)
+    return provision_flow(provider, journal, config_path, line_id, number, a.persona)
 
 
 def _add_manual(a, config_path: Path) -> int:
     if not LINE_ID_RE.match(a.id or ""):
         _fail(f"--id is required and must match {LINE_ID_RE.pattern}")
+    raw = read_raw(config_path)
+    if a.id in (raw.get("lines") or {}):
+        _fail(f"line {a.id!r} already exists; pick another --id")
     if a.provider == "trunk":
-        if not E164_RE.match(a.number or ""):
+        if not E164_RE.fullmatch(a.number or ""):
             _fail("--number must be E.164, like +442079460000")
+        if not a.registrar or not a.user or not a.password_env:
+            _fail("--registrar, --user and --password-env are required for a trunk line")
         from ai_phone.config import host_of
         line = {"kind": "trunk", "number": a.number, "caller_id": a.caller_id or a.number, "registrar": a.registrar,
                 "dial_domain": a.dial_domain or host_of(a.registrar), "user": a.user, "password_env": a.password_env,
@@ -163,11 +176,14 @@ def _add_manual(a, config_path: Path) -> int:
         line = {"kind": "sip", "user": a.user, "aor": f"sip:{a.user}@{a.host}", "caller_id": f"sip:{a.user}@{a.host}",
                 "display_name": a.user, "transport": a.transport, "persona": a.persona,
                 "accept_invites_from": "trusted" if a.trusted else "lan", "trusted_peers": list(a.trusted or [])}
+    added = False
     try:
         add_line(config_path, a.id, line)
+        added = True
         load_config(config_path)  # validate what we just wrote
     except (ValueError, ConfigError) as e:
-        remove_line(config_path, a.id)
+        if added:  # only undo what this command wrote
+            remove_line(config_path, a.id)
         _fail(str(e))
     _say(f"Line {a.id} added. Restart ai-phone (or start it) to bring it up.")
     return EXIT_OK
@@ -185,20 +201,32 @@ def _journal_for(line_id: str, a):
     return pname, ln
 
 
+def _planned(journal: Journal, step: str, key: str):
+    return next((s["planned"].get(key) for s in journal.doc["steps"] if s["name"] == step), None)
+
+
 def cmd_resume(a) -> int:
+    """Re-runs provisioning from the journal: finished steps are skipped, half-done ones reconciled, a pending order polled."""
     pname, ln = _journal_for(a.line_id, a)
     if not pname:
         _fail(f"line {a.line_id} has no provider journal to resume")
     a.provider = pname
     provider = _provider(a)
     journal = Journal.open(paths.lines_dir(), a.line_id, pname)
+    e164 = _planned(journal, "target", "phone_number")
+    user = _planned(journal, "credentials", "user")
+    env_name = ln.get("password_env") or _planned(journal, "credentials", "password_env") or line_password_env(a.line_id)
+    if not e164 or not user:
+        _fail(f"the journal for {a.line_id} has no number or credentials yet; run `ai-phone lines add` again or `lines remove --local-only`")
+    password = load_secrets(paths.secrets_path()).get(env_name)
+    if not password:
+        _fail(f"{env_name} is missing from {paths.secrets_path()}; run `ai-phone lines remove {a.line_id} --local-only` and add the line again")
     try:
-        result = provider.poll(journal)
+        result = provider.provision(journal, Number(e164, None, None, False, e164), a.line_id, user, password)
     except ProviderError as e:
         _say(f"error: {e}")
         return EXIT_ERROR
-    env_name = ln.get("password_env") or line_password_env(a.line_id)
-    return _commit(journal, _config_path(a), a.line_id, result, ln.get("persona", "default"), env_name)
+    return _commit(journal, _config_path(a), a.line_id, result, ln.get("persona") or _planned(journal, "target", "persona") or "default", env_name)
 
 
 def cmd_remove(a) -> int:
@@ -301,6 +329,17 @@ def cmd_verify(a) -> int:
     return EXIT_OK
 
 
+def _guarded(fn):
+    """Provider and secrets failures anywhere in a command are reported, never traced, and exit 3."""
+    def run(a) -> int:
+        try:
+            return fn(a)
+        except (ProviderError, SecretsError, ValueError) as e:
+            _say(f"error: {e}")
+            return EXIT_ERROR
+    return run
+
+
 # ---- argparse ------------------------------------------------------------------------------------
 
 def register(sub) -> None:
@@ -319,13 +358,13 @@ def register(sub) -> None:
     add.add_argument("--user"); add.add_argument("--password-env"); add.add_argument("--caller-id")
     add.add_argument("--transport", choices=["udp", "tcp", "tls"], default="udp")
     add.add_argument("--trusted-cidr", action="append"); add.add_argument("--host"); add.add_argument("--trusted", action="append")
-    add.set_defaults(func=cmd_add)
+    add.set_defaults(func=_guarded(cmd_add))
 
-    r = s.add_parser("resume"); r.add_argument("line_id"); r.add_argument("--key-env", required=True); r.add_argument("--secret-env"); r.set_defaults(func=cmd_resume)
+    r = s.add_parser("resume"); r.add_argument("line_id"); r.add_argument("--key-env", required=True); r.add_argument("--secret-env"); r.set_defaults(func=_guarded(cmd_resume))
     rm = s.add_parser("remove"); rm.add_argument("line_id"); rm.add_argument("--key-env"); rm.add_argument("--secret-env")
-    rm.add_argument("--local-only", action="store_true"); rm.add_argument("--yes", action="store_true"); rm.set_defaults(func=cmd_remove)
-    s.add_parser("list").set_defaults(func=cmd_list)
+    rm.add_argument("--local-only", action="store_true"); rm.add_argument("--yes", action="store_true"); rm.set_defaults(func=_guarded(cmd_remove))
+    s.add_parser("list").set_defaults(func=_guarded(cmd_list))
     f = s.add_parser("forward"); f.add_argument("line_id"); f.add_argument("--when", choices=list(WHEN), default="no-answer")
-    f.add_argument("--from", dest="from_number", required=True); f.set_defaults(func=cmd_forward)
+    f.add_argument("--from", dest="from_number", required=True); f.set_defaults(func=_guarded(cmd_forward))
     v = s.add_parser("verify-caller-id"); v.add_argument("line_id"); v.add_argument("number"); v.add_argument("--key-env", required=True)
-    v.add_argument("--secret-env"); v.set_defaults(func=cmd_verify)
+    v.add_argument("--secret-env"); v.set_defaults(func=_guarded(cmd_verify))

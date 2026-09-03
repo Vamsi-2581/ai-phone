@@ -181,3 +181,9 @@ def test_models_home_follows_ai_phone_home(tmp_path: Path, monkeypatch):
 def test_trailing_newline_in_a_header_bound_field_is_rejected(tmp_path: Path):
     with pytest.raises(ConfigError, match="display_name"):
         _load(tmp_path, V2.replace('display_name: "Sam\'s assistant"', 'display_name: "Sam\\n"'))
+
+
+def test_bad_provider_field_names_the_field(tmp_path: Path):
+    bad = V2.replace('    caller_id: "+442079460000"\n', '    caller_id: "+442079460000"\n    provider: {name: telnyx, state: nope, resources: {}}\n', 1)
+    with pytest.raises(ConfigError, match="provider.state"):
+        _load(tmp_path, bad)
