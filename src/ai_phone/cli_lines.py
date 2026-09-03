@@ -76,6 +76,8 @@ def _pick_number(provider, a):
     if a.yes:
         return nums[0]
     choice = input("Which one? [1] ").strip() or "1"
+    if not choice.isdigit() or not 1 <= int(choice) <= len(nums):
+        _fail(f"answer with a number from 1 to {len(nums)} (or q to stop)" if choice.lower() not in ("q", "n", "no") else "stopped; nothing was bought")
     return nums[int(choice) - 1]
 
 

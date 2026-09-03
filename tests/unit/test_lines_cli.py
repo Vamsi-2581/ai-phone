@@ -159,3 +159,25 @@ def test_resume_works_for_a_journal_without_the_target_step(home: Path, monkeypa
     monkeypatch.delenv("AI_PHONE_FAKE_CRASH_AFTER")
     assert main(["lines", "resume", "main", "--key-env", "FAKE_KEY"]) == 0
     assert load_config(home / "config.yaml").lines["main"].number == "+442079460000"
+
+
+def test_pick_number_stops_cleanly_on_a_non_numeric_answer(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from ai_phone import cli_lines
+
+    class Provider:
+        name = "fake"
+
+        def search_numbers(self, country, area, limit):
+            return [SimpleNamespace(e164="+15550000001", monthly_cost=1.0, currency="USD", requires_regulatory=False)]
+
+    args = SimpleNamespace(number=None, country="US", area=None, yes=False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    with pytest.raises(SystemExit):
+        cli_lines._pick_number(Provider(), args)
+    assert "stopped; nothing was bought" in capsys.readouterr().out
+    monkeypatch.setattr("builtins.input", lambda prompt="": "7")
+    with pytest.raises(SystemExit):
+        cli_lines._pick_number(Provider(), args)
+    assert "from 1 to 1" in capsys.readouterr().out
