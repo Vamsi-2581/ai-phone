@@ -72,7 +72,35 @@ def test_first_token_deadline_beats_a_long_idle_timeout_and_keepalives():
     t0 = time.monotonic()
     with pytest.raises(BrainError) as e:
         list(b.stream(1, [{"role": "user", "content": "hi"}], 10))
-    assert e.value.kind == "first_token_timeout" and time.monotonic() - t0 < 5
+    assert e.value.kind == "first_token_timeout" and time.monotonic() - t0 < 1.0
+
+
+def test_first_token_deadline_while_waiting_for_headers():
+    def slow_headers(req):
+        time.sleep(1.5)  # the server has not even answered with headers
+        return httpx.Response(200, content=b"".join(_sse(["late"])))
+
+    b = _backend(slow_headers, first_token_timeout_ms=300, stream_idle_timeout_ms=10000)
+    t0 = time.monotonic()
+    with pytest.raises(BrainError) as e:
+        list(b.stream(1, [{"role": "user", "content": "hi"}], 10))
+    assert e.value.kind == "first_token_timeout" and time.monotonic() - t0 < 1.0
+
+
+def test_idle_timeout_after_the_first_token_uses_the_idle_deadline():
+    class Stall(httpx.SyncByteStream):
+        def __iter__(self):
+            yield from _sse(["first"], done=False)
+            time.sleep(1.5)
+            yield from _sse(["second"])
+
+    b = _backend(lambda req: httpx.Response(200, stream=Stall()), first_token_timeout_ms=5000, stream_idle_timeout_ms=300)
+    out = []
+    t0 = time.monotonic()
+    with pytest.raises(BrainError) as e:
+        for tok in b.stream(1, [{"role": "user", "content": "hi"}], 10):
+            out.append(tok)
+    assert out == ["first"] and e.value.kind == "idle_timeout" and time.monotonic() - t0 < 1.0
 
 
 def test_first_token_deadline_in_total_silence():
@@ -85,7 +113,7 @@ def test_first_token_deadline_in_total_silence():
     t0 = time.monotonic()
     with pytest.raises(BrainError) as e:
         list(b.stream(1, [{"role": "user", "content": "hi"}], 10))
-    assert e.value.kind == "first_token_timeout" and time.monotonic() - t0 < 5
+    assert e.value.kind == "first_token_timeout" and time.monotonic() - t0 < 1.0
 
 
 def test_non_text_content_is_malformed_not_a_crash():

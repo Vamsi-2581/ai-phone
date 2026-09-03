@@ -6,6 +6,7 @@ kind the controller can log; there are no retries because the caller is waiting 
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 
@@ -36,81 +37,110 @@ class OpenAICompatLLM:
         return {"warm_ms": (time.monotonic_ns() - t) / 1e6, "endpoint": self.base_url}
 
     def stream(self, gen_id: int, messages: list[Message], max_tokens: int):
+        """The HTTP stream runs in a helper thread that hands lines over a queue; this generator owns the clock:
+        the first token must arrive within first_token_timeout (headers, keepalives and silence all count),
+        later tokens within stream_idle_timeout. On a deadline or cancel the response is closed from here."""
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens, "stream": True}
         t0 = time.monotonic_ns()
-        deadline = time.monotonic() + self.first_token_s
         t_first = None
         n = chars = 0
-        finished = False
-        first_token_timer: threading.Timer | None = None
-        timed_out = threading.Event()
-        try:
-            with self.http.stream("POST", f"{self.base_url}/chat/completions", json=body, timeout=self.timeout) as r:
-                if r.status_code >= 300:
-                    raise BrainError(f"http_{r.status_code}")
-                # the idle read timeout governs silence between reads; the first token has its own, shorter deadline,
-                # enforced by closing the response from a timer so neither silence nor SSE keepalives can stretch it
-                def _expire():
-                    timed_out.set()
-                    r.close()
-                first_token_timer = threading.Timer(self.first_token_s, _expire)
-                first_token_timer.daemon = True
-                first_token_timer.start()
-                try:
+        q: queue.Queue = queue.Queue()
+        holder: dict = {}
+
+        def pump():
+            try:
+                with self.http.stream("POST", f"{self.base_url}/chat/completions", json=body, timeout=self.timeout) as r:
+                    holder["response"] = r
+                    q.put(("status", r.status_code))
                     for line in r.iter_lines():
-                        if gen_id in self._cancelled:
-                            raise BrainError("cancelled")
-                        if t_first is None and time.monotonic() > deadline:
-                            raise BrainError("first_token_timeout")
-                        if not line.startswith("data:"):
-                            continue  # SSE comments / keepalives
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            finished = True
-                            break
-                        try:
-                            piece = json.loads(data)["choices"][0].get("delta", {}).get("content")
-                        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
-                            raise BrainError("malformed", str(e)[:80]) from None
-                        if piece is None or piece == "":
-                            continue
-                        if not isinstance(piece, str):
-                            raise BrainError("malformed", f"delta.content is {type(piece).__name__}, not text")
-                        if t_first is None:
-                            t_first = time.monotonic_ns()
-                            first_token_timer.cancel()
-                        n += 1
-                        chars += len(piece)
-                        if chars > self.max_chars:
-                            raise BrainError("too_long", f"> {self.max_chars} chars")
-                        yield piece
-                except BrainError:
-                    raise  # our own verdicts pass through (BrainError is a RuntimeError, which the next clause catches)
-                except (httpx.StreamError, httpx.TransportError, RuntimeError) as e:
-                    if timed_out.is_set():  # the first-token timer closed the response
-                        raise BrainError("first_token_timeout") from None
+                        q.put(("line", line))
+                q.put(("eof", None))
+            except BaseException as e:  # reported to the consumer, which decides what it means
+                q.put(("error", e))
+
+        worker = threading.Thread(target=pump, name="brain-stream", daemon=True)
+        worker.start()
+
+        def close_response():
+            r = holder.get("response")
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+
+        def next_item(timeout_s: float, kind_on_timeout: str):
+            try:
+                return q.get(timeout=timeout_s)
+            except queue.Empty:
+                close_response()
+                raise BrainError(kind_on_timeout) from None
+
+        deadline_first = time.monotonic() + self.first_token_s
+        idle_s = self.timeout.read or self.first_token_s
+        finished = False
+        try:
+            while True:
+                if gen_id in self._cancelled:
+                    close_response()
+                    self._cancelled.discard(gen_id)
+                    return
+                if t_first is None:
+                    remaining = deadline_first - time.monotonic()
+                    if remaining <= 0:
+                        close_response()
+                        raise BrainError("first_token_timeout")
+                    kind, payload = next_item(remaining, "first_token_timeout")
+                else:
+                    kind, payload = next_item(idle_s, "idle_timeout")
+                if kind == "status":
+                    if payload >= 300:
+                        close_response()
+                        raise BrainError(f"http_{payload}")
+                    continue
+                if kind == "error":
+                    e = payload
+                    if isinstance(e, httpx.ConnectError):
+                        raise BrainError("connect", str(e)[:80]) from None
+                    if isinstance(e, httpx.ReadTimeout):
+                        raise BrainError("first_token_timeout" if t_first is None else "idle_timeout") from None
+                    if isinstance(e, httpx.HTTPError):
+                        raise BrainError("connect", type(e).__name__) from None
                     raise BrainError("malformed", type(e).__name__) from None
-            if not finished:
-                raise BrainError("malformed", "stream ended without [DONE]")
-        except httpx.ConnectError as e:
-            raise BrainError("connect", str(e)[:80]) from None
-        except httpx.ReadTimeout:
-            raise BrainError("first_token_timeout" if t_first is None else "idle_timeout") from None
-        except httpx.HTTPError as e:
-            raise BrainError("connect", type(e).__name__) from None
-        except BrainError as e:
-            if e.kind == "cancelled":
-                self._cancelled.discard(gen_id)
-                return
-            raise
+                if kind == "eof":
+                    if not finished:
+                        raise BrainError("malformed", "stream ended without [DONE]")
+                    return
+                line = payload
+                if not line.startswith("data:"):
+                    continue  # SSE comments / keepalives
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    finished = True
+                    continue
+                try:
+                    piece = json.loads(data)["choices"][0].get("delta", {}).get("content")
+                except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+                    raise BrainError("malformed", str(e)[:80]) from None
+                if piece is None or piece == "":
+                    continue
+                if not isinstance(piece, str):
+                    raise BrainError("malformed", f"delta.content is {type(piece).__name__}, not text")
+                if t_first is None:
+                    t_first = time.monotonic_ns()
+                n += 1
+                chars += len(piece)
+                if chars > self.max_chars:
+                    close_response()
+                    raise BrainError("too_long", f"> {self.max_chars} chars")
+                yield piece
         finally:
-            if first_token_timer is not None:
-                first_token_timer.cancel()
+            close_response()
             t_end = time.monotonic_ns()
             first = t_first or t_end
             self.last_timings = {"prompt_eval_ms": (first - t0) / 1e6, "first_token_ms": (first - t0) / 1e6,
                                  "gen_ms": (t_end - first) / 1e6, "tokens": n}
-        self._cancelled.discard(gen_id)
+            self._cancelled.discard(gen_id)
 
     def cancel(self, gen_id: int) -> None:
         self._cancelled.add(gen_id)
