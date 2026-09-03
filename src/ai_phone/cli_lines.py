@@ -213,7 +213,10 @@ def cmd_resume(a) -> int:
     a.provider = pname
     provider = _provider(a)
     journal = Journal.open(paths.lines_dir(), a.line_id, pname)
-    e164 = _planned(journal, "target", "phone_number")
+    e164 = (_planned(journal, "target", "phone_number")                      # journals from this version
+            or _planned(journal, "order", "phone_number")                    # older Telnyx journals
+            or _planned(journal, "number", "phone_number")                   # older Twilio journals
+            or _planned(journal, "number", "name"))                          # older fake-carrier journals
     user = _planned(journal, "credentials", "user")
     env_name = ln.get("password_env") or _planned(journal, "credentials", "password_env") or line_password_env(a.line_id)
     if not e164 or not user:

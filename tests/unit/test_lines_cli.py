@@ -120,3 +120,14 @@ def test_provider_errors_exit_3_not_traceback(home: Path, monkeypatch, capsys):
     monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "profile")
     assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 3
     assert "error:" in capsys.readouterr().out
+
+
+def test_resume_works_for_a_journal_without_the_target_step(home: Path, monkeypatch):
+    monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "number")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 3
+    j = Journal.open(home / "lines", "main")
+    j.doc["steps"] = [s for s in j.doc["steps"] if s["name"] != "target"]  # a journal from before the target step existed
+    j._save()
+    monkeypatch.delenv("AI_PHONE_FAKE_CRASH_AFTER")
+    assert main(["lines", "resume", "main", "--key-env", "FAKE_KEY"]) == 0
+    assert load_config(home / "config.yaml").lines["main"].number == "+442079460000"
