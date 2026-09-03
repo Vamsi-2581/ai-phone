@@ -176,3 +176,8 @@ def test_malformed_legacy_sections_are_config_errors(tmp_path: Path):
 def test_models_home_follows_ai_phone_home(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
     assert _load(tmp_path, "").models.home == str(tmp_path / "models")
+
+
+def test_trailing_newline_in_a_header_bound_field_is_rejected(tmp_path: Path):
+    with pytest.raises(ConfigError, match="display_name"):
+        _load(tmp_path, V2.replace('display_name: "Sam\'s assistant"', 'display_name: "Sam\\n"'))

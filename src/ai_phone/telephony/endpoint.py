@@ -74,7 +74,7 @@ def _grammar(c: LineConfig) -> None:
         if c.caller_id is not None:
             checks.append((AOR_RE, c.caller_id, "caller_id"))
     for rx, value, name in checks:
-        if not rx.match(value):
+        if not rx.fullmatch(value):  # fullmatch: `$` alone would accept a trailing newline
             raise ValueError(f"line {name} {value!r} does not match {rx.pattern}")
 
 

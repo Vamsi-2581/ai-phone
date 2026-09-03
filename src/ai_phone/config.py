@@ -334,42 +334,42 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
     b = cfg.sip.bind
     _require(b.tcp_port != b.tls_port, "config.sip.bind.tls_port: TLS cannot share the TCP port")
     for ns in cfg.sip.nameservers:
-        _require(bool(HOST_RE.match(ns)), f"config.sip.nameservers: {ns!r} is not host[:port]")
+        _require(bool(HOST_RE.fullmatch(ns)), f"config.sip.nameservers: {ns!r} is not host[:port]")
     if cfg.sip.stun_server is not None:
-        _require(bool(HOST_RE.match(cfg.sip.stun_server)), "config.sip.stun_server: expected host[:port]")
+        _require(bool(HOST_RE.fullmatch(cfg.sip.stun_server)), "config.sip.stun_server: expected host[:port]")
     cfg.personas.setdefault("default", PersonaConfig())
     users_seen: dict[str, str] = {}
     uses_tls = False
     for lid, ln in cfg.lines.items():
         p = f"config.lines.{lid}"
-        _require(bool(LINE_ID_RE.match(lid)), f"{p}: line ids must match {LINE_ID_RE.pattern}")
+        _require(bool(LINE_ID_RE.fullmatch(lid)), f"{p}: line ids must match {LINE_ID_RE.pattern}")
         if ln.kind == "trunk":
-            _require(bool(USER_RE.match(ln.user)), f"{p}.user: must match {USER_RE.pattern} (letters and digits, 4 to 32)")
+            _require(bool(USER_RE.fullmatch(ln.user)), f"{p}.user: must match {USER_RE.pattern} (letters and digits, 4 to 32)")
         else:
-            _require(bool(SIP_USER_RE.match(ln.user)), f"{p}.user: must match {SIP_USER_RE.pattern}")
-        _require(bool(DISPLAY_RE.match(ln.display_name)), f"{p}.display_name: printable ASCII, 1 to 64 characters, no quotes or backslashes")
+            _require(bool(SIP_USER_RE.fullmatch(ln.user)), f"{p}.user: must match {SIP_USER_RE.pattern}")
+        _require(bool(DISPLAY_RE.fullmatch(ln.display_name)), f"{p}.display_name: printable ASCII, 1 to 64 characters, no quotes or backslashes")
         _require(ln.persona in cfg.personas, f"{p}.persona: no persona named {ln.persona!r}")
         _require(ln.srtp == "off" or ln.transport == "tls", f"{p}.srtp: SRTP needs transport: tls")
         if ln.password_env is not None:
-            _require(bool(ENV_RE.match(ln.password_env)), f"{p}.password_env: must match {ENV_RE.pattern}")
+            _require(bool(ENV_RE.fullmatch(ln.password_env)), f"{p}.password_env: must match {ENV_RE.pattern}")
         for c in ln.trusted_cidrs:
-            _require(bool(CIDR_RE.match(c)), f"{p}.trusted_cidrs: {c!r} is not an IP or CIDR")
+            _require(bool(CIDR_RE.fullmatch(c)), f"{p}.trusted_cidrs: {c!r} is not an IP or CIDR")
         for n in ln.diverted_from:
-            _require(bool(E164_RE.match(n)), f"{p}.diverted_from: {n!r} is not E.164")
+            _require(bool(E164_RE.fullmatch(n)), f"{p}.diverted_from: {n!r} is not E.164")
         for v in ln.verified_caller_ids:
-            _require(bool(E164_RE.match(v.number)), f"{p}.verified_caller_ids: {v.number!r} is not E.164")
+            _require(bool(E164_RE.fullmatch(v.number)), f"{p}.verified_caller_ids: {v.number!r} is not E.164")
         if ln.accept_invites_from == "trusted":
             _require(bool(ln.trusted_peers), f"{p}.trusted_peers: accept_invites_from: trusted needs at least one peer")
         uses_tls = uses_tls or ln.transport == "tls"
         if ln.kind == "trunk":
-            _require(ln.registrar is not None and bool(SIP_URI_RE.match(ln.registrar)), f"{p}.registrar: expected sip:host[:port][;transport=…]")
-            _require(ln.dial_domain is not None and bool(HOST_RE.match(ln.dial_domain)), f"{p}.dial_domain: expected host[:port]")
+            _require(ln.registrar is not None and bool(SIP_URI_RE.fullmatch(ln.registrar)), f"{p}.registrar: expected sip:host[:port][;transport=…]")
+            _require(ln.dial_domain is not None and bool(HOST_RE.fullmatch(ln.dial_domain)), f"{p}.dial_domain: expected host[:port]")
             if ln.outbound_proxy is not None:
-                _require(bool(SIP_URI_RE.match(ln.outbound_proxy)), f"{p}.outbound_proxy: expected sip:host[:port]")
+                _require(bool(SIP_URI_RE.fullmatch(ln.outbound_proxy)), f"{p}.outbound_proxy: expected sip:host[:port]")
             if ln.number is not None:
-                _require(bool(E164_RE.match(ln.number)), f"{p}.number: expected E.164 like +442079460000")
+                _require(bool(E164_RE.fullmatch(ln.number)), f"{p}.number: expected E.164 like +442079460000")
             if ln.caller_id is not None:
-                _require(bool(E164_RE.match(ln.caller_id)), f"{p}.caller_id: expected E.164 on a trunk line")
+                _require(bool(E164_RE.fullmatch(ln.caller_id)), f"{p}.caller_id: expected E.164 on a trunk line")
             _require(ln.accept_invites_from != "trusted" or bool(ln.trusted_peers), f"{p}.trusted_peers: required")
             if ln.accept_invites_from == "registered_trunk" and not ln.trusted_cidrs:
                 warnings.append(f"{p}.trusted_cidrs is empty: only the registrar's resolved addresses will be accepted")
@@ -379,10 +379,10 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
             if not env.get(env_name):
                 warnings.append(f"{p}: password variable {env_name} is not set; this line will be skipped at start")
         else:
-            _require(ln.aor is not None and bool(AOR_RE.match(ln.aor)), f"{p}.aor: expected sip:user@host[:port]")
+            _require(ln.aor is not None and bool(AOR_RE.fullmatch(ln.aor)), f"{p}.aor: expected sip:user@host[:port]")
             _require(ln.accept_invites_from != "registered_trunk", f"{p}.accept_invites_from: a sip line cannot use registered_trunk")
             if ln.caller_id is not None:
-                _require(bool(AOR_RE.match(ln.caller_id)), f"{p}.caller_id: expected a sip: URI on a sip line")
+                _require(bool(AOR_RE.fullmatch(ln.caller_id)), f"{p}.caller_id: expected a sip: URI on a sip line")
             if ln.transport == "tls":
                 _require(bool(cfg.sip.tls.cert_file and cfg.sip.tls.key_file), f"{p}.transport: tls on a sip line needs sip.tls.cert_file and key_file")
     if uses_tls:
@@ -400,7 +400,7 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
         loopback = host in ("127.0.0.1", "localhost", "::1")
         _require(loopback or u.scheme == "https", "config.brain.base_url: a brain that is not on this machine must use https")
         if br.api_key_env is not None:
-            _require(bool(ENV_RE.match(br.api_key_env)), "config.brain.api_key_env: must match " + ENV_RE.pattern)
+            _require(bool(ENV_RE.fullmatch(br.api_key_env)), "config.brain.api_key_env: must match " + ENV_RE.pattern)
     return warnings
 
 

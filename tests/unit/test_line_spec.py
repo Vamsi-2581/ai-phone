@@ -34,6 +34,10 @@ def test_from_config_refuses_unvalidated_parts():
         _trunk(display_name='evil" <sip:x@y>')
     with pytest.raises(ValueError, match="user"):
         _trunk(user="a b")
+    with pytest.raises(ValueError, match="display_name"):
+        _trunk(display_name="safe\n")  # `$` alone would let a trailing newline through
+    with pytest.raises(ValueError, match="number"):
+        _trunk(number="+442079460000\n")
     with pytest.raises(ValueError, match="aor"):
         LineSpec.from_config("s", LineConfig(kind="sip", user="ok", aor="sip:ok@host;evil", display_name="ok"), None)
 
