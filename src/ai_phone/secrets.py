@@ -5,6 +5,7 @@ component can be swapped for a symlink between a check and the open. The mode is
 """
 from __future__ import annotations
 
+import errno
 import os
 import re
 import stat
@@ -31,14 +32,15 @@ def _open_dir_nofollow(directory: Path, create: bool) -> int:
         for name in parts[1:]:
             try:
                 nxt = os.open(name, _DIR_FLAGS, dir_fd=fd)
-            except (NotADirectoryError, OSError) as e:
-                if isinstance(e, FileNotFoundError) and create:
-                    os.mkdir(name, 0o700, dir_fd=fd)
-                    nxt = os.open(name, _DIR_FLAGS, dir_fd=fd)
-                elif getattr(e, "errno", None) in (getattr(os, "ELOOP", -1), getattr(os, "ENOTDIR", -1)):
-                    raise SecretsError(f"{directory}: {name!r} is a symlink or not a directory; refusing to use it") from None
-                else:
+            except FileNotFoundError:
+                if not create:
                     raise
+                os.mkdir(name, 0o700, dir_fd=fd)
+                nxt = os.open(name, _DIR_FLAGS, dir_fd=fd)
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):  # a symlink (O_NOFOLLOW) or a non-directory in the path
+                    raise SecretsError(f"{directory}: {name!r} is a symlink or not a directory; refusing to use it") from None
+                raise
             os.close(fd)
             fd = nxt
         if create:
@@ -55,7 +57,7 @@ def _read_file(dirfd: int, name: str) -> str | None:
     except FileNotFoundError:
         return None
     except OSError as e:
-        if getattr(e, "errno", None) == getattr(os, "ELOOP", -1):
+        if e.errno in (errno.ELOOP, errno.EMLINK):  # O_NOFOLLOW on a symlink: ELOOP on Linux/macOS (EMLINK on some BSDs)
             raise SecretsError(f"{name} is a symlink; refusing to use it") from None
         raise
     try:
@@ -89,9 +91,10 @@ def _parse(text: str, label: str) -> dict[str, str]:
 def load_secrets(path: Path | None = None) -> dict[str, str]:
     path = Path(path) if path else paths.secrets_path()
     absolute = Path(os.path.abspath(path))
-    if not absolute.parent.exists():
+    try:
+        dirfd = _open_dir_nofollow(absolute.parent, create=False)
+    except FileNotFoundError:
         return {}
-    dirfd = _open_dir_nofollow(absolute.parent, create=False)
     try:
         text = _read_file(dirfd, absolute.name)
     finally:
@@ -103,8 +106,15 @@ def _write_all(path: Path, values: dict[str, str]) -> None:
     absolute = Path(os.path.abspath(path))
     dirfd = _open_dir_nofollow(absolute.parent, create=True)
     try:
-        tmp = f".{absolute.name}.{os.getpid()}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+        for _ in range(8):  # a fresh random name each time; O_EXCL makes a leftover or a concurrent writer harmless
+            tmp = f".{absolute.name}.{os.urandom(8).hex()}.tmp"
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise SecretsError(f"could not create a temporary file next to {path}")
         try:
             with os.fdopen(fd, "w") as f:
                 f.write("".join(f"{k}={v}\n" for k, v in sorted(values.items())))
