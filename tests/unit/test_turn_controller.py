@@ -336,3 +336,11 @@ async def test_goodbye_drains_before_hangup_is_requested():
         assert tc.hangup_requested.is_set() and tc.end_reason == "brain_error" and tx.available() == 0
     finally:
         await teardown(stop, runner, rings, clients)
+
+
+def test_real_media_port_clears_the_flag_only_after_flushing():
+    pytest.importorskip("ai_phone.vendor.pjsua2")
+    import inspect
+    from ai_phone.telephony import media_port
+    src = inspect.getsource(media_port.RingMediaPort.onFrameRequested)
+    assert src.index("self.tx.flush()") < src.index("self._flush_requested = False")

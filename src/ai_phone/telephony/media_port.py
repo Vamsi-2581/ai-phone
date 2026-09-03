@@ -47,8 +47,8 @@ class RingMediaPort(pj.AudioMediaPort):
 
     def onFrameRequested(self, frame) -> None:
         if self._flush_requested:
-            self._flush_requested = False
             self.tx.flush()
+            self._flush_requested = False  # cleared only after the flush, so flush_pending never lies to the controller
         data = self.tx.pop_or_silence() if self.playing else (self.tx.pop() or SILENCE)
         if self._armed and data != SILENCE:
             self.first_nonsilent_ns = time.monotonic_ns()
