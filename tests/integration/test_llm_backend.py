@@ -30,3 +30,19 @@ def test_cancel_stops_stream_early():
         if len(out) == 3:
             llm.cancel(4)
     assert len(out) <= 4
+
+
+def test_prompt_cache_reuses_the_system_prefix():
+    from ai_phone.services.backends.mlx_lm_backend import make_t4
+
+    llm = make_t4()
+    llm.warmup(SYS)
+    hist = [{"role": "system", "content": SYS}, {"role": "user", "content": "What time is it right now?"}]
+    reply = "".join(llm.stream(5, hist, 40))
+    t1 = dict(llm.last_timings)
+    hist += [{"role": "assistant", "content": reply}, {"role": "user", "content": "And what day is it?"}]
+    reply2 = "".join(llm.stream(6, hist, 40))
+    t2 = dict(llm.last_timings)
+    assert reply2.strip()
+    assert t1["prompt_tokens_cached"] > 0 and t2["prompt_tokens_cached"] == t1["prompt_tokens_cached"], (t1, t2)
+    assert t1["prompt_tokens_new"] < t1["prompt_tokens_cached"] + t1["prompt_tokens_new"], "system prefix must come from the snapshot"

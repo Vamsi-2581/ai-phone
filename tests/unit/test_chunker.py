@@ -14,13 +14,17 @@ def test_sentence_punctuation_always_emits():
 
 
 def test_clause_punctuation_needs_min_tokens():
+    # first unit: clause break allowed from 4 tokens; later units need 6
     assert run(["Yes", ",", " I", " can", " do", " that", ",", " sure", "."]) == ["Yes, I can do that,", "sure."]
+    assert run(["Well", ",", " yes", ",", " I", " can", " do", " that", "."]) == ["Well, yes,", "I can do that."]
 
 
 def test_max_tokens_emits_without_punctuation():
-    toks = [f" w{i}" for i in range(15)]
-    out = run(toks, max_tokens=12)
-    assert out[0].split() == [f"w{i}" for i in range(12)] and len(out) == 2
+    toks = [f" w{i}" for i in range(24)]
+    out = run(toks, max_tokens=12, first_max_tokens=8)
+    assert out[0].split() == [f"w{i}" for i in range(8)]           # first unit: 8 tokens
+    assert out[1].split() == [f"w{i}" for i in range(8, 20)]       # later units: 12 tokens
+    assert len(out) == 3
 
 
 def test_flush_returns_remainder_and_empties():
