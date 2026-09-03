@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 import pytest
 
@@ -142,6 +143,8 @@ async def test_factory_args_reach_the_backend():
 @pytest.mark.asyncio
 async def test_workers_never_see_line_passwords(monkeypatch):
     monkeypatch.setenv("AI_PHONE_LINE_MAIN_PASSWORD", "hunter2")
+    monkeypatch.setenv("TELNYX_API_KEY", "KEYabc")           # the README tells the user to export exactly this
+    monkeypatch.setenv("SOME_SERVICE_TOKEN", "tok")
     loop = asyncio.get_running_loop()
     c = WorkerClient("llm", "ai_phone.services.backends.fake:EnvProbeLLM", loop, None, None, {})
     await c.start()
@@ -149,4 +152,5 @@ async def test_workers_never_see_line_passwords(monkeypatch):
     c.send({"op": "llm.generate", "gen": g, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10})
     evs = await _collect(c, "done", g)
     assert "".join(e["text"] for e in evs if e["ev"] == "token") == "clean"
+    assert os.environ.get("TELNYX_API_KEY") == "KEYabc"  # the parent keeps its own environment
     await c.stop()

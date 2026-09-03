@@ -58,6 +58,11 @@ def test_request_uri_for_pstn_and_sip_targets():
     assert request_uri(s, "sip:bob@203.0.113.7:5062") == "sip:bob@203.0.113.7:5062"
     with pytest.raises(DialError, match="E.164"):
         request_uri(s, "07700900123")
+    with pytest.raises(DialError, match="E.164"):
+        request_uri(s, "+447700900123\n")               # `$` alone would let a trailing newline through
+    for bad in ("sip:bob@host;evil=1", "sip:bob@host\r\nVia: x", "sips:bob@host", "sip:bob"):
+        with pytest.raises(DialError, match="sip:"):
+            request_uri(s, bad)
 
 
 def test_caller_id_must_be_own_number_or_verified():
@@ -65,6 +70,31 @@ def test_caller_id_must_be_own_number_or_verified():
     check_caller_id(_trunk(caller_id="+447700900123", verified_caller_ids=[__import__("ai_phone.config", fromlist=["VerifiedCallerId"]).VerifiedCallerId("+447700900123", "telnyx", "2026-09-10T00:00:00Z")]))
     with pytest.raises(DialError, match="verified"):
         check_caller_id(_trunk(caller_id="+447700900999"))
+
+
+class _Call:
+    def __init__(self, cid):
+        self._cid, self.ended, self.answer_timeout = cid, False, None
+
+    def getId(self):
+        return self._cid
+
+
+def test_claim_is_held_until_the_daemon_releases_it():
+    import asyncio
+    from ai_phone.config import Config
+    from ai_phone.telephony.endpoint import Telephony
+    tel = Telephony(Config(), [], asyncio.new_event_loop(), asyncio.Queue(), None, None)
+    a, b = _Call(1), _Call(2)
+    assert tel.try_claim_call(a) and not tel.try_claim_call(b)
+    tel._call_ended(a)                      # PJSIP says disconnected: still claimed
+    assert not tel.try_claim_call(b)
+    assert not tel.release_call(2) and tel.release_call(1)
+    assert tel.try_claim_call(b)
+    tel._stopping = True
+    tel.release_call(2)
+    assert not tel.try_claim_call(a)        # nothing is claimed while stopping
+    tel.loop.close()
 
 
 def test_trunk_without_number_or_caller_id_is_refused():

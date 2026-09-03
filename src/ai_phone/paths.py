@@ -28,9 +28,19 @@ def socket_path() -> Path:
     if len(str(candidate).encode()) <= 100:
         return candidate
     import hashlib
+    import stat
     digest = hashlib.sha256(str(home()).encode()).hexdigest()[:12]
     base = Path("/private/tmp") if Path("/private/tmp").is_dir() else Path("/tmp")
-    return base / f"ai-phone-{os.getuid()}-{digest}.sock"
+    private = base / f"ai-phone-{os.getuid()}"  # a 0700 directory of our own inside the world-writable tmp
+    if private.is_symlink():
+        raise RuntimeError(f"{private} is a symlink; refusing to place the control socket there")
+    private.mkdir(mode=0o700, exist_ok=True)
+    st = private.stat()
+    if st.st_uid != os.getuid():
+        raise RuntimeError(f"{private} is not owned by this user; refusing to place the control socket there")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(private, 0o700)
+    return private / f"{digest}.sock"
 
 
 def lines_dir() -> Path:

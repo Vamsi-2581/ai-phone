@@ -7,6 +7,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,16 +25,31 @@ def _private_dir(d: Path) -> Path:
     return d
 
 
+_lock_depth = threading.local()
+
+
 @contextmanager
 def line_lock(d: Path):
+    """Exclusive lock for everything under ~/.ai-phone/lines (and the config/secrets writes that go with it).
+    Re-entrant within a thread, so a whole CLI command can hold it while the helpers it calls take it again."""
+    depth = getattr(_lock_depth, "n", 0)
+    if depth:
+        _lock_depth.n = depth + 1
+        try:
+            yield
+        finally:
+            _lock_depth.n -= 1
+        return
     d = _private_dir(Path(d))
     fd = os.open(d / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)  # never follows a planted symlink; 0600
     try:
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_depth.n = 1
         try:
             yield
         finally:
+            _lock_depth.n = 0
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)

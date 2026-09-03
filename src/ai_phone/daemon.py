@@ -77,7 +77,9 @@ class Daemon:
         gen = tts.next_gen()
         tts.send({"op": "tts.synth", "gen": gen, "seq": 0, "text": text})
         while True:
-            m = await tts.events.get()
+            m = await asyncio.wait_for(tts.events.get(), 120)
+            if m["ev"] == "error":
+                raise RuntimeError(f"TTS worker failed while caching a phrase: {m.get('message', '')[:200]}")
             if m["ev"] == "done" and m["gen"] == gen:
                 break
         frames = []
@@ -149,34 +151,38 @@ class Daemon:
         else:
             llm = WorkerClient("llm", F["llm"][self.tier], loop, None, None, {"system_prompt": default_prompt})
         tts = WorkerClient("tts", F["tts"], loop, None, tts_out, {})
-        try:
-            warm = await asyncio.gather(stt.start(), llm.start(), tts.start())
-        except RuntimeError as e:
-            log.error("%s", redact(str(e), self.secrets.values()))
-            raise SystemExit(1)
-        cached = {"prompt": await self._cache_phrase(tts, tts_out, "Still there?"),
-                  "warning": await self._cache_phrase(tts, tts_out, "This call will end in thirty seconds."),
-                  "apology": await self._cache_phrase(tts, tts_out, APOLOGY),
-                  "goodbye": await self._cache_phrase(tts, tts_out, GOODBYE)}
-        greetings = {name: await self._cache_phrase(tts, tts_out, p.greeting) for name, p in personas.items()}
-        openings = {name: await self._cache_phrase(tts, tts_out, p.outbound_opening) for name, p in personas.items()}
-        specs = self._line_specs()
-        tel = Telephony(self.cfg, specs, loop, events, rx, tx)
-        tel.start()
-        for w in tel.peer_warnings:
-            log.warning(w)
-        self._write_state()
-        turn_log = TurnLog(self.log_dir / "turns.jsonl")
-        stop = asyncio.Event()
-        for s in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(s, stop.set)
-        ctx = dict(tel=tel, stt=stt, llm=llm, tts=tts, rx=rx, tx=tx, stt_in=stt_in, tts_out=tts_out, cached=cached,
-                   greetings=greetings, openings=openings, personas=personas, turn_log=turn_log, events=events, stop=stop, specs={s.id: s for s in specs})
-        control = ControlServer(paths.socket_path(), lambda msg, send: self._control(msg, send, ctx))
-        await control.start()
-        log.info("ready lines=%s brain=%s tier=%s warm=%s", [s.id for s in specs], self.cfg.brain.kind, self.tier, warm)
-        print("ready", flush=True)
-        try:
+        tel: Telephony | None = None
+        control: ControlServer | None = None
+        started: list[WorkerClient] = []
+        try:  # from here on every failure tears down what exists: workers, rings, endpoint, socket
+            try:
+                warm = await asyncio.gather(stt.start(), llm.start(), tts.start())
+            except RuntimeError as e:
+                log.error("%s", redact(str(e), self.secrets.values()))
+                raise SystemExit(1)
+            started = [stt, llm, tts]
+            cached = {"prompt": await self._cache_phrase(tts, tts_out, "Still there?"),
+                      "warning": await self._cache_phrase(tts, tts_out, "This call will end in thirty seconds."),
+                      "apology": await self._cache_phrase(tts, tts_out, APOLOGY),
+                      "goodbye": await self._cache_phrase(tts, tts_out, GOODBYE)}
+            greetings = {name: await self._cache_phrase(tts, tts_out, p.greeting) for name, p in personas.items()}
+            openings = {name: await self._cache_phrase(tts, tts_out, p.outbound_opening) for name, p in personas.items()}
+            specs = self._line_specs()
+            tel = Telephony(self.cfg, specs, loop, events, rx, tx)
+            tel.start()
+            for w in tel.peer_warnings:
+                log.warning(w)
+            self._write_state()
+            turn_log = TurnLog(self.log_dir / "turns.jsonl")
+            stop = asyncio.Event()
+            for s in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(s, stop.set)
+            ctx = dict(tel=tel, stt=stt, llm=llm, tts=tts, rx=rx, tx=tx, stt_in=stt_in, tts_out=tts_out, cached=cached,
+                       greetings=greetings, openings=openings, personas=personas, turn_log=turn_log, events=events, stop=stop, specs={s.id: s for s in specs})
+            control = ControlServer(paths.socket_path(), lambda msg, send: self._control(msg, send, ctx))
+            await control.start()
+            log.info("ready lines=%s brain=%s tier=%s warm=%s", [s.id for s in specs], self.cfg.brain.kind, self.tier, warm)
+            print("ready", flush=True)
             while not stop.is_set():
                 try:
                     e = await asyncio.wait_for(events.get(), 0.2)
@@ -190,7 +196,7 @@ class Daemon:
                 elif isinstance(e, ev.CallRejected):
                     log.info("rejected on %s: %s with %s", e.line_id, e.source_ip, e.code)
                 elif isinstance(e, ev.MediaActive):
-                    lid = tel.line_of(e.call_id) or next(iter(ctx["specs"]))
+                    lid = e.line_id  # the event is authoritative; current_call is mutable state
                     ob = self._outbound if self._outbound and self._outbound["call_id"] == e.call_id else None
                     if ob is None:
                         await self._run_call(e.call_id, lid, "in", None, ctx)
@@ -213,12 +219,16 @@ class Daemon:
                         # a rejected second caller's own "ended" carries a different id and must not touch it
                         self.active_call = None
                         self._write_state()
+                        tel.release_call(e.call_id)  # no controller ran, so nothing else will release the claim
                     for q in self._call_waiters:
                         q.put_nowait(e)
         finally:
-            await control.stop()
-            tel.stop()
-            await asyncio.gather(stt.stop(), llm.stop(), tts.stop())
+            if control is not None:
+                await control.stop()
+            if tel is not None:
+                tel.stop()
+            if started:
+                await asyncio.gather(*(c.stop() for c in started))
             for r in (rx, tx, stt_in, tts_out):
                 r.close()
                 r.unlink()
@@ -236,9 +246,9 @@ class Daemon:
             await send({"ok": True, "hung_up": cid is not None})
             return
         # call
-        line_id = msg.get("line") or next(iter(ctx["specs"]), None)
+        line_id = msg.get("line") or self._default_line_for(msg.get("to", ""), ctx["specs"], tel)
         if line_id not in ctx["specs"]:
-            await send({"ok": False, "error": f"no such line {line_id!r}"})
+            await send({"ok": False, "error": f"no such line {line_id!r}" if msg.get("line") else "no line can dial that target (no registered trunk for a phone number, or no sip line for a sip: address)"})
             return
         persona = msg.get("persona") or ctx["specs"][line_id].persona
         if persona not in ctx["personas"]:
@@ -248,6 +258,7 @@ class Daemon:
         self._call_waiters.append(q)
         cid: int | None = None   # set once PJSIP has a call; cleanup below must not assume it
         outcome = "rejected"
+        detail = ""
         try:
             try:
                 cid = tel.make_call(line_id, msg["to"], float(msg.get("timeout_sec", 30)))
@@ -256,7 +267,7 @@ class Daemon:
                 return
             except DialError as e:
                 await send({"event": "ended", "reason": "rejected", "detail": str(e), "exit_code": EXIT["rejected"]})
-                return
+                return  # nothing was claimed (make_call cleared it) and no state was written
             log.info("control: call on line %s to %s -> call_id %s", line_id, msg["to"], cid)
             self._outbound = {"call_id": cid, "persona": persona, "send": send}
             self.active_call = {"call_id": cid, "line_id": line_id, "remote": msg["to"], "started_at": time.time(), "direction": "out"}
@@ -264,9 +275,11 @@ class Daemon:
             while True:  # progress arrives via the main loop, which is the only consumer of the telephony queue
                 e = await q.get()
                 if isinstance(e, ev.OutboundProgress) and (e.call_id == cid or (e.call_id == -1 and e.line_id == line_id)):  # -1: "dialling", before PJSIP assigns the id
-                    await self._send_quiet(send, {"event": e.state, "code": e.code, "uri": e.reason if e.state == "dialling" else ""})
+                    await self._send_quiet(send, {"event": e.state, "code": e.code, "uri": e.reason if e.state == "dialling" else "",
+                                                  "reason": "" if e.state == "dialling" else e.reason})
                     if e.state in ("busy", "no_answer", "rejected", "redirected"):
                         outcome = e.state
+                        detail = f"{e.code} {e.reason}".strip()
                         break
                     if e.state == "answered":
                         outcome = "answered"
@@ -276,13 +289,28 @@ class Daemon:
                     break
                 elif isinstance(e, ev.CallStateChanged) and e.call_id == cid and e.state == "ended" and self._outbound is not None:
                     break  # ended before media became active
-            await self._send_quiet(send, {"event": "ended", "reason": outcome, "exit_code": EXIT.get(outcome, EXIT["rejected"])})
+            if outcome == "rejected" and detail and detail.split(" ", 1)[0] in ("403", "603"):
+                detail += " (the carrier refused the caller ID; use the line's own number or a verified one)"
+            await self._send_quiet(send, {"event": "ended", "reason": outcome, "detail": detail, "exit_code": EXIT.get(outcome, EXIT["rejected"])})
         finally:
             self._outbound = None
             self._call_waiters.remove(q)
             if cid is not None and self.active_call is not None and self.active_call.get("call_id") == cid and outcome != "answered":
                 self.active_call = None  # never reached media, so _run_call never cleared it
                 self._write_state()
+
+    @staticmethod
+    def _default_line_for(target: str, specs: dict, tel) -> str | None:
+        """No --line given: a sip: address goes out on the first sip line (falling back to any line);
+        a phone number goes out on the first registered trunk line."""
+        if target.startswith("sip:"):
+            sip_lines = [lid for lid, s in specs.items() if s.kind == "sip"]
+            return sip_lines[0] if sip_lines else next(iter(specs), None)
+        for lid, s in specs.items():
+            acc = tel.accounts.get(lid) if hasattr(tel, "accounts") else None
+            if s.kind == "trunk" and s.dial_domain and (acc is None or acc.registered):
+                return lid
+        return None
 
     async def _send_quiet(self, send, msg: dict) -> None:
         try:
@@ -347,7 +375,11 @@ class Daemon:
             rec = tc.timer.to_record(str(call_id), n[0])
             rec.update(incomplete=True, state_at_end=tc.state, line_id=line_id, persona=persona_name)
             turn_log.write(rec)
+        port = tel.port
+        if port is not None and hasattr(port, "cancel_flush"):
+            port.cancel_flush()  # a flush the PJSIP thread never performed must not hit the next call's greeting
         for r in (rx, tx, tts_out):
             r.flush()
         self.active_call = None
         self._write_state()
+        tel.release_call(call_id)  # only now may the next call be claimed

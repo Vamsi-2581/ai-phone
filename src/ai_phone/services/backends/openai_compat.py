@@ -23,7 +23,8 @@ class OpenAICompatLLM:
         self.base_url, self.model, self.max_chars = base_url.rstrip("/"), model, max_response_chars
         self.first_token_s = first_token_timeout_ms / 1000
         self.timeout = httpx.Timeout(connect=connect_timeout_ms / 1000, read=stream_idle_timeout_ms / 1000, write=5.0, pool=5.0)
-        self.http = http or httpx.Client(timeout=self.timeout, follow_redirects=False)
+        # our own client never consults HTTP(S)_PROXY (trust_env=False): the only in-call network is the configured endpoint
+        self.http = http or httpx.Client(timeout=self.timeout, follow_redirects=False, trust_env=False)
         self.http.follow_redirects = False
         if api_key:
             self.http.headers["Authorization"] = f"Bearer {api_key}"
@@ -56,7 +57,12 @@ class OpenAICompatLLM:
                 with self.http.stream("POST", f"{self.base_url}/chat/completions", json=body, timeout=thread_timeout) as r:
                     holder["response"] = r
                     q.put(("status", r.status_code))
+                    budget = 8 * self.max_chars + 4096  # the producer stops reading long before a hostile endpoint can flood the queue
                     for line in r.iter_lines():
+                        budget -= len(line) + 1
+                        if budget < 0:
+                            q.put(("error", BrainError("too_long", "stream exceeded the response budget")))
+                            return
                         q.put(("line", line))
                 q.put(("eof", None))
             except BaseException as e:  # reported to the consumer, which decides what it means
@@ -104,6 +110,8 @@ class OpenAICompatLLM:
                     continue
                 if kind == "error":
                     e = payload
+                    if isinstance(e, BrainError):
+                        raise e
                     if isinstance(e, httpx.ConnectError):
                         raise BrainError("connect", str(e)[:80]) from None
                     if isinstance(e, httpx.ReadTimeout):

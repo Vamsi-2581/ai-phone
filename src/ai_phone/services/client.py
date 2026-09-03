@@ -2,11 +2,32 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import multiprocessing as mp
+import os
+import re
 
 from ai_phone.services import ipc
 from ai_phone.services.worker import run_worker
 from ai_phone.telephony.rings import FrameRing
+
+
+SECRET_ENV_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)", re.IGNORECASE)
+SECRET_ENV_PREFIXES = ("AI_PHONE_LINE_", "TELNYX_", "TWILIO_")
+
+
+def is_secret_env(name: str) -> bool:
+    return name.startswith(SECRET_ENV_PREFIXES) or bool(SECRET_ENV_RE.search(name))
+
+
+@contextlib.contextmanager
+def scrubbed_environment():
+    """Spawned children copy the parent's environment at start(); hide anything that looks like a secret meanwhile."""
+    hidden = {k: os.environ.pop(k) for k in list(os.environ) if is_secret_env(k)}
+    try:
+        yield
+    finally:
+        os.environ.update(hidden)
 
 
 class WorkerClient:
@@ -42,7 +63,8 @@ class WorkerClient:
             args=(self.kind, self.factory, self._child,
                   self.audio_in.name if self.audio_in else None,
                   self.audio_out.name if self.audio_out else None, self.warm_args, self.factory_args))
-        self._proc.start()
+        with scrubbed_environment():  # no carrier key, line password or token reaches a model worker
+            self._proc.start()
         self._child.close()  # the child owns its end now
         ready = await self.loop.run_in_executor(None, ipc.recv, self._parent)
         if ready.get("ev") != "ready":

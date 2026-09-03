@@ -19,6 +19,7 @@ class AiCall(pj.Call):
         self.direction = direction
         self.media_connected = False
         self.answered = False
+        self.ended = False  # PJSIP reported DISCONNECTED; the daemon releases the one-call claim after its own teardown
         self.cancelled = False  # set by Telephony when it CANCELs an unanswered outbound call
         self.answer_timeout = None  # asyncio TimerHandle for the no-answer CANCEL, owned by this call
         self._media_index = None  # outbound: audio that became active before CONFIRMED (early media) waits here
@@ -37,10 +38,11 @@ class AiCall(pj.Call):
                 self._connect_media(self._media_index)  # early media was held back; the answer is real now
         elif ci.state == pj.PJSIP_INV_STATE_DISCONNECTED:
             code, reason = int(ci.lastStatusCode), str(ci.lastReason)
+            self.ended = True
             if self.direction == "out" and not self.answered:
                 _post(loop, q, ev.OutboundProgress(self.getId(), lid, self._outcome(code), code, reason))
             _post(loop, q, ev.CallStateChanged(self.getId(), lid, "ended", code, reason))
-            self.acc.telephony._call_ended(self)
+            self.acc.telephony._call_ended(self)  # timers only; the claim is released by the daemon once teardown is done
 
     def _outcome(self, code: int) -> str:
         if code in (486, 600):

@@ -51,6 +51,14 @@ def test_empty_and_malformed_logs_fail_cleanly(tmp_path: Path):
     assert r["total_sec"] == 0 and r["registered_pct"] == 0 and not r["ok"](60, 99)
 
 
+def test_a_dead_daemon_never_passes(tmp_path: Path):
+    p = tmp_path / "s.log"
+    p.write_text("2026-09-10 12:00:00,000 INFO registration line=main state=registered code=200 reason=OK\n"
+                 "2026-09-10 12:00:30,000 ERROR soak end (daemon died)\n")
+    r = analyse(p, "main")
+    assert r["died"] and not r["ok"](60, 0)
+
+
 def test_bad_timestamp_and_empty_log_are_ignored_not_fatal(tmp_path: Path):
     p = tmp_path / "s.log"
     p.write_text("")

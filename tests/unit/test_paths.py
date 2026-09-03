@@ -11,7 +11,10 @@ def test_home_honours_env(monkeypatch, tmp_path: Path):
     assert paths.state_path() == tmp_path / "state.json"
     sock = paths.socket_path()  # falls back to a short /tmp path when the home is too deep for AF_UNIX
     short_tmp = Path("/private/tmp") if Path("/private/tmp").is_dir() else Path("/tmp")  # the same rule production uses
-    assert sock == tmp_path / "control.sock" if len(str(tmp_path / "control.sock").encode()) <= 100 else sock.parent == short_tmp
+    if len(str(tmp_path / "control.sock").encode()) <= 100:
+        assert sock == tmp_path / "control.sock"
+    else:
+        assert sock.parent.parent == short_tmp and sock.parent.name.startswith("ai-phone-")
     assert paths.lines_dir() == tmp_path / "lines"
 
 
@@ -24,7 +27,9 @@ def test_socket_path_falls_back_to_a_short_tmp_path(monkeypatch, tmp_path: Path)
     deep = tmp_path / ("x" * 60) / ("y" * 60)
     monkeypatch.setenv("AI_PHONE_HOME", str(deep))
     sock = paths.socket_path()
-    assert len(str(sock).encode()) <= 100 and sock.name.startswith("ai-phone-") and sock.suffix == ".sock"
+    import os, stat
+    assert len(str(sock).encode()) <= 100 and sock.suffix == ".sock" and sock.parent.name == f"ai-phone-{os.getuid()}"
+    assert stat.S_IMODE(sock.parent.stat().st_mode) == 0o700 and sock.parent.stat().st_uid == os.getuid()
     assert paths.socket_path() == sock  # deterministic for the same home
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path / "short"))
     assert paths.socket_path() == tmp_path / "short" / "control.sock" or len(str(tmp_path / "short")) > 87

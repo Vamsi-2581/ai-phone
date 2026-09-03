@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ai_phone import paths
 from ai_phone.config import E164_RE, LINE_ID_RE, ConfigError, line_password_env, load_config
-from ai_phone.lines.config_writer import add_line, read_raw, remove_line, update_line
+from ai_phone.lines.config_writer import add_line, read_raw, remove_line, update_line, write_raw
 from ai_phone.lines.credentials import generate_sip_password, generate_sip_user
 from ai_phone.lines.forward import WHEN, divert_codes
 from ai_phone.lines.journal import Journal
@@ -105,6 +105,12 @@ def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, 
 
 def _commit(journal: Journal, config_path: Path, line_id: str, result, persona: str, env_name: str) -> int:
     if result.state == "failed":
+        raw = read_raw(config_path)
+        existing = (raw.get("lines") or {}).get(line_id)
+        if existing is not None:  # a pending line whose order the carrier finally rejected: say so in the config too
+            provider = dict(existing.get("provider") or {"name": journal.doc["provider"], "resources": {}})
+            provider["state"] = "failed"
+            update_line(config_path, line_id, provider=provider)
         _say(f"error: {result.message}\nRun `ai-phone lines remove {line_id} --key-env <NAME>` to release what was created.")
         return EXIT_ERROR
     if not result.line:  # nothing loadable to write yet; the journal keeps the state
@@ -118,11 +124,23 @@ def _commit(journal: Journal, config_path: Path, line_id: str, result, persona: 
     line["provider"] = dict(line.get("provider") or {"name": journal.doc["provider"], "resources": {}})
     line["provider"]["state"] = result.state
     raw = read_raw(config_path)
-    if line_id in (raw.get("lines") or {}):
+    previous = (raw.get("lines") or {}).get(line_id)
+    if previous is not None:
         update_line(config_path, line_id, **line)
     else:
         add_line(config_path, line_id, line)
-    load_config(config_path)  # what we wrote must load, pending or ready
+    try:
+        load_config(config_path)  # what we wrote must load, pending or ready
+    except ConfigError as e:  # never leave an unloadable config behind: restore what was there, keep the journal
+        if previous is not None:
+            raw2 = read_raw(config_path)
+            raw2["lines"][line_id] = previous
+            write_raw(config_path, raw2)
+        else:
+            remove_line(config_path, line_id)
+        _say(f"error: the provisioned line does not validate ({e}); the config was restored. The carrier resources exist: "
+             f"fix the cause, then `ai-phone lines resume {line_id}`, or `ai-phone lines remove {line_id}` to release them.")
+        return EXIT_ERROR
     if result.state == "ready":
         journal.start("local_committed")
         journal.finish("local_committed")  # the step's own timestamp records when; no result keys, so resources() stays carrier ids
@@ -144,11 +162,16 @@ def cmd_add(a) -> int:
     provider = _provider(a)
     raw = read_raw(config_path)
     line_id = a.id or _next_id(raw, a.provider)
-    if not LINE_ID_RE.match(line_id):
+    if not LINE_ID_RE.fullmatch(line_id):
         _fail(f"--id must match {LINE_ID_RE.pattern}")
     if line_id in (raw.get("lines") or {}):
         _say(f"error: line {line_id!r} already exists (use --id to pick another name)")
         return EXIT_ERROR
+    # everything the finished line will need is checked now, before a single carrier request spends money
+    current = load_config(config_path) if config_path.exists() else None
+    known_personas = set((current.personas if current else {}) | {"default": None})
+    if a.persona not in known_personas:
+        _fail(f"--persona {a.persona!r} is not defined in {config_path} (personas: {', '.join(sorted(known_personas))})")
     number = _pick_number(provider, a)
     cost = f"{number.monthly_cost:.2f} {number.currency}/month" if number.monthly_cost is not None else "the carrier's monthly price"
     if not _ask(f"Buy {number.e164} for {cost} on your {provider.name} account?", a.yes):
@@ -158,7 +181,7 @@ def cmd_add(a) -> int:
 
 
 def _add_manual(a, config_path: Path) -> int:
-    if not LINE_ID_RE.match(a.id or ""):
+    if not LINE_ID_RE.fullmatch(a.id or ""):
         _fail(f"--id is required and must match {LINE_ID_RE.pattern}")
     raw = read_raw(config_path)
     if a.id in (raw.get("lines") or {}):
@@ -289,7 +312,7 @@ def cmd_forward(a) -> int:
     ln = cfg.lines.get(a.line_id) or _fail(f"no line {a.line_id}")
     if ln.kind != "trunk" or not ln.number:
         _fail(f"line {a.line_id} has no phone number to divert to")
-    if not E164_RE.match(a.from_number):
+    if not E164_RE.fullmatch(a.from_number):
         _fail("--from must be your mobile number in E.164, like +447700900123")
     c = divert_codes(a.when, ln.number)
     _say(f"On your iPhone, open the dialler, type {c['activate']} and press call.\n"
@@ -305,7 +328,7 @@ def cmd_verify(a) -> int:
     pname, ln = _journal_for(a.line_id, a)
     if not pname:
         _fail(f"line {a.line_id} was not provisioned by a carrier module; verify the number in your carrier's portal")
-    if not E164_RE.match(a.number):
+    if not E164_RE.fullmatch(a.number):
         _fail("number must be E.164")
     a.provider = pname
     provider = _provider(a)
@@ -337,11 +360,14 @@ def cmd_verify(a) -> int:
 
 
 def _guarded(fn):
-    """Provider and secrets failures anywhere in a command are reported, never traced, and exit 3."""
+    """Every lines command runs under the lines lock for its whole duration (config, secrets and journal writes
+    included, so two commands never interleave), and provider/secrets failures are reported, never traced (exit 3)."""
     def run(a) -> int:
+        from ai_phone.lines.journal import line_lock
         from ai_phone.providers.base import ProviderError
         try:
-            return fn(a)
+            with line_lock(paths.lines_dir()):
+                return fn(a)
         except (ProviderError, SecretsError, ValueError) as e:
             _say(f"error: {e}")
             return EXIT_ERROR

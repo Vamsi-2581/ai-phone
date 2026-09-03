@@ -150,6 +150,19 @@ def test_missing_password_env_is_a_warning_not_an_error(tmp_path: Path, monkeypa
     assert any("AI_PHONE_LINE_MAIN_PASSWORD" in w for w in warnings)
 
 
+def test_password_in_secrets_env_is_not_warned_about(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("AI_PHONE_LINE_MAIN_PASSWORD", raising=False)
+    cfg = _load(tmp_path, V2)
+    assert any("AI_PHONE_LINE_MAIN_PASSWORD" in w for w in cfg.warnings)
+    cfg2 = load_config(tmp_path / "config.yaml", env={"AI_PHONE_LINE_MAIN_PASSWORD": "from-secrets-env"})
+    assert not any("AI_PHONE_LINE_MAIN_PASSWORD" in w for w in cfg2.warnings)
+
+
+def test_any_policy_is_warned_about(tmp_path: Path):
+    cfg = _load(tmp_path, V2.replace("accept_invites_from: registered_trunk", "accept_invites_from: any"))
+    assert any("'any'" in w for w in cfg.warnings)
+
+
 def test_unknown_key_is_rejected(tmp_path: Path):
     with pytest.raises(ConfigError, match="unknown key"):
         _load(tmp_path, V2 + "bogus: 1\n")

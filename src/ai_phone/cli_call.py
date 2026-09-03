@@ -28,7 +28,8 @@ def cmd_call(a) -> int:
         if kind == "turn":
             print(f"turn {e.get('turn')}: first audible {e.get('first_audible_ms')} ms", flush=True)
         elif kind == "ended":
-            print(f"ended: {e.get('reason')}", flush=True)
+            detail = e.get("detail")
+            print(f"ended: {e.get('reason')}" + (f" ({detail})" if detail else ""), flush=True)
         else:
             print(f"{kind} {e.get('uri', '')}".strip(), flush=True)
 

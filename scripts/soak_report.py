@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 LINE = re.compile(r"^(\S+ \S+?),\d+ \w+ registration line=(\S+) state=(\S+) code=(\d+)")
-END = re.compile(r"^(\S+ \S+?),\d+ \w+ soak end")
+END = re.compile(r"^(\S+ \S+?),\d+ \w+ soak end( \(daemon died\))?")
 
 
 def analyse(path: Path, line_id: str) -> dict:
@@ -16,6 +16,7 @@ def analyse(path: Path, line_id: str) -> dict:
     registered = 0.0
     drops: list[dict] = []
     first = last = None
+    died = False
     for raw in Path(path).read_text().splitlines():
         m = LINE.match(raw)
         e = END.match(raw)
@@ -27,6 +28,7 @@ def analyse(path: Path, line_id: str) -> dict:
             continue  # a registration line with an unparseable timestamp is ignored, never fatal
         if e:
             last = stamp
+            died = bool(e.group(2))
             break
         if m.group(2) != line_id:
             continue  # other lines never move this line's clock
@@ -49,9 +51,10 @@ def analyse(path: Path, line_id: str) -> dict:
     pct = (registered / total * 100) if total else 0.0
 
     def ok(max_recover_sec: float, min_registered_pct: float) -> bool:
-        return pct >= min_registered_pct and all(d["recover_sec"] is not None and d["recover_sec"] <= max_recover_sec for d in drops)
+        return (not died and pct >= min_registered_pct
+                and all(d["recover_sec"] is not None and d["recover_sec"] <= max_recover_sec for d in drops))
 
-    return {"registered_pct": pct, "total_sec": total, "drops": drops, "ok": ok}
+    return {"registered_pct": pct, "total_sec": total, "drops": drops, "died": died, "ok": ok}
 
 
 def main(argv=None) -> int:
@@ -62,7 +65,8 @@ def main(argv=None) -> int:
     ap.add_argument("--min-registered-pct", type=float, default=99)
     a = ap.parse_args(argv)
     r = analyse(Path(a.log), a.line)
-    print(f"line {a.line}: registered {r['registered_pct']:.2f}% of {r['total_sec'] / 3600:.1f} h; drops: {len(r['drops'])}")
+    print(f"line {a.line}: registered {r['registered_pct']:.2f}% of {r['total_sec'] / 3600:.1f} h; drops: {len(r['drops'])}"
+          + ("; THE DAEMON DIED before the end" if r["died"] else ""))
     for d in r["drops"]:
         print(f"  {d['at']}  recovered in {d['recover_sec']} s")
     good = r["ok"](a.max_recover_sec, a.min_registered_pct)

@@ -42,6 +42,18 @@ def test_lock_is_exclusive(tmp_path: Path):
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
+def test_lock_is_reentrant_in_one_thread_and_exclusive_across_processes(tmp_path: Path):
+    import fcntl
+    with line_lock(tmp_path / "lines"):
+        with line_lock(tmp_path / "lines"):  # a helper inside a locked command takes it again without deadlocking
+            f = open(tmp_path / "lines" / ".lock", "w")
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    f2 = open(tmp_path / "lines" / ".lock", "w")
+    fcntl.flock(f2, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released once the outermost context ended
+    fcntl.flock(f2, fcntl.LOCK_UN)
+
+
 def test_credentials_follow_carrier_rules():
     u = generate_sip_user("my-line-2")
     assert u.isalnum() and 4 <= len(u) <= 32 and u.startswith("aimyline2")

@@ -361,6 +361,8 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
             _require(bool(E164_RE.fullmatch(v.number)), f"{p}.verified_caller_ids: {v.number!r} is not E.164")
         if ln.accept_invites_from == "trusted":
             _require(bool(ln.trusted_peers), f"{p}.trusted_peers: accept_invites_from: trusted needs at least one peer")
+        if ln.accept_invites_from == "any":
+            warnings.append(f"{p}.accept_invites_from is 'any': every INVITE from anywhere on the internet will be answered")
         uses_tls = uses_tls or ln.transport == "tls"
         if ln.kind == "trunk":
             _require(ln.registrar is not None and bool(SIP_URI_RE.fullmatch(ln.registrar)), f"{p}.registrar: expected sip:host[:port][;transport=…]")
@@ -405,11 +407,12 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
     return warnings
 
 
-def load_config(path: Path) -> Config:
+def load_config(path: Path, env: Mapping[str, str] | None = None) -> Config:
+    """`env` is where line passwords are looked up for the warnings (the daemon passes os.environ merged with secrets.env)."""
     raw = yaml.safe_load(Path(path).expanduser().read_text()) or {}
     if not isinstance(raw, dict):
         raise ConfigError("config: expected a mapping at the top level")
     raw, warnings = _migrate_legacy(raw)
     cfg = _build(Config, raw, "config")
-    cfg.warnings = warnings + validate_config(cfg)
+    cfg.warnings = warnings + validate_config(cfg, env)
     return cfg

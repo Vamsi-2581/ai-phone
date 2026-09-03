@@ -86,6 +86,34 @@ def test_verify_caller_id_records_it(home: Path, monkeypatch):
     assert v and v[0].number == "+447700900123" and v[0].provider == "fake"
 
 
+def test_unknown_persona_is_refused_before_any_carrier_call(home: Path, capsys):
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--persona", "typo", "--yes"]) == 3
+    assert "--persona" in capsys.readouterr().out
+    assert not (home / "fake-carrier.json").exists() and not (home / "lines" / "main.journal.json").exists()
+
+
+def test_unloadable_result_restores_the_config(home: Path, monkeypatch):
+    from ai_phone.providers.base import ProvisionResult
+    monkeypatch.setattr("ai_phone.providers.fake.FakeProvider.provision",
+                        lambda self, journal, number, line_id, user, pw: ProvisionResult("ready", "ok", {"kind": "trunk", "registrar": "not a uri", "dial_domain": "x", "user": user}))
+    from ai_phone.lines.config_writer import read_raw
+    before = read_raw(home / "config.yaml")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 3
+    after = read_raw(home / "config.yaml")
+    assert (after.get("lines") or {}) == {} and after["personas"] == before["personas"]  # restored (an empty lines: {} is equivalent)
+    assert (home / "lines" / "main.journal.json").exists()  # the carrier side is kept for resume/remove
+
+
+def test_failed_order_marks_an_existing_pending_line(home: Path, monkeypatch):
+    monkeypatch.setenv("AI_PHONE_FAKE_PENDING", "5")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 2
+    from ai_phone.providers.base import ProvisionResult
+    monkeypatch.setattr("ai_phone.providers.fake.FakeProvider.provision",
+                        lambda self, journal, number, line_id, user, pw: ProvisionResult("failed", "the carrier rejected the order"))
+    assert main(["lines", "resume", "main", "--key-env", "FAKE_KEY"]) == 3
+    assert load_config(home / "config.yaml").lines["main"].provider.state == "failed"
+
+
 def test_list(home: Path, capsys):
     main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"])
     assert main(["lines", "list"]) == 0

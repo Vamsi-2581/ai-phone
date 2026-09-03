@@ -23,10 +23,11 @@ SIGNALLING_CIDRS: list[str] = [
 
 
 def _detail(r: httpx.Response) -> str:
+    """The carrier's error *message* (never the body): the `detail` strings of a JSON error, or nothing."""
     try:
-        return "; ".join(e.get("detail", "") for e in r.json().get("errors", [])) or r.text[:200]
+        return "; ".join(str(e.get("detail", ""))[:120] for e in r.json().get("errors", []))[:300]
     except ValueError:
-        return r.text[:200]
+        return "(non-JSON error response)"
 
 
 class TelnyxProvider:
@@ -35,6 +36,7 @@ class TelnyxProvider:
 
     def __init__(self, key: str, secret: str | None = None, http: httpx.Client | None = None):
         self._key = key
+        self._sensitive: list[str] = [key]  # everything that must never appear in an error: key, then SIP passwords seen
         self.http = http or httpx.Client(base_url=TELNYX_API, timeout=20.0)
         self.http.headers["Authorization"] = f"Bearer {key}"
 
@@ -45,9 +47,13 @@ class TelnyxProvider:
         except httpx.HTTPError as e:
             raise ProviderError(f"telnyx {method} {path}: {type(e).__name__}", retryable=True) from None
         if r.status_code >= 400:
-            raise ProviderError(f"telnyx {method} {path} -> {r.status_code}: {_detail(r).replace(self._key, '***')}",
-                                retryable=r.status_code >= 500)
+            raise ProviderError(f"telnyx {method} {path} -> {r.status_code}: {self._redact(_detail(r))}", retryable=r.status_code >= 500)
         return r.json().get("data", {}) if r.content else {}
+
+    def _redact(self, text: str) -> str:
+        for v in sorted((v for v in self._sensitive if v), key=len, reverse=True):
+            text = text.replace(v, "***")
+        return text
 
     def _find(self, path: str, key: str, value: str) -> dict | None:
         for item in self._call("GET", path, params={f"filter[{key}][contains]": value}) or []:
@@ -75,6 +81,7 @@ class TelnyxProvider:
 
     # ---- provisioning -------------------------------------------------------------------------
     def provision(self, journal: Journal, number: Number, line_id: str, sip_user: str, sip_password: str) -> ProvisionResult:
+        self._sensitive.append(sip_password)
         name = f"ai-phone:{line_id}"
         st, data = journal.start("profile", name=name)
         if st != "done":

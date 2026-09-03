@@ -24,8 +24,10 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if a.cmd == "run":
+        import os
         from ai_phone.daemon import Daemon  # models and PJSIP load only for `run`
-        cfg = load_config(Path(a.config).expanduser() if a.config else paths.config_path())
+        from ai_phone.secrets import load_secrets
+        cfg = load_config(Path(a.config).expanduser() if a.config else paths.config_path(), env={**os.environ, **load_secrets(paths.secrets_path())})
         for w in cfg.warnings:
             logging.getLogger("ai-phone").warning(w)
         asyncio.run(Daemon(cfg, a.tier, Path(cfg.log.dir), a.lan, a.fake).run())

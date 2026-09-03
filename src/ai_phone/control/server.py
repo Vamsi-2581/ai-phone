@@ -32,7 +32,11 @@ class ControlServer:
             finally:
                 s.close()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._server = await asyncio.start_unix_server(self._client, path=str(self.path))
+        old_umask = os.umask(0o077)  # the socket is 0600 from the instant it exists: no connect-before-chmod window
+        try:
+            self._server = await asyncio.start_unix_server(self._client, path=str(self.path))
+        finally:
+            os.umask(old_umask)
         os.chmod(self.path, 0o600)
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

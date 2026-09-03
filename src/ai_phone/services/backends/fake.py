@@ -107,5 +107,6 @@ class EnvProbeLLM(FakeLLM):
 
     def stream(self, gen_id, messages, max_tokens):
         import os
-        leaked = sorted(n for n in os.environ if n.startswith("AI_PHONE_LINE_") and n.endswith("_PASSWORD"))
+        from ai_phone.services.client import is_secret_env
+        leaked = sorted(n for n in os.environ if is_secret_env(n))
         yield ",".join(leaked) or "clean"

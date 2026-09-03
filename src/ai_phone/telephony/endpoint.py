@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
+import re
 from dataclasses import dataclass, field
 
 from ai_phone.config import AOR_RE, DISPLAY_RE, E164_RE, SIP_URI_RE, SIP_USER_RE, USER_RE, Config, LineConfig, host_of
@@ -106,10 +108,15 @@ class DialError(ValueError):
     pass
 
 
+SIP_TARGET_RE = re.compile(r"^sip:[A-Za-z0-9._+-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?$")
+
+
 def request_uri(spec: LineSpec, target: str) -> str:
-    if target.startswith(("sip:", "sips:")):
+    if target.startswith("sip:"):
+        if not SIP_TARGET_RE.fullmatch(target):
+            raise DialError(f"target {target!r} is not a plain sip:user@host[:port] address")
         return target
-    if not E164_RE.match(target):
+    if not E164_RE.fullmatch(target):
         raise DialError(f"target {target!r} is neither a sip: URI nor an E.164 number like +447700900123")
     if spec.kind != "trunk" or not spec.dial_domain:
         raise DialError(f"line {spec.id} cannot dial phone numbers (no dial_domain)")
@@ -145,18 +152,30 @@ class Telephony:
         self.current_call: AiCall | None = None
         self.peer_warnings: list[str] = []
         self._call_lock = threading.Lock()  # make_call (asyncio thread) and onIncomingCall (PJSIP thread) both claim current_call
+        self._stopping = False  # once stop() begins, nothing may claim a call
 
     @property
     def current_call_id(self) -> int | None:
         return self.current_call.getId() if self.current_call is not None else None
 
     def try_claim_call(self, call: AiCall) -> bool:
-        """The one-call-at-a-time gate, safe across the asyncio and PJSIP threads."""
+        """The one-call-at-a-time gate, safe across the asyncio and PJSIP threads. The claim lasts from the INVITE
+        (or makeCall) until the daemon calls release_call() after its own teardown, so a call that PJSIP already
+        reports as disconnected still blocks the next one while the controller drains and flushes."""
         with self._call_lock:
-            if self.current_call is not None:
+            if self.current_call is not None or self._stopping:
                 return False
             self.current_call = call
             return True
+
+    def release_call(self, call_id: int) -> bool:
+        """Called by the daemon when it has finished with the call (rings flushed, controller stopped)."""
+        with self._call_lock:
+            c = self.current_call
+            if c is not None and c.getId() == call_id:
+                self.current_call = None
+                return True
+            return False
 
     def line_of(self, call_id: int) -> str | None:
         c = self.current_call
@@ -316,21 +335,28 @@ class Telephony:
             call.answer_timeout = None
 
     def _call_ended(self, call: AiCall) -> None:
-        with self._call_lock:
-            if self.current_call is call:
-                self.current_call = None
+        """PJSIP thread: DISCONNECTED. Only the answer timer is dropped here; release_call() ends the claim."""
         self.loop.call_soon_threadsafe(self._drop_answer_timeout, call)
 
     def stop(self) -> None:
-        if self.current_call is not None:
-            self._drop_answer_timeout(self.current_call)
-        if self.current_call is not None:
+        with self._call_lock:
+            self._stopping = True  # no new claim from either thread from here on
+            call = self.current_call
+        if call is not None:
+            self._drop_answer_timeout(call)
             try:
-                self.hangup(self.current_call.getId())
+                if not call.ended:
+                    self.hangup(call.getId())
             except Exception:
                 pass
+            for _ in range(40):  # up to 2 s for PJSIP to report the release before the library goes away
+                if call.ended:
+                    break
+                time.sleep(0.05)
+        call = None  # drop our own reference too: a pjsua2 Call that outlives libDestroy aborts the process
         if self.ep is not None:
-            self.current_call = None
+            with self._call_lock:
+                self.current_call = None
             for acc in self.accounts.values():
                 try:
                     acc.shutdown()

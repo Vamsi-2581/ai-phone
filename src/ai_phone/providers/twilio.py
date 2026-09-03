@@ -40,6 +40,8 @@ class TwilioProvider:
         self.http.auth = (key, secret)
 
     def _redact(self, text: str) -> str:
+        for v in sorted((v for v in getattr(self, "_sensitive", []) if v), key=len, reverse=True):
+            text = text.replace(v, "***")
         return text.replace(self._token, "***").replace(self.sid, "AC***")
 
     def _call(self, method: str, url: str, **kw) -> dict:
@@ -50,9 +52,9 @@ class TwilioProvider:
             raise ProviderError(f"twilio {method} {shown}: {type(e).__name__}", retryable=True) from None
         if r.status_code >= 400:
             try:
-                msg = r.json().get("message", "")
+                msg = str(r.json().get("message", ""))[:300]  # the carrier's message, never the body
             except ValueError:
-                msg = r.text[:200]
+                msg = "(non-JSON error response)"
             raise ProviderError(f"twilio {method} {shown} -> {r.status_code}: {self._redact(msg)}", retryable=r.status_code >= 500)
         return r.json() if r.content else {}
 
@@ -77,6 +79,7 @@ class TwilioProvider:
     # ---- provisioning -------------------------------------------------------------------------
     def provision(self, journal: Journal, number: Number, line_id: str, sip_user: str, sip_password: str) -> ProvisionResult:
         """One journal step per carrier request, so a crash between any request and its `done` is reconciled by name."""
+        self._sensitive = getattr(self, "_sensitive", []) + [sip_password]
         name = f"ai-phone:{line_id}"
         st, planned = journal.start("credential_list", name=name)
         if st != "done":

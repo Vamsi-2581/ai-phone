@@ -82,7 +82,7 @@ def _parse(text: str, label: str) -> dict[str, str]:
             continue
         key, sep, value = line.partition("=")
         key = key.strip()
-        if not sep or not KEY_RE.match(key):
+        if not sep or not KEY_RE.fullmatch(key):
             raise SecretsError(f"{label}:{n}: expected KEY=VALUE")
         out[key] = value  # values keep their spaces
     return out
@@ -130,7 +130,7 @@ def _write_all(path: Path, values: dict[str, str]) -> None:
 
 
 def write_secret(key: str, value: str, path: Path | None = None) -> None:
-    if not KEY_RE.match(key):
+    if not KEY_RE.fullmatch(key):
         raise SecretsError(f"secret name {key!r} must match {KEY_RE.pattern}")
     if "\n" in value or "\r" in value:
         raise SecretsError("secret values cannot contain newlines")

@@ -155,6 +155,21 @@ def test_connect_failure():
     assert e.value.kind == "connect"
 
 
+def test_environment_proxies_are_ignored(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    b = OpenAICompatLLM("http://127.0.0.1:1234/v1", "m")   # the default client, as the daemon builds it
+    assert b.http.trust_env is False
+
+
+def test_a_flooding_endpoint_is_cut_off_by_the_producer():
+    big = json.dumps({"choices": [{"delta": {"content": "x" * 1000}}]})
+    b = _backend(lambda req: httpx.Response(200, content=("data: " + big + "\n\n").encode() * 2000), max_response_chars=100)
+    with pytest.raises(BrainError) as e:
+        list(b.stream(1, [{"role": "user", "content": "hi"}], 10))
+    assert e.value.kind == "too_long"
+
+
 def test_api_key_goes_in_the_header_and_redirects_are_off():
     seen = {}
 

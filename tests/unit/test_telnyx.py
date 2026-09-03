@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from ai_phone.lines.journal import Journal
-from ai_phone.providers.base import ProviderError
+from ai_phone.providers.base import Number, ProviderError
 from ai_phone.providers.telnyx import SIGNALLING_CIDRS, TELNYX_API, TelnyxProvider
 
 
@@ -182,10 +182,16 @@ def test_caller_id_verification():
     assert p.complete_caller_id_verification(step, "123456") is True
 
 
-def test_errors_never_leak_the_key(tmp_path: Path):
+def test_errors_never_leak_the_key_the_password_or_the_body(tmp_path: Path):
     def boom(req):
-        return httpx.Response(401, json={"errors": [{"detail": "bad key KEY"}]})
-    p = TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(boom), base_url="https://api.telnyx.com"))
+        if req.url.path == "/v2/available_phone_numbers":
+            return httpx.Response(401, json={"errors": [{"detail": "bad key KEY"}]})
+        return httpx.Response(500, text="<html>internal error dumping request: password=Passw0rdPassw0rdPassw0rd</html>")
+    p = TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(boom), base_url=TELNYX_API))
     with pytest.raises(ProviderError) as e:
         p.search_numbers("GB", None, 1)
     assert "KEY" not in str(e.value)
+    j = Journal.open(tmp_path, "main", "telnyx")
+    with pytest.raises(ProviderError) as e2:
+        p.provision(j, Number("+442079460000", 1.0, "GBP", False, "x"), "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
+    assert "Passw0rd" not in str(e2.value) and "<html>" not in str(e2.value) and "non-JSON" in str(e2.value)
