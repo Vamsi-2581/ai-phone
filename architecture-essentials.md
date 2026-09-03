@@ -4,7 +4,7 @@ Read this first. If it does not answer your question, the table at the bottom sa
 
 ## What it is
 
-One daemon, one SIP identity, one phone call at a time. It registers to a SIP trunk or PBX, answers and places calls, and runs speech-to-text → language model → text-to-speech entirely on the host. No cloud AI. No API keys. No network connections other than SIP signalling and RTP media to the configured peer.
+One daemon, one SIP identity, one phone call at a time. It registers to a SIP trunk or PBX, answers and places calls, and runs speech-to-text → language model → text-to-speech entirely on the host. No cloud AI. During a call, no network connections other than SIP signalling and RTP media to the configured peer. Numbers come from lines (see below): a carrier key may be used once at setup to buy one, never on the call path.
 
 ## The five invariants (never break these)
 
