@@ -8,11 +8,12 @@ One daemon, one SIP identity, one phone call at a time. It registers to a SIP tr
 
 ## The five invariants (never break these)
 
-1. **During a call, no network except SIP/RTP to the peer.** No model downloads at runtime (`HF_HUB_OFFLINE=1`), no telemetry, no update checks, no external model server. `ai-phone doctor` pre-installs everything, including the spaCy model Kokoro's phonemizer would otherwise fetch from GitHub. Buying a number or sending an SMS may use a carrier API, but only from setup commands, never from the call path (see `architecture.md` §14a).
+1. **During a call, no network except SIP/RTP to the peer, and HTTP(S) to the one brain endpoint you configured.** The default brain is the local model and uses no socket; a brain that is not on this machine must be `https` and the daemon says, at start and in `doctor`, that transcripts, the system prompt and the history go there. No model downloads at runtime (`HF_HUB_OFFLINE=1`), no telemetry, no update checks. STUN and trusted-peer DNS happen at start only. Buying a number uses a carrier API from `ai-phone lines …`, never from the daemon, which does not even import the carrier code (see `architecture.md` §14a).
 2. **The PJSIP thread never blocks and never touches models.** Media callbacks only copy 640-byte frames into ring buffers. Model work lives in three child processes.
 3. **Everything internal is 16 kHz int16, 20 ms frames (320 samples).** The wire is 8 kHz G.711 (PCMU/PCMA only; all other codecs disabled). PJSIP resamples 8↔16; we resample TTS 24→16.
 4. **Every generation has a `gen_id`.** Cancel means: all workers drop that id, the outbound ring is flushed, late results with a stale id are discarded, the partial reply stays in history marked `[interrupted]`.
-5. **Latency is measured, not claimed.** t0 = last voice-active chunk; t5 = first non-silent RTP frame handed to PJSIP. Budget 900 ms p50, gate 1000 ms. Every turn writes a JSON record with per-stage times.
+5. **Latency is measured, not claimed.** t0 = last voice-active chunk; t5 = first non-silent RTP frame handed to PJSIP (daemon-side, on the PSTN leg as on the LAN). Budget 900 ms p50, gate 1000 ms. Every turn writes a JSON record with per-stage times.
+6. **One daemon, one or more lines, one call at a time across all of them.** Each line is its own pjsua2 account; every telephony event carries `line_id`; the one-call claim is a lock shared by the PJSIP thread and the asyncio thread.
 
 ## Process and layer map
 
@@ -56,10 +57,13 @@ Answer with a fixed cached greeting. Second INVITE while busy → 486. INVITE fr
 ## Where things live
 
 ```
-src/ai_phone/  telephony/ (endpoint, account, call, media_port, policy, rings)
+src/ai_phone/  telephony/ (endpoint, call, media_port, policy, events, state, rings)
                pipeline/  (turn, vad, bargein, chunker, audio_out, timing)
-               services/  (base, ipc, worker, registry, backends/)
-               control/   (socket, doctor, api, tui, service)
+               services/  (base, ipc, worker, client, errors, backends/ incl. openai_compat)
+               lines/     (journal, config_writer, forward, credentials)     — provisioning bookkeeping (CLI only)
+               providers/ (base, telnyx, twilio, fake)                       — carrier REST (CLI only; the daemon never imports it)
+               control/   (protocol, server, client)                        — the unix control socket
+               cli.py, cli_lines.py, cli_status.py, cli_call.py, daemon.py, config.py, secrets.py, paths.py
 native/pjsua2/ SWIG interface + build script (GPL source offer)
 scripts/       latency_report.py, pjsua_peer.sh, pf/ ruleset, utterances.txt
 packaging/     Homebrew formula, Dockerfile.cuda, launchd plist
@@ -68,11 +72,11 @@ config:        ~/.ai-phone/config.yaml (0600) · models: ~/.ai-phone/models · l
 
 ## Lines (Milestone 2)
 
-An agent is reachable through lines: a number bought with your own Twilio/Telnyx key (belongs to the agent; direct dial and outbound), your existing number forwarded to it, a free SIP address for agent-to-agent calls, or a SIP trunk you bring. The daemon sees only SIP either way. The brain is pluggable (local model by default, or any OpenAI-compatible endpoint you name). No flagship job; the receptionist is a persona preset. Full sketch in `architecture.md` §14a.
+An agent is reachable through lines: a number bought with your own Telnyx or Twilio key (`ai-phone lines add telnyx --key-env TELNYX_API_KEY`), your own phone diverted to it (`ai-phone lines forward main --when no-answer --from +44…` prints the dial codes), a free SIP address for agent-to-agent calls (`ai-phone lines add sip …`), or a trunk you bring. The daemon sees only SIP either way; `ai-phone call <number|sip:…>` dials out with the agent's number (or your verified mobile) as caller ID and opens with an AI disclosure line; `ai-phone status` shows registration per line. Provisioning is journaled and resumable (`lines resume`), and `lines remove` undoes everything a carrier created. Configuration applies at restart. The brain is pluggable: `brain: {kind: openai_compatible, base_url: …}` makes any OpenAI-compatible server the agent. Full detail in `architecture.md` §14a.
 
 ## Milestone gates
 
-M1 latency proof: p50 < 1.0 s at 8 kHz over the 20-utterance script, else the 4B tier becomes default. M2 real trunk: 24 h registered. M3 packaging: install-to-first-call under 10 min on both platforms. M4 control plane: API drives a call. M5 launch. Nothing is built before its gate.
+M1 latency proof: p50 < 1.0 s at 8 kHz over the 20-utterance script, else the 4B tier becomes default (passed: p50 874 ms). M2 lines: a Telnyx number bought by `lines add` registers from behind the home router and stays registered 24 h (≥ 99 %, induced drops recovered within 60 s); an iPhone call answered under 1 s daemon-side; the iPhone diverted with `**61*` reaches the agent; `ai-phone call` rings it with the agent's number; two daemons call each other over `sip:`; Twilio passes the same inbound/outbound flow; a killed brain yields the apology, not silence; `lines remove` leaves nothing in the carrier account; no worker ever holds a line password. M3 packaging: install-to-first-call under 10 min on both platforms. M4 control plane: API drives a call. M5 launch. Nothing is built before its gate.
 
 ## Test peer (same box)
 

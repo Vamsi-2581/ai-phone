@@ -37,6 +37,33 @@ caller: `scripts/pjsua_peer.sh scripts/utt/00.wav /tmp/rec.wav 18`.
 
 Packaging (`uv tool install`, Homebrew tap, Docker) and real trunk registration are Milestones 2–3.
 
+## Three ways to call it (Milestone 2)
+
+```bash
+# 1. Its own number (a Telnyx or Twilio account and API key; about £1/month for the number)
+export TELNYX_API_KEY=…
+ai-phone lines add telnyx --key-env TELNYX_API_KEY --country GB --area 020
+ai-phone run
+
+# 2. Your own number, diverted when you don't answer
+ai-phone lines forward telnyx --when no-answer --from +447700900123
+#   … then dial the printed **61* code on your phone (##002# cancels every divert)
+
+# 3. A SIP address, no carrier (agents calling agents)
+ai-phone lines add sip --id agents --user agents --host home.example.org --trusted 203.0.113.7
+ai-phone call sip:agents@friend.example.org --line agents
+
+# Outbound from the agent's number, or from your mobile once it is verified
+ai-phone call +447700900123
+ai-phone lines verify-caller-id telnyx +447700900123 --key-env TELNYX_API_KEY
+ai-phone status
+
+# Any brain: LM Studio, llama.cpp, or your own agent behind an OpenAI-compatible endpoint
+#   brain: {kind: openai_compatible, base_url: "http://127.0.0.1:1234/v1", model: "…"}
+```
+
+During a call the daemon opens no network connection except SIP/RTP to the peer and, only if you configured one, HTTP(S) to that brain endpoint. Buying a number talks to the carrier once, from the `lines` command, and the daemon never loads the carrier code. Provisioning is journaled: `ai-phone lines resume` picks up where a crash left off, `ai-phone lines remove` deletes everything the carrier created. Configuration applies at restart. The NAT and transport checks run before calling it done are in `docs/nat-checklist.md`; the 24 h registration soak is `scripts/soak.sh`.
+
 ## License
 
 AGPL-3.0-or-later. `native/pjsua2/` carries PJSIP's GPLv2-or-later interface files; see its README.
