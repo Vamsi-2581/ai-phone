@@ -309,4 +309,23 @@ using namespace pj;
 %}
 #endif
 
+/* ai-phone: PJSUA_REG_USE_* are #defines in pjsua.h, not an enum, so symbols.i cannot carry them. */
+%constant int PJSUA_REG_USE_OUTBOUND_PROXY = 1;
+%constant int PJSUA_REG_USE_ACC_PROXY = 2;
+
+/* ai-phone: PJSIP's TCP/TLS CRLF keepalive interval is a process-wide setting that pjsua2 does not expose. */
+%inline %{
+#include <pjsip/sip_config.h>
+static void ai_phone_set_keepalive(long tcp_sec, long tls_sec) {
+    pjsip_cfg()->tcp.keep_alive_interval = tcp_sec;
+    pjsip_cfg()->tls.keep_alive_interval = tls_sec;
+}
+static long ai_phone_get_tcp_keepalive(void) { return pjsip_cfg()->tcp.keep_alive_interval; }
+static long ai_phone_get_tls_keepalive(void) { return pjsip_cfg()->tls.keep_alive_interval; }
+%}
+%pythoncode %{
+def ai_phone_get_keepalive():
+    return (ai_phone_get_tcp_keepalive(), ai_phone_get_tls_keepalive())
+%}
+
 %include "pjsua2/endpoint.hpp"
