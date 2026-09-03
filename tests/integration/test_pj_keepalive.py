@@ -5,10 +5,12 @@ pytestmark = pytest.mark.integration
 
 def test_keepalive_setter_round_trips():
     from ai_phone.telephony.pj import pj
-    assert pj.ai_phone_get_keepalive() == (90, 90)  # PJSIP's compiled defaults
-    pj.ai_phone_set_keepalive(30, 30)
-    assert pj.ai_phone_get_keepalive() == (30, 30)
-    pj.ai_phone_set_keepalive(90, 90)
+    before = pj.ai_phone_get_keepalive()  # process-wide: another test's endpoint may already have changed it
+    assert all(isinstance(v, int) for v in before)
+    pj.ai_phone_set_keepalive(45, 46)
+    assert pj.ai_phone_get_keepalive() == (45, 46)
+    pj.ai_phone_set_keepalive(*before)
+    assert pj.ai_phone_get_keepalive() == before
 
 
 def test_symbols_needed_by_m2_exist():

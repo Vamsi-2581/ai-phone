@@ -8,9 +8,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from ai_phone.config import Config, SipConfig
+from ai_phone.config import Config, LineConfig
 from ai_phone.telephony import events as ev
-from ai_phone.telephony.endpoint import Telephony
+from ai_phone.telephony.endpoint import LineSpec, Telephony
 from ai_phone.telephony.rings import FrameRing
 
 pytestmark = pytest.mark.integration
@@ -35,11 +35,12 @@ def _rms(path: Path) -> float:
 def test_echo_call_round_trips_audio(tmp_path: Path):
     play, rec = tmp_path / "tone.wav", tmp_path / "rec.wav"
     _tone_wav(play)
-    cfg = Config(sip=SipConfig(user="ai", accept_invites_from="lan"))
+    spec = LineSpec.from_config("main", LineConfig(kind="sip", user="ai", aor="sip:ai@127.0.0.1", display_name="ai",
+                                                   accept_invites_from="lan", caller_id="sip:ai@127.0.0.1"), None)
     loop = asyncio.new_event_loop()
     events: asyncio.Queue = asyncio.Queue()
     rx, tx = FrameRing(None, 100), FrameRing(None, 100)
-    tel = Telephony(cfg, loop, events, rx, tx, echo_mode=True)
+    tel = Telephony(Config(), [spec], loop, events, rx, tx, echo_mode=True)
     seen = []
     stats = {}
 

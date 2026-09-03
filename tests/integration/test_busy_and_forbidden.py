@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from ai_phone.config import Config, SipConfig
+from ai_phone.config import Config, LineConfig
 from ai_phone.telephony import events as ev
-from ai_phone.telephony.endpoint import Telephony
+from ai_phone.telephony.endpoint import LineSpec, Telephony
 from ai_phone.telephony.rings import FrameRing
 
 pytestmark = pytest.mark.integration
@@ -37,11 +37,12 @@ async def _next(events, kind, timeout=10.0, **match):
 
 
 def test_second_call_gets_486_and_public_source_gets_403():
-    cfg = Config(sip=SipConfig(user="ai", accept_invites_from="lan"))
+    spec = LineSpec.from_config("main", LineConfig(kind="sip", user="ai", aor="sip:ai@127.0.0.1", display_name="ai",
+                                                   accept_invites_from="lan", caller_id="sip:ai@127.0.0.1"), None)
     loop = asyncio.new_event_loop()
     events: asyncio.Queue = asyncio.Queue()
     rx, tx = FrameRing(None, 100), FrameRing(None, 100)
-    tel = Telephony(cfg, loop, events, rx, tx, echo_mode=True)
+    tel = Telephony(Config(), [spec], loop, events, rx, tx, echo_mode=True)
     tel.start()
     peers = []
     try:
@@ -58,11 +59,11 @@ def test_second_call_gets_486_and_public_source_gets_403():
         _quit(p2)
         _quit(p1)
         loop.run_until_complete(_next(events, ev.CallStateChanged, call_id=first.call_id, state="ended"))
-        tel.cfg.sip.accept_invites_from = "registered_trunk"  # no trunk configured → every LAN INVITE is disallowed
+        tel.accounts["main"].spec.accept_invites_from = "trusted"  # policy is per line; an empty trusted set disallows every source
         p3 = _peer(5066)
         peers.append(p3)
         rej = loop.run_until_complete(_next(events, ev.CallRejected))
-        assert rej.code == 403, f"disallowed source should get 403, got {rej.code}"
+        assert rej.code == 403 and rej.line_id == "main", f"disallowed source should get 403 on line main, got {rej}"
         _quit(p3)
     finally:
         for p in peers:

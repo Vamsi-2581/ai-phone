@@ -1,11 +1,11 @@
-"""pjsua2 Account and Call subclasses: decide fast on PJSIP's thread, post events to the asyncio loop."""
+"""pjsua2 Account and Call subclasses: decide fast on PJSIP's thread, post events (with line_id) to the asyncio loop."""
 from __future__ import annotations
 
 import asyncio
 
 from ai_phone.telephony import events as ev
 from ai_phone.telephony.pj import pj
-from ai_phone.telephony.policy import source_allowed
+from ai_phone.telephony.policy import PeerSet, source_allowed
 
 
 def _post(loop: asyncio.AbstractEventLoop, q: asyncio.Queue, item) -> None:
@@ -13,18 +13,42 @@ def _post(loop: asyncio.AbstractEventLoop, q: asyncio.Queue, item) -> None:
 
 
 class AiCall(pj.Call):
-    def __init__(self, acc: "AiAccount", call_id: int = pj.PJSUA_INVALID_ID):
+    def __init__(self, acc: "LineAccount", call_id: int = pj.PJSUA_INVALID_ID, direction: str = "in"):
         super().__init__(acc, call_id)
         self.acc = acc
+        self.direction = direction
         self.media_connected = False
+        self.answered = False
+        self.cancelled = False  # set by Telephony when it CANCELs an unanswered outbound call
 
     def onCallState(self, prm) -> None:
         ci = self.getInfo()
-        if ci.state == pj.PJSIP_INV_STATE_CONFIRMED:
-            _post(self.acc.loop, self.acc.events, ev.CallStateChanged(self.getId(), "active"))
+        lid, loop, q = self.acc.line_id, self.acc.loop, self.acc.events
+        if ci.state == pj.PJSIP_INV_STATE_EARLY and self.direction == "out":
+            _post(loop, q, ev.OutboundProgress(self.getId(), lid, "ringing", int(ci.lastStatusCode), str(ci.lastReason)))
+        elif ci.state == pj.PJSIP_INV_STATE_CONFIRMED:
+            self.answered = True
+            if self.direction == "out":
+                _post(loop, q, ev.OutboundProgress(self.getId(), lid, "answered", 200, "OK"))
+            _post(loop, q, ev.CallStateChanged(self.getId(), lid, "active"))
         elif ci.state == pj.PJSIP_INV_STATE_DISCONNECTED:
-            _post(self.acc.loop, self.acc.events, ev.CallStateChanged(self.getId(), "ended"))
+            code, reason = int(ci.lastStatusCode), str(ci.lastReason)
+            if self.direction == "out" and not self.answered:
+                _post(loop, q, ev.OutboundProgress(self.getId(), lid, self._outcome(code), code, reason))
+            _post(loop, q, ev.CallStateChanged(self.getId(), lid, "ended", code, reason))
             self.acc.telephony._call_ended(self)
+
+    def _outcome(self, code: int) -> str:
+        if code in (486, 600):
+            return "busy"
+        if code == 487 and self.cancelled:
+            return "no_answer"
+        if 300 <= code < 400:
+            return "redirected"
+        return "rejected"
+
+    def onCallRedirected(self, prm) -> int:
+        return pj.PJSIP_REDIRECT_STOP  # never follow 3xx, not to the next target either
 
     def onCallMediaState(self, prm) -> None:
         ci = self.getInfo()
@@ -35,38 +59,39 @@ class AiCall(pj.Call):
                 am.startTransmit(port)
                 port.startTransmit(am)
                 self.media_connected = True
-                _post(self.acc.loop, self.acc.events, ev.MediaActive(self.getId()))
+                _post(self.acc.loop, self.acc.events, ev.MediaActive(self.getId(), self.acc.line_id))
 
     def onDtmfDigit(self, prm) -> None:
-        _post(self.acc.loop, self.acc.events, ev.Dtmf(self.getId(), prm.digit))
+        _post(self.acc.loop, self.acc.events, ev.Dtmf(self.getId(), self.acc.line_id, prm.digit))
 
 
-class AiAccount(pj.Account):
-    def __init__(self, telephony: "Telephony"):
+class LineAccount(pj.Account):
+    def __init__(self, telephony: "Telephony", spec, peers: PeerSet):
         super().__init__()
-        self.telephony = telephony
+        self.telephony, self.spec, self.peers = telephony, spec, peers
+        self.line_id = spec.id
         self.loop, self.events = telephony.loop, telephony.events
 
     def onRegState(self, prm) -> None:
         ai = self.getInfo()
-        _post(self.loop, self.events, ev.RegState(bool(ai.regIsActive), int(prm.code), str(prm.reason)))
+        _post(self.loop, self.events, ev.RegState(self.line_id, bool(ai.regIsActive), int(prm.code), str(prm.reason), int(prm.expiration)))
 
     def onIncomingCall(self, prm) -> None:  # PJSIP thread: decide fast, no models
         t = self.telephony
-        call = AiCall(self, prm.callId)
+        call = AiCall(self, prm.callId, "in")
         source_ip = str(prm.rdata.srcAddress).rsplit(":", 1)[0].strip("[]")
         op = pj.CallOpParam()
-        if not source_allowed(t.cfg.sip.accept_invites_from, source_ip, t.cfg.sip.trusted_peers, t.registrar_ip):
+        if not source_allowed(self.spec.accept_invites_from, source_ip, self.peers):
             op.statusCode = pj.PJSIP_SC_FORBIDDEN
             call.hangup(op)
-            _post(self.loop, self.events, ev.CallRejected(prm.callId, source_ip, 403))
+            _post(self.loop, self.events, ev.CallRejected(prm.callId, self.line_id, source_ip, 403))
             return
         if t.current_call is not None:
             op.statusCode = pj.PJSIP_SC_BUSY_HERE
             call.hangup(op)
-            _post(self.loop, self.events, ev.CallRejected(prm.callId, source_ip, 486))
+            _post(self.loop, self.events, ev.CallRejected(prm.callId, self.line_id, source_ip, 486))
             return
         t.current_call = call
         op.statusCode = pj.PJSIP_SC_RINGING
         call.answer(op)
-        _post(self.loop, self.events, ev.IncomingCall(call.getId(), str(call.getInfo().remoteUri), source_ip))
+        _post(self.loop, self.events, ev.IncomingCall(call.getId(), self.line_id, str(call.getInfo().remoteUri), source_ip))
