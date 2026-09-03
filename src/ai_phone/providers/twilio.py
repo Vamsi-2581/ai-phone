@@ -93,8 +93,19 @@ class TwilioProvider:
         st, planned = journal.start("domain", domain_name=f"ai-phone-{line_id}-{secrets.token_hex(3)}.sip.twilio.com", name=name)
         domain_name = planned["domain_name"]
         if st != "done":
-            rec = (self._find_domain(domain_name) if st == "started" else None) or self._call(
-                "POST", self._acct("/SIP/Domains.json"), data={"DomainName": domain_name, "FriendlyName": name, "SipRegistration": "true", "VoiceMethod": "POST"})
+            rec = self._find_domain(domain_name) if st == "started" else None
+            for attempt in range(2):
+                if rec is not None:
+                    break
+                try:
+                    rec = self._call("POST", self._acct("/SIP/Domains.json"),
+                                     data={"DomainName": domain_name, "FriendlyName": name, "SipRegistration": "true", "VoiceMethod": "POST"})
+                except ProviderError as err:
+                    if attempt == 1 or "already" not in str(err).lower():
+                        raise
+                    domain_name = f"ai-phone-{line_id}-{secrets.token_hex(3)}.sip.twilio.com"  # someone else has that name: one fresh suffix
+                    journal.doc["steps"][-1]["planned"]["domain_name"] = domain_name  # the journal always names what will be created
+                    journal._save()
             journal.finish("domain", domain_sid=rec["sid"], domain_name=domain_name)
         domain_sid = journal.resources()["domain_sid"]
 

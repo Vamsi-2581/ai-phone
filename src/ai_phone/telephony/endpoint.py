@@ -272,6 +272,8 @@ class Telephony:
     def make_call(self, line_id: str, target: str, timeout_sec: float = 30) -> int:
         acc = self.accounts[line_id]
         spec = acc.spec
+        if not acc.registered:
+            raise DialError(f"line {line_id} is not registered (degraded); try again once `ai-phone status` shows it registered")
         check_caller_id(spec)
         uri = request_uri(spec, target)
         op = pj.CallOpParam(True)

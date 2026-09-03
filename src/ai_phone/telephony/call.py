@@ -21,6 +21,7 @@ class AiCall(pj.Call):
         self.answered = False
         self.cancelled = False  # set by Telephony when it CANCELs an unanswered outbound call
         self.answer_timeout = None  # asyncio TimerHandle for the no-answer CANCEL, owned by this call
+        self._media_index = None  # outbound: audio that became active before CONFIRMED (early media) waits here
 
     def onCallState(self, prm) -> None:
         ci = self.getInfo()
@@ -32,6 +33,8 @@ class AiCall(pj.Call):
             if self.direction == "out":
                 _post(loop, q, ev.OutboundProgress(self.getId(), lid, "answered", 200, "OK"))
             _post(loop, q, ev.CallStateChanged(self.getId(), lid, "active"))
+            if self._media_index is not None and not self.media_connected:
+                self._connect_media(self._media_index)  # early media was held back; the answer is real now
         elif ci.state == pj.PJSIP_INV_STATE_DISCONNECTED:
             code, reason = int(ci.lastStatusCode), str(ci.lastReason)
             if self.direction == "out" and not self.answered:
@@ -51,16 +54,22 @@ class AiCall(pj.Call):
     def onCallRedirected(self, prm) -> int:
         return pj.PJSIP_REDIRECT_STOP  # never follow 3xx, not to the next target either
 
+    def _connect_media(self, index: int) -> None:
+        am = self.getAudioMedia(index)
+        port = self.acc.telephony.port
+        am.startTransmit(port)
+        port.startTransmit(am)
+        self.media_connected = True
+        _post(self.acc.loop, self.acc.events, ev.MediaActive(self.getId(), self.acc.line_id))
+
     def onCallMediaState(self, prm) -> None:
         ci = self.getInfo()
         for mi in ci.media:
             if mi.type == pj.PJMEDIA_TYPE_AUDIO and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE and not self.media_connected:
-                am = self.getAudioMedia(mi.index)
-                port = self.acc.telephony.port
-                am.startTransmit(port)
-                port.startTransmit(am)
-                self.media_connected = True
-                _post(self.acc.loop, self.acc.events, ev.MediaActive(self.getId(), self.acc.line_id))
+                if self.direction == "out" and not self.answered:
+                    self._media_index = mi.index  # early media (183 with SDP): ignored until the 200 OK
+                    continue
+                self._connect_media(mi.index)
 
     def onDtmfDigit(self, prm) -> None:
         _post(self.acc.loop, self.acc.events, ev.Dtmf(self.getId(), self.acc.line_id, prm.digit))
@@ -72,9 +81,11 @@ class LineAccount(pj.Account):
         self.telephony, self.spec, self.peers = telephony, spec, peers
         self.line_id = spec.id
         self.loop, self.events = telephony.loop, telephony.events
+        self.registered = spec.kind != "trunk"  # sip lines need no registration; trunks flip this in onRegState
 
     def onRegState(self, prm) -> None:
         ai = self.getInfo()
+        self.registered = bool(ai.regIsActive)
         _post(self.loop, self.events, ev.RegState(self.line_id, bool(ai.regIsActive), int(prm.code), str(prm.reason), int(prm.expiration)))
 
     def onIncomingCall(self, prm) -> None:  # PJSIP thread: decide fast, no models

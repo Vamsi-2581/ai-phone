@@ -184,3 +184,21 @@ def test_release_and_caller_id(tmp_path: Path):
     assert p.complete_caller_id_verification(step, None) is False
     c.callerids["+447700900123"] = "verified"
     assert p.complete_caller_id_verification(step, None) is True
+
+
+def test_domain_name_collision_gets_one_fresh_suffix(tmp_path: Path):
+    c = Carrier()
+    seen = []
+
+    def handler(req):
+        if req.method == "POST" and req.url.path.endswith("/SIP/Domains.json"):
+            seen.append(dict(urllib.parse.parse_qsl(req.content.decode()))["DomainName"])
+            if len(seen) == 1:
+                return httpx.Response(400, json={"message": "A SIP Domain with that name already exists"})
+        return c(req)
+
+    p = TwilioProvider(key=SID, secret="tok", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    j = Journal.open(tmp_path, "main", "twilio")
+    r = p.provision(j, p.search_numbers("GB", None, 1)[0], "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
+    assert r.state == "ready" and len(seen) == 2 and seen[0] != seen[1]
+    assert next(s["planned"]["domain_name"] for s in j.doc["steps"] if s["name"] == "domain") == seen[1] == r.line["registrar"][4:]
