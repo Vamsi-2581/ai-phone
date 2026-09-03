@@ -572,6 +572,20 @@ macOS: `ai-phone install-service` writes `~/Library/LaunchAgents/com.ai-phone.da
 - **Full-duplex model** (Moshi-style): replaces Layers 2–3's STT→LLM→TTS with one worker; the media port and control plane stay.
 - **SMS**: SIP MESSAGE method only, where the trunk supports it.
 
+## 14a. Lines (Milestone 2 design sketch)
+
+```
+ Line (abstract): id, kind, addresses it answers to, outbound caller id, routing target (agent)
+   ├─ TrunkLine        registers to a SIP trunk (bring your own, or one the wizard created)
+   ├─ ProvisionedLine  a TrunkLine created by a provider plugin: buy number → create SIP connection → point at us
+   ├─ ForwardedLine    documentation + detection only: an existing number forwarded to another line
+   └─ SipAddressLine   no carrier; the daemon is reachable at sip:<agent>@<host or domain>
+ Provider plugin (setup time only, never during a call): Twilio, Telnyx — buy/release numbers, create/point trunks, send SMS (opt-in)
+ Routing: dialled number → agent; optional rules by caller, time, extension; one agent may own many lines
+```
+
+Constraints learned so far: inbound from Twilio's Elastic SIP Trunking needs the daemon reachable at a public address (port forwarding or a tunnel); Telnyx credential connections support registration-based inbound, which works from behind home NAT without port forwarding. The wizard should prefer the path that needs no router changes. All provider calls happen in `ai-phone setup` / `ai-phone numbers …`, never in the daemon's call path, so the isolation guarantee (§12) is unchanged.
+
 ## 15. Decision log
 
 | Date | Decision | Status |
@@ -585,6 +599,7 @@ macOS: `ai-phone install-service` writes `~/Library/LaunchAgents/com.ai-phone.da
 | 2026-09-02 | Media port at 16 kHz; VAD in main process; three workers; shared-memory audio, JSON control | [D]/[P] as marked |
 | 2026-09-02 | `lan` mode includes loopback and link-local | [D] |
 | 2026-09-02 | English-only, single-call, no web UI, no SMS through launch | [D] |
+| 2026-09-03 | Premise 2 refined: **the conversation never touches the cloud; getting a number (and opt-in SMS) may, at setup or message time.** Four line kinds (provisioned via own carrier key, forwarded existing number, SIP address for agent-to-agent, bring-your-own trunk); a provisioned number belongs to the agent. Flagship launch job: the personal receptionist. Milestone 2 becomes "lines + receptionist" | [D] |
 | 2026-09-02 | Home Assistant is an integration, not an add-on | [D] |
 | 2026-09-02 | Spike B (9B, quiet machine, no telephony): stt 26.9 ms, llm_ttft 221, llm_first_clause 408, tts_first 161, trio 600 ms p50 → projected first-audible ≈ 1000 ms, no margin | [D] |
 | 2026-09-03 | **M1 gate PASSED, 4B tier, 20/20 LAN PCMU calls: first_audible p50 874 ms / p95 1438** (endpoint 297, STT 96, LLM prompt-eval 229, LLM first clause 312, TTS first chunk 164, egress 9; 0 underruns) with the host swapping ~10 GB. Barge-in, 5 interrupting callers: stop 218–259 ms after onset, all under 300; interrupting sentences transcribed whole. **Default tier is t4.** An earlier 977 ms figure was an artifact (ring geometry bug stamped t5 early) and is withdrawn; the 9B tier does not fit beside normal apps on 24 GB | [D] |

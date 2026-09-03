@@ -8,7 +8,7 @@ One daemon, one SIP identity, one phone call at a time. It registers to a SIP tr
 
 ## The five invariants (never break these)
 
-1. **No network except SIP/RTP to the peer.** No model downloads at runtime (`HF_HUB_OFFLINE=1`), no telemetry, no update checks, no external model server. `ai-phone doctor` pre-installs everything, including the spaCy model Kokoro's phonemizer would otherwise fetch from GitHub.
+1. **During a call, no network except SIP/RTP to the peer.** No model downloads at runtime (`HF_HUB_OFFLINE=1`), no telemetry, no update checks, no external model server. `ai-phone doctor` pre-installs everything, including the spaCy model Kokoro's phonemizer would otherwise fetch from GitHub. Buying a number or sending an SMS may use a carrier API, but only from setup commands, never from the call path (see `architecture.md` §14a).
 2. **The PJSIP thread never blocks and never touches models.** Media callbacks only copy 640-byte frames into ring buffers. Model work lives in three child processes.
 3. **Everything internal is 16 kHz int16, 20 ms frames (320 samples).** The wire is 8 kHz G.711 (PCMU/PCMA only; all other codecs disabled). PJSIP resamples 8↔16; we resample TTS 24→16.
 4. **Every generation has a `gen_id`.** Cancel means: all workers drop that id, the outbound ring is flushed, late results with a stale id are discarded, the partial reply stays in history marked `[interrupted]`.
@@ -65,6 +65,10 @@ scripts/       latency_report.py, pjsua_peer.sh, pf/ ruleset, utterances.txt
 packaging/     Homebrew formula, Dockerfile.cuda, launchd plist
 config:        ~/.ai-phone/config.yaml (0600) · models: ~/.ai-phone/models · logs: ~/Library/Logs/ai-phone
 ```
+
+## Lines (Milestone 2)
+
+An agent is reachable through lines: a number bought with your own Twilio/Telnyx key (belongs to the agent; direct dial and outbound), your existing number forwarded to it, a free SIP address for agent-to-agent calls, or a SIP trunk you bring. The daemon sees only SIP either way. Flagship job: the personal receptionist. Full sketch in `architecture.md` §14a.
 
 ## Milestone gates
 
