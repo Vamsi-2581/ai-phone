@@ -16,7 +16,7 @@ def main(argv=None) -> int:
     r = sub.add_parser("run", help="start the daemon in the foreground")
     r.add_argument("--config", default="~/.ai-phone/config.yaml")
     r.add_argument("--lan", action="store_true", help="accept calls from the LAN, loopback and link-local (dev/test)")
-    r.add_argument("--tier", choices=["t9", "t4"], default="t9")
+    r.add_argument("--tier", choices=["t9", "t4"], default="t4")  # t4 is the default: the 9B tier does not fit a 24 GB machine beside normal apps
     r.add_argument("--fake", action="store_true", help="fake model backends (tests)")
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

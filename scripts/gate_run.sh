@@ -6,7 +6,7 @@ LOG="${AI_PHONE_LOG_DIR:-$HOME/Library/Logs/ai-phone}"
 rm -f "$LOG/turns.jsonl"
 for f in scripts/utt/*.wav; do
   # keep pjsua's stdin open (it quits on EOF); it hangs up itself after the file plays
-  printf '' | { sleep 14; echo q; } | bash scripts/pjsua_peer.sh "$f" /tmp/ai-phone-rec.wav 14 >/dev/null 2>&1 || true
+  printf '' | { sleep 18; echo q; } | bash scripts/pjsua_peer.sh "$f" /tmp/ai-phone-rec.wav 18 >/dev/null 2>&1 || true
   sleep 1
 done
 uv run python scripts/latency_report.py "$LOG/turns.jsonl" --last 20
