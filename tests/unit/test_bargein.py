@@ -18,10 +18,14 @@ def test_quiet_speech_under_raised_floor_does_not_trigger():
     assert not any(feed(d, 20, speech=True, rms=0.02, noise_rms=0.01, playing=True))
 
 
-def test_gap_resets_count():
+def test_one_quiet_chunk_is_tolerated_but_two_reset_the_count():
     d = BargeInDetector()
     feed(d, 5, speech=True, rms=0.2, noise_rms=0.01, playing=True)
-    d.update(speech=False, rms=0.0, noise_rms=0.01, playing=True)
+    d.update(speech=False, rms=0.0, noise_rms=0.01, playing=True)          # one gap: count kept (5)
+    assert any(feed(d, 3, speech=True, rms=0.2, noise_rms=0.01, playing=True))  # 8 → trigger
+    d = BargeInDetector()
+    feed(d, 5, speech=True, rms=0.2, noise_rms=0.01, playing=True)
+    feed(d, 2, speech=False, rms=0.0, noise_rms=0.01, playing=True)       # two gaps: reset
     assert not any(feed(d, 5, speech=True, rms=0.2, noise_rms=0.01, playing=True))
 
 

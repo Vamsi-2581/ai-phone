@@ -18,6 +18,7 @@ from ai_phone.pipeline.chunker import ClauseChunker
 from ai_phone.pipeline.timing import TurnTimer
 from ai_phone.pipeline.vad import Endpointer, SpeechChunk, SpeechEnd, SpeechStart
 from ai_phone.services.client import WorkerClient
+from ai_phone.services.ipc import tag_frame, untag_frame
 from ai_phone.telephony.rings import FrameRing
 
 
@@ -54,6 +55,7 @@ class TurnController:
         self._prompted = False
         self._warned = False
         self._start_ns = 0
+        self._candidate: list[np.ndarray] = []  # speech chunks seen while not listening; replayed on barge-in
 
     # ---- generation bookkeeping ---------------------------------------------------------------
     def _new_gen(self) -> int:
@@ -61,6 +63,8 @@ class TurnController:
         g = max(self.stt.current_gen, self.llm.current_gen, self.tts.current_gen) + 1
         for c in (self.stt, self.llm, self.tts):
             c.set_gen(g)
+        self._seq, self._tts_done_seq, self._llm_done, self._reply_parts = 0, -1, False, []
+        self._pending_stt = 0
         return g
 
     def request_end(self, reason: str) -> None:
@@ -74,6 +78,7 @@ class TurnController:
             self.tx.push(f)
         self._new_gen()
         self._start_ns = time.monotonic_ns()
+        self._rtp_baseline = self._start_ns
         while not stop.is_set() and self.state != "ENDING":
             now = time.monotonic_ns()
             while (f := self.rx.pop()) is not None:
@@ -109,38 +114,37 @@ class TurnController:
             self._warned = True
         if elapsed_s >= self.cfg.max_call_sec:
             self.request_end("max_duration")
-        if self.rtp_last_rx_ns is not None and (now - self.rtp_last_rx_ns()) / 1e9 >= self.cfg.rtp_timeout_sec:
-            self.request_end("rtp_timeout")
+        if self.rtp_last_rx_ns is not None:
+            last_rx = max(self.rtp_last_rx_ns(), self._rtp_baseline)  # a stale or zero stamp must not fire the timeout
+            if (now - last_rx) / 1e9 >= self.cfg.rtp_timeout_sec:
+                self.request_end("rtp_timeout")
 
     # ---- inbound audio ------------------------------------------------------------------------
     def _on_frame(self, frame: bytes, t_ns: int) -> None:
         for e in self.ep.feed(frame, t_ns):
             if isinstance(e, SpeechChunk):
                 rms = float(np.sqrt(np.mean(e.pcm_f32 * e.pcm_f32)))
-                playing = self.tx.available() > 0 or self.state == "SPEAKING"
-                if self.state in ("THINKING", "SPEAKING"):
+                playing = self.tx.available() > 0 or self.state in ("GREETING", "SPEAKING")
+                if self.state in ("GREETING", "THINKING", "SPEAKING"):
+                    # not listening: remember the audio so the interrupting utterance keeps its onset
                     if self._interrupt_t is None:
                         self._interrupt_t = e.t_ns
+                    self._candidate.append(e.pcm_f32)
                     if self.bargein.update(True, rms, self.ep.noise_rms, playing):
-                        self._interrupt(t_ns)  # this chunk now belongs to the next utterance
-                else:
-                    self.bargein.update(True, rms, self.ep.noise_rms, playing)
+                        self._interrupt(t_ns)  # replays the candidate audio, including this chunk
+                    continue
+                self.bargein.update(True, rms, self.ep.noise_rms, playing)
             else:
                 self.bargein.update(False, 0.0, self.ep.noise_rms, False)
                 self._interrupt_t = None
+                self._candidate = []
             if isinstance(e, SpeechStart):
                 self.last_activity_ns = t_ns
                 self._prompted = False  # the caller is back
-                if self.state == "GREETING":  # the caller talks over the greeting: stop it and listen
-                    self.tx.flush()
-                    self.state = "LISTENING"
                 if self.state == "LISTENING":
                     self.timer = TurnTimer(gen=self.stt.current_gen)
             elif isinstance(e, SpeechChunk) and self.state == "LISTENING":
-                self.stt_in.push((np.clip(e.pcm_f32, -1, 1) * 32767).astype("<i2").tobytes())
-                self._pending_stt += 1
-                if self._pending_stt >= 10:
-                    self._flush_stt_push()
+                self._push_stt(e.pcm_f32)
             elif isinstance(e, SpeechEnd) and self.state == "LISTENING":
                 self._flush_stt_push()
                 if self.timer is None:
@@ -150,26 +154,37 @@ class TurnController:
                 self.stt.send({"op": "stt.finalize", "gen": self.stt.current_gen})
                 self.state = "THINKING"
 
+    def _push_stt(self, pcm_f32: np.ndarray) -> None:
+        self.stt_in.push(tag_frame(self.stt.current_gen, (np.clip(pcm_f32, -1, 1) * 32767).astype("<i2").tobytes()))
+        self._pending_stt += 1
+        if self._pending_stt >= 10:
+            self._flush_stt_push()
+
     def _interrupt(self, now: int) -> None:
-        """Caller talked over us: cancel everything for this generation, flush audio, keep the partial reply."""
+        """Caller talked over us (greeting or reply): cancel this generation, flush audio, keep the partial reply,
+        and replay the interrupting speech into the new generation so its first 250 ms are not lost."""
+        was_greeting = self.state == "GREETING"
         t = self.timer
-        g = t.gen
-        for c in (self.stt, self.llm, self.tts):
-            c.cancel(g)
+        if t is not None and not was_greeting:
+            for c in (self.stt, self.llm, self.tts):
+                c.cancel(t.gen)
         self.tx.flush()
         self.tts_out.flush()
-        t.bargein = True
-        t.bargein_stop_ns = now - (self._interrupt_t or now)
-        t.reply_text = "".join(self._reply_parts).strip()
-        self.history.append({"role": "assistant", "content": (t.reply_text + " [interrupted]").strip()})
-        t.rx_overruns, t.tx_underruns = self.rx.overruns, self.tx.underruns
-        self.on_turn(t)
+        if t is not None and not was_greeting:
+            t.bargein = True
+            t.bargein_stop_ns = now - (self._interrupt_t or now)
+            t.reply_text = "".join(self._reply_parts).strip()
+            self.history.append({"role": "assistant", "content": (t.reply_text + " [interrupted]").strip()})
+            t.rx_overruns, t.tx_underruns = self.rx.overruns, self.tx.underruns
+            self.on_turn(t)
+        candidate, self._candidate = self._candidate, []
         self._new_gen()
         self.bargein.reset()
         self._interrupt_t = None
         self.timer = TurnTimer(gen=self.stt.current_gen)
         self.state = "LISTENING"
-        self._pending_stt = 0
+        for pcm in candidate:
+            self._push_stt(pcm)
 
     def _flush_stt_push(self) -> None:
         if self._pending_stt:
@@ -199,7 +214,6 @@ class TurnController:
                 return
             self.history.append({"role": "user", "content": m["text"]})
             msgs = [{"role": "system", "content": self.system_prompt}] + self.history[-2 * self.cfg.history_turns:]
-            self._seq, self._tts_done_seq, self._llm_done, self._reply_parts = 0, -1, False, []
             self.chunker = ClauseChunker()
             self.port.arm_t5()
             self.llm.send({"op": "llm.generate", "gen": self.timer.gen, "messages": msgs, "max_tokens": self.cfg.max_tokens})
@@ -230,8 +244,11 @@ class TurnController:
         self._seq += 1
 
     def _pump_tts_out(self) -> None:
+        cur = self.tts.current_gen & 0xFFFFFFFF
         while (f := self.tts_out.pop()) is not None:
-            self.tx.push(f)
+            g, payload = untag_frame(f)
+            if g == cur:  # audio from a cancelled generation is dropped here, whatever its timing
+                self.tx.push(payload)
         # accept the port's stamp only once this turn has sent TTS (t3), so a previous turn's stamp is never reused
         if (self.timer is not None and self.timer.t5 is None and self.timer.t3 is not None
                 and self.port.first_nonsilent_ns and self.port.first_nonsilent_ns >= self.timer.t3):

@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from ai_phone.services.client import WorkerClient
+from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, tag_frame, untag_frame
 from ai_phone.telephony.rings import FRAME_BYTES, FrameRing
 
 
@@ -55,7 +56,7 @@ async def test_cancel_drops_stale_generation():
 @pytest.mark.asyncio
 async def test_tts_worker_writes_frames_to_ring():
     loop = asyncio.get_running_loop()
-    out = FrameRing(None, 200)
+    out = FrameRing(None, 200, frame_bytes=TTS_OUT_FRAME)
     try:
         c = WorkerClient("tts", "ai_phone.services.backends.fake:FakeTTS", loop, None, out, {})
         await c.start()
@@ -64,7 +65,8 @@ async def test_tts_worker_writes_frames_to_ring():
         evs = await _collect(c, "done", gen)
         n = sum(e["nframes"] for e in evs if e["ev"] == "chunk")
         assert n == 25 and out.available() == 25
-        assert out.pop() != bytes(FRAME_BYTES)
+        g, payload = untag_frame(out.pop())
+        assert g == gen and len(payload) == FRAME_BYTES and payload != bytes(FRAME_BYTES)
         await c.stop()
     finally:
         out.close()
@@ -74,13 +76,13 @@ async def test_tts_worker_writes_frames_to_ring():
 @pytest.mark.asyncio
 async def test_stt_worker_push_finalize():
     loop = asyncio.get_running_loop()
-    inp = FrameRing(None, 200, frame_bytes=1024)
+    inp = FrameRing(None, 200, frame_bytes=STT_IN_FRAME)
     try:
         c = WorkerClient("stt", "ai_phone.services.backends.fake:FakeSTT", loop, inp, None, {})
         await c.start()
         gen = c.next_gen()
         for _ in range(10):
-            inp.push(b"\x01\x00" * 512)
+            inp.push(tag_frame(gen, b"\x01\x00" * 512))
         c.send({"op": "stt.push", "gen": gen, "nframes": 10})
         c.send({"op": "stt.finalize", "gen": gen})
         evs = await _collect(c, "final", gen)

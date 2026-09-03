@@ -27,7 +27,7 @@ brew install swig pjproject && ./native/pjsua2/build.sh
 mkdir -p src/ai_phone/vendor && cp native/pjsua2/build/pjsua2.py native/pjsua2/build/_pjsua2*.so src/ai_phone/vendor/
 uv sync
 # weights (one-off, ~4.3 GB): Qwen3.5-4B-MLX-4bit, parakeet-tdt-0.6b-v2, Kokoro-82M-bf16, plus voices from prince-canuma/Kokoro-82M
-cp ~/.ai-phone/config.yaml.example ~/.ai-phone/config.yaml   # or write one: see architecture.md §8
+mkdir -p ~/.ai-phone && cp config.example.yaml ~/.ai-phone/config.yaml && chmod 600 ~/.ai-phone/config.yaml
 HF_HUB_OFFLINE=1 uv run ai-phone run --lan
 ```
 

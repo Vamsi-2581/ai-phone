@@ -14,6 +14,7 @@ from ai_phone.pipeline.timing import TurnLog
 from ai_phone.pipeline.turn import TurnController
 from ai_phone.pipeline.vad import Endpointer, EnergyVad, SileroVad
 from ai_phone.services.client import WorkerClient
+from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, untag_frame
 from ai_phone.telephony import events as ev
 from ai_phone.telephony.endpoint import Telephony
 from ai_phone.telephony.rings import FrameRing
@@ -48,14 +49,16 @@ class Daemon:
                 break
         frames = []
         while (f := ring.pop()) is not None:
-            frames.append(f)
+            g, payload = untag_frame(f)
+            if g == (gen & 0xFFFFFFFF):
+                frames.append(payload)
         return frames
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         events: asyncio.Queue = asyncio.Queue()
         rx, tx = FrameRing(None, 100), FrameRing(None, 400)
-        stt_in, tts_out = FrameRing(None, 400, frame_bytes=1024), FrameRing(None, 400)
+        stt_in, tts_out = FrameRing(None, 400, frame_bytes=STT_IN_FRAME), FrameRing(None, 400, frame_bytes=TTS_OUT_FRAME)
         F = FACTORIES["fake" if self.fake else "real"]
         stt = WorkerClient("stt", F["stt"], loop, stt_in, None, {})
         llm = WorkerClient("llm", F["llm"][self.tier], loop, None, None, {"system_prompt": self.system_prompt})
@@ -120,7 +123,9 @@ class Daemon:
             except asyncio.TimeoutError:
                 continue
             if isinstance(e, ev.CallStateChanged) and e.state == "ended":
-                break
+                if e.call_id == call_id:
+                    break
+                log.info("ignoring end of unrelated call %s while call %s is active", e.call_id, call_id)
             if isinstance(e, ev.CallRejected):
                 log.info("rejected %s with %s", e.source_ip, e.code)
         call_stop.set()

@@ -41,6 +41,7 @@ class WorkerClient:
                   self.audio_in.name if self.audio_in else None,
                   self.audio_out.name if self.audio_out else None, self.warm_args))
         self._proc.start()
+        self._child.close()  # the child owns its end now
         ready = await self.loop.run_in_executor(None, ipc.recv, self._parent)
         if ready.get("ev") != "ready":
             raise RuntimeError(f"{self.kind} worker failed: {ready}")
@@ -71,3 +72,7 @@ class WorkerClient:
             self._proc.join(5)
             if self._proc.is_alive():
                 self._proc.kill()
+        try:
+            self._parent.close()
+        except Exception:
+            pass

@@ -12,9 +12,8 @@ import traceback
 import numpy as np
 
 from ai_phone.services import ipc
+from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, tag_frame, untag_frame
 from ai_phone.telephony.rings import FrameRing
-
-STT_FRAME_BYTES = 1024  # 512 int16 samples = one VAD chunk
 
 
 def _load(factory: str):
@@ -39,8 +38,8 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    ain = FrameRing.attach(audio_in_name, frame_bytes=STT_FRAME_BYTES if kind == "stt" else 640) if audio_in_name else None
-    aout = FrameRing.attach(audio_out_name) if audio_out_name else None
+    ain = FrameRing.attach(audio_in_name, frame_bytes=STT_IN_FRAME if kind == "stt" else 640) if audio_in_name else None
+    aout = FrameRing.attach(audio_out_name, frame_bytes=TTS_OUT_FRAME if kind == "tts" else 640) if audio_out_name else None
     cancelled: set[int] = set()
     pending: list[dict] = []  # messages read during a mid-stream cancel check, processed next
     try:
@@ -58,9 +57,17 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 continue
             gen = msg.get("gen")
             if op == "stt.push":
-                # always consume the frames this push owns, even for a cancelled gen, so the ring stays in step
-                frames = b"".join(ain.pop() or b"" for _ in range(msg["nframes"]))
-                if gen in cancelled:
+                # consume the frames this push owns (even for a cancelled gen) and keep only those tagged with it
+                parts = []
+                for _ in range(msg["nframes"]):
+                    f = ain.pop()
+                    if f is None:
+                        break
+                    g, payload = untag_frame(f)
+                    if g == (gen & 0xFFFFFFFF):
+                        parts.append(payload)
+                frames = b"".join(parts)
+                if gen in cancelled or not frames:
                     continue
                 pcm = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
                 partial = backend.push(gen, pcm)
@@ -83,7 +90,7 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 for frame in backend.stream(gen, msg["seq"], msg["text"]):
                     if gen in cancelled or (conn.poll(0) and _drain_cancel(conn, cancelled, backend, gen, pending)):
                         break
-                    aout.push(frame)
+                    aout.push(tag_frame(gen, frame))
                     n += 1
                     if n % 5 == 0:
                         ipc.send(conn, {"ev": "chunk", "gen": gen, "seq": msg["seq"], "nframes": 5})

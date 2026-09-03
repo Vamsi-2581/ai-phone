@@ -8,6 +8,7 @@ from ai_phone.config import ConversationConfig
 from ai_phone.pipeline.turn import TurnController
 from ai_phone.pipeline.vad import Endpointer, EnergyVad
 from ai_phone.services.client import WorkerClient
+from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, tag_frame, untag_frame
 from ai_phone.telephony.rings import FRAME_BYTES, SILENCE, FrameRing
 
 
@@ -44,7 +45,7 @@ async def _drain_tx(tx, port, seconds):
 
 async def make_stack(loop, cfg=None, greeting=None):
     rx, tx = FrameRing(None, 100), FrameRing(None, 400)
-    stt_in, tts_out = FrameRing(None, 400, frame_bytes=1024), FrameRing(None, 400)
+    stt_in, tts_out = FrameRing(None, 400, frame_bytes=STT_IN_FRAME), FrameRing(None, 400, frame_bytes=TTS_OUT_FRAME)
     stt = WorkerClient("stt", "ai_phone.services.backends.fake:FakeSTT", loop, stt_in, None, {})
     llm = WorkerClient("llm", "ai_phone.services.backends.fake:FakeLLM", loop, None, None, {"system_prompt": "sys"})
     tts = WorkerClient("tts", "ai_phone.services.backends.fake:FakeTTS", loop, None, tts_out, {})

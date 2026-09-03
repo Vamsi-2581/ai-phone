@@ -1,8 +1,12 @@
 """Single-producer / single-consumer ring of fixed-size audio frames on shared memory.
 
-Layout: [head u64][tail u64][overruns u64][underruns u64][frames × frame_bytes].
-head/tail are ever-increasing counters; slot = counter % frames. Aligned 8-byte
-stores are atomic on arm64 and x86-64, which is all SPSC needs.
+Layout: [head u64][tail u64][overruns u64][underruns u64][frames u64][frame_bytes u64][frames × frame_bytes].
+The geometry lives in the header because the OS rounds the segment up to a page size, so an
+attaching process cannot infer the frame count from the segment length.
+Every counter has exactly one writer: the producer owns `head` and `overruns`, the consumer owns
+`tail` and `underruns`. Each is written with one aligned 8-byte store, which is atomic on arm64 and
+x86-64, so the two sides never clobber each other's position. A full ring drops the NEW frame
+(counted as an overrun) rather than overwriting the slot the consumer may be reading.
 """
 from __future__ import annotations
 
@@ -11,7 +15,9 @@ from multiprocessing import shared_memory
 
 FRAME_BYTES = 640  # 320 samples × int16 at 16 kHz = 20 ms
 SILENCE = bytes(FRAME_BYTES)
-_HDR = struct.Struct("<QQQQ")  # head, tail, overruns, underruns
+_U64 = struct.Struct("<Q")
+_HEAD, _TAIL, _OVER, _UNDER, _FRAMES, _FBYTES = 0, 8, 16, 24, 32, 40
+_HDR_SIZE = 48
 
 
 class FrameRing:
@@ -19,72 +25,81 @@ class FrameRing:
         if frames < 1 or frame_bytes < 1:
             raise ValueError("frames and frame_bytes must be >= 1")
         self.frames, self.frame_bytes = frames, frame_bytes
-        size = _HDR.size + frames * frame_bytes
+        size = _HDR_SIZE + frames * frame_bytes
         self._shm = shared_memory.SharedMemory(name=name, create=create, size=size)
         self._buf = self._shm.buf
         if create:
-            _HDR.pack_into(self._buf, 0, 0, 0, 0, 0)
+            for off in (_HEAD, _TAIL, _OVER, _UNDER):
+                _U64.pack_into(self._buf, off, 0)
+            _U64.pack_into(self._buf, _FRAMES, frames)
+            _U64.pack_into(self._buf, _FBYTES, frame_bytes)
 
     @classmethod
-    def attach(cls, name: str, frames: int | None = None, frame_bytes: int = FRAME_BYTES) -> "FrameRing":
+    def attach(cls, name: str, frames: int | None = None, frame_bytes: int | None = None) -> "FrameRing":
+        """Attach to an existing ring; geometry comes from its header (arguments are only cross-checked)."""
         shm = shared_memory.SharedMemory(name=name, create=False)
-        n = frames or (len(shm.buf) - _HDR.size) // frame_bytes
+        n = _U64.unpack_from(shm.buf, _FRAMES)[0]
+        fb = _U64.unpack_from(shm.buf, _FBYTES)[0]
         shm.close()
-        return cls(name, n, frame_bytes, create=False)
+        if frames is not None and frames != n:
+            raise ValueError(f"ring {name} has {n} frames, caller expected {frames}")
+        if frame_bytes is not None and frame_bytes != fb:
+            raise ValueError(f"ring {name} has {fb}-byte frames, caller expected {frame_bytes}")
+        return cls(name, n, fb, create=False)
 
     @property
     def name(self) -> str:
         return self._shm.name
 
-    def _hdr(self):
-        return _HDR.unpack_from(self._buf, 0)
+    def _rd(self, off: int) -> int:
+        return _U64.unpack_from(self._buf, off)[0]
 
-    def _set(self, head, tail, over, under):
-        _HDR.pack_into(self._buf, 0, head, tail, over, under)
+    def _wr(self, off: int, value: int) -> None:
+        _U64.pack_into(self._buf, off, value)
 
     @property
     def overruns(self) -> int:
-        return self._hdr()[2]
+        return self._rd(_OVER)
 
     @property
     def underruns(self) -> int:
-        return self._hdr()[3]
+        return self._rd(_UNDER)
 
     def available(self) -> int:
-        head, tail, _, _ = self._hdr()
-        return head - tail
+        return self._rd(_HEAD) - self._rd(_TAIL)
 
+    # ---- producer side --------------------------------------------------------------------
     def push(self, frame: bytes) -> None:
         if len(frame) != self.frame_bytes:
             raise ValueError(f"frame must be {self.frame_bytes} bytes, got {len(frame)}")
-        head, tail, over, under = self._hdr()
-        if head - tail >= self.frames:  # full: drop oldest
-            tail += 1
-            over += 1
-        off = _HDR.size + (head % self.frames) * self.frame_bytes
-        self._buf[off:off + self.frame_bytes] = frame
-        self._set(head + 1, tail, over, under)
+        head = self._rd(_HEAD)
+        if head - self._rd(_TAIL) >= self.frames:  # full: drop this frame, never touch the consumer's slot
+            self._wr(_OVER, self._rd(_OVER) + 1)
+            return
+        off = _HDR_SIZE + (head % self.frames) * self.frame_bytes
+        self._buf[off:off + self.frame_bytes] = frame  # data first,
+        self._wr(_HEAD, head + 1)  # then publish
 
+    # ---- consumer side --------------------------------------------------------------------
     def pop(self) -> bytes | None:
-        head, tail, over, under = self._hdr()
-        if head == tail:
+        tail = self._rd(_TAIL)
+        if self._rd(_HEAD) == tail:
             return None
-        off = _HDR.size + (tail % self.frames) * self.frame_bytes
+        off = _HDR_SIZE + (tail % self.frames) * self.frame_bytes
         frame = bytes(self._buf[off:off + self.frame_bytes])
-        self._set(head, tail + 1, over, under)
+        self._wr(_TAIL, tail + 1)
         return frame
 
     def pop_or_silence(self) -> bytes:
         f = self.pop()
         if f is None:
-            head, tail, over, under = self._hdr()
-            self._set(head, tail, over, under + 1)
+            self._wr(_UNDER, self._rd(_UNDER) + 1)
             return SILENCE if self.frame_bytes == FRAME_BYTES else bytes(self.frame_bytes)
         return f
 
     def flush(self) -> None:
-        head, _, over, under = self._hdr()
-        self._set(head, head, over, under)
+        """Consumer-side: discard everything currently queued."""
+        self._wr(_TAIL, self._rd(_HEAD))
 
     def close(self) -> None:
         self._buf = None

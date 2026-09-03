@@ -9,4 +9,4 @@ for f in scripts/utt/*.wav; do
   printf '' | { sleep 18; echo q; } | bash scripts/pjsua_peer.sh "$f" /tmp/ai-phone-rec.wav 18 >/dev/null 2>&1 || true
   sleep 1
 done
-uv run python scripts/latency_report.py "$LOG/turns.jsonl" --last 20
+uv run python scripts/latency_report.py "$LOG/turns.jsonl" --last 20 --expect 20

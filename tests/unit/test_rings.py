@@ -19,14 +19,15 @@ def test_push_pop_fifo():
         r.unlink()
 
 
-def test_overflow_overwrites_oldest_and_counts():
+def test_overflow_drops_newest_and_counts():
     r = FrameRing(None, frames=2)
     try:
         for i in range(1, 4):
             r.push(bytes([i]) * FRAME_BYTES)
         assert r.overruns == 1
+        assert r.pop() == b"\x01" * FRAME_BYTES  # the queued frames are untouched; the third was dropped
         assert r.pop() == b"\x02" * FRAME_BYTES
-        assert r.pop() == b"\x03" * FRAME_BYTES
+        assert r.pop() is None
     finally:
         r.close()
         r.unlink()
@@ -80,6 +81,38 @@ def test_cross_process_push():
         assert p.exitcode == 0
         assert r.available() == 5
         assert r.pop() == b"\x00" * FRAME_BYTES
+    finally:
+        r.close()
+        r.unlink()
+
+
+def _producer(name, n):
+    r = FrameRing.attach(name)
+    for i in range(n):
+        while True:  # spin until there is room: this producer never drops
+            before = r.overruns
+            r.push(i.to_bytes(4, "little") * (FRAME_BYTES // 4))
+            if r.overruns == before:
+                break
+    r.close()
+
+
+def test_concurrent_producer_and_consumer_never_lose_or_duplicate_frames():
+    r = FrameRing(None, frames=8)
+    try:
+        n = 3000
+        p = mp.get_context("spawn").Process(target=_producer, args=(r.name, n))
+        p.start()
+        seen = []
+        import time
+        deadline = time.time() + 30
+        while len(seen) < n and time.time() < deadline:
+            f = r.pop()
+            if f is None:
+                continue
+            seen.append(int.from_bytes(f[:4], "little"))
+        p.join(10)
+        assert seen == list(range(n)), f"got {len(seen)} frames, first mismatch at {next((i for i, v in enumerate(seen) if v != i), None)}"
     finally:
         r.close()
         r.unlink()

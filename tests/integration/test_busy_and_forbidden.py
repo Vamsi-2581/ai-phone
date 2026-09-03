@@ -53,6 +53,8 @@ def test_second_call_gets_486_and_public_source_gets_403():
         peers.append(p2)
         rej = loop.run_until_complete(_next(events, ev.CallRejected))
         assert rej.code == 486, f"second caller should get 486, got {rej.code}"
+        loop.run_until_complete(asyncio.sleep(0.5))
+        assert tel.current_call_id == first.call_id, "the rejected caller must not disturb the active call"
         _quit(p2)
         _quit(p1)
         loop.run_until_complete(_next(events, ev.CallStateChanged))  # first call ends
