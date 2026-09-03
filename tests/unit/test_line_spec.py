@@ -47,3 +47,21 @@ def test_srtp_mapping():
     assert srtp_values(_trunk()) == (pj.PJMEDIA_SRTP_DISABLED, 0)
     assert srtp_values(_trunk(transport="tls", srtp="optional")) == (pj.PJMEDIA_SRTP_OPTIONAL, 1)
     assert srtp_values(_trunk(transport="tls", srtp="required")) == (pj.PJMEDIA_SRTP_MANDATORY, 1)
+
+
+from ai_phone.telephony.endpoint import DialError, check_caller_id, request_uri
+
+
+def test_request_uri_for_pstn_and_sip_targets():
+    s = _trunk()
+    assert request_uri(s, "+447700900123") == "sip:+447700900123@sip.telnyx.com"
+    assert request_uri(s, "sip:bob@203.0.113.7:5062") == "sip:bob@203.0.113.7:5062"
+    with pytest.raises(DialError, match="E.164"):
+        request_uri(s, "07700900123")
+
+
+def test_caller_id_must_be_own_number_or_verified():
+    check_caller_id(_trunk())  # own number
+    check_caller_id(_trunk(caller_id="+447700900123", verified_caller_ids=[__import__("ai_phone.config", fromlist=["VerifiedCallerId"]).VerifiedCallerId("+447700900123", "telnyx", "2026-09-10T00:00:00Z")]))
+    with pytest.raises(DialError, match="verified"):
+        check_caller_id(_trunk(caller_id="+447700900999"))
