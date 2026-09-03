@@ -25,6 +25,7 @@ from ai_phone.telephony.rings import FrameRing
 
 
 _log = logging.getLogger("ai-phone.turn")
+OPENING = ("GREETING", "OUTBOUND_OPENING")  # the cached line that opens a call; barge-in armed, then LISTENING
 _DEBUG_RX = os.environ.get("AI_PHONE_DEBUG_RX")  # path prefix: every call's inbound audio is written as <prefix>-<n>.raw (16 kHz int16)
 
 
@@ -39,7 +40,8 @@ class TurnController:
                  rx: FrameRing, tx: FrameRing, stt_in: FrameRing, tts_out: FrameRing, endpointer: Endpointer,
                  greeting_frames: list[bytes], system_prompt: str, on_turn: Callable[[TurnTimer], None],
                  prompt_frames: list[bytes] = (), warning_frames: list[bytes] = (),
-                 rtp_last_rx_ns: Callable[[], int] | None = None):
+                 rtp_last_rx_ns: Callable[[], int] | None = None, apology_frames: list[bytes] = (), goodbye_frames: list[bytes] = (),
+                 opening_frames: list[bytes] | None = None, direction: str = "in"):
         self.cfg, self.port, self.stt, self.llm, self.tts = cfg, port, stt, llm, tts
         self.rx, self.tx, self.stt_in, self.tts_out, self.ep = rx, tx, stt_in, tts_out, endpointer
         self.greeting, self.system_prompt, self.on_turn = greeting_frames, system_prompt, on_turn
@@ -62,6 +64,9 @@ class TurnController:
         self._warned = False
         self._start_ns = 0
         self._candidate: list[np.ndarray] = []  # speech chunks seen while not listening; replayed on barge-in
+        self.apology_frames, self.goodbye_frames = list(apology_frames), list(goodbye_frames)
+        self.opening_frames, self.direction = opening_frames, direction
+        self._brain_errors = 0  # consecutive brain failures in this call; reset by a completed turn
         self._rx_dump = open(f"{_DEBUG_RX}-{int(time.time())}.raw", "wb") if _DEBUG_RX else None
 
     # ---- generation bookkeeping ---------------------------------------------------------------
@@ -80,8 +85,14 @@ class TurnController:
         self.hangup_requested.set()
 
     # ---- main loop ----------------------------------------------------------------------------
+    def _timer(self) -> TurnTimer:
+        t = TurnTimer(gen=self.stt.current_gen)
+        t.direction = self.direction
+        return t
+
     async def run(self, stop: asyncio.Event) -> None:
-        for f in self.greeting:
+        self.state = "OUTBOUND_OPENING" if self.opening_frames is not None else "GREETING"
+        for f in (self.opening_frames if self.opening_frames is not None else self.greeting):
             self.tx.push(f)
         self._new_gen()
         self._start_ns = time.monotonic_ns()
@@ -92,15 +103,17 @@ class TurnController:
                 self._on_frame(f, now)
             self._pump_tts_out()
             self._drain_worker_events()
-            if self.state == "GREETING" and self.tx.available() == 0:
+            if self.state in OPENING and self.tx.available() == 0:
                 self._greeting_over(now)
             playing = getattr(self.port, "playing", None)
             if playing is not None:
-                self.port.playing = self.state in ("GREETING", "SPEAKING")
+                self.port.playing = self.state in OPENING or self.state == "SPEAKING"
             if self.state == "SPEAKING" and self._llm_done and self._tts_done_seq >= self._seq - 1 and self.tx.available() == 0:
                 self._finish_turn()
             self._check_timers(now)
             await asyncio.sleep(0.005)
+        if self.end_reason == "brain_error":  # let the cached goodbye reach PJSIP before the daemon hangs up
+            await asyncio.sleep(min(2.0, 0.02 * len(self.goodbye_frames)))
 
     def _check_timers(self, now: int) -> None:
         """All call timers live here, none in PJSIP. Warning fires 30 s before the cap (0.5 s for caps <= 30 s)."""
@@ -135,8 +148,8 @@ class TurnController:
                           f" utter={len(e.utterance_f32) / 16000:.2f}s" if isinstance(e, SpeechEnd) else "")
             if isinstance(e, SpeechChunk):
                 rms = float(np.sqrt(np.mean(e.pcm_f32 * e.pcm_f32)))
-                playing = self.tx.available() > 0 or self.state in ("GREETING", "SPEAKING")
-                if self.state in ("GREETING", "THINKING", "SPEAKING"):
+                playing = self.tx.available() > 0 or self.state in OPENING or self.state == "SPEAKING"
+                if self.state in OPENING or self.state in ("THINKING", "SPEAKING"):
                     # not listening: remember the audio so the interrupting utterance keeps its onset
                     if self._interrupt_t is None:
                         self._interrupt_t = e.t_ns
@@ -151,7 +164,7 @@ class TurnController:
             else:
                 self.bargein.update(False, 0.0, self.ep.noise_rms, False)
                 self._interrupt_t = None
-                if isinstance(e, SpeechEnd) and self.state == "GREETING" and self._candidate:
+                if isinstance(e, SpeechEnd) and self.state in OPENING and self._candidate:
                     self._flush_tx()  # they have spoken; answering beats finishing the greeting
                     self._greeting_over(t_ns)  # replays what was heard, then the SpeechEnd below finalises it
                 else:
@@ -160,13 +173,13 @@ class TurnController:
                 self.last_activity_ns = t_ns
                 self._prompted = False  # the caller is back
                 if self.state == "LISTENING":
-                    self.timer = TurnTimer(gen=self.stt.current_gen)
+                    self.timer = self._timer()
             elif isinstance(e, SpeechChunk) and self.state == "LISTENING":
                 self._push_stt(e.pcm_f32)
             elif isinstance(e, SpeechEnd) and self.state == "LISTENING":
                 self._flush_stt_push()
                 if self.timer is None:
-                    self.timer = TurnTimer(gen=self.stt.current_gen)
+                    self.timer = self._timer()
                 self.timer.t0 = e.t0_ns
                 self.timer.t0_end = t_ns
                 self.stt.send({"op": "stt.finalize", "gen": self.stt.current_gen})
@@ -180,7 +193,7 @@ class TurnController:
         self._interrupt_t = None
         self.bargein.reset()
         if candidate:
-            self.timer = TurnTimer(gen=self.stt.current_gen)
+            self.timer = self._timer()
             for pcm in candidate:
                 self._push_stt(pcm)
 
@@ -193,7 +206,7 @@ class TurnController:
     def _interrupt(self, now: int) -> None:
         """Caller talked over us (greeting or reply): cancel this generation, flush audio, keep the partial reply,
         and replay the interrupting speech into the new generation so its first 250 ms are not lost."""
-        was_greeting = self.state == "GREETING"
+        was_greeting = self.state in OPENING
         t = self.timer
         if t is not None and not was_greeting:
             for c in (self.stt, self.llm, self.tts):
@@ -211,7 +224,7 @@ class TurnController:
         self._new_gen()
         self.bargein.reset()
         self._interrupt_t = None
-        self.timer = TurnTimer(gen=self.stt.current_gen)
+        self.timer = self._timer()
         self.state = "LISTENING"
         for pcm in candidate:
             self._push_stt(pcm)
@@ -241,6 +254,9 @@ class TurnController:
             self.request_end(f"worker error: {m['message'][:200]}")
             return
         if self.timer is None or m.get("gen") != self.timer.gen:
+            return
+        if ev == "brain_error":
+            self._brain_error(now, m["kind"])
             return
         if ev == "final":
             self.timer.t1 = now
@@ -275,6 +291,32 @@ class TurnController:
         elif ev == "done" and m["kind"] == "tts":
             self._tts_done_seq = max(self._tts_done_seq, m["seq"])
 
+    def _brain_error(self, now: int, kind: str) -> None:
+        """The brain failed mid-turn. Cancel exactly like a barge-in (nothing half-generated may be spoken),
+        then apologise; twice in a row means the brain is gone and the call ends politely."""
+        t = self.timer
+        for c in (self.stt, self.llm, self.tts):
+            c.cancel(t.gen)
+        self._flush_tx()
+        self.tts_out.flush()
+        t.brain_error = kind
+        t.reply_text = "".join(self._reply_parts).strip()
+        t.rx_overruns, t.tx_underruns = self.rx.overruns, self.tx.underruns
+        self.on_turn(t)
+        self.timer = None
+        self._new_gen()
+        self._brain_errors += 1
+        _log.warning("brain error %s (%d in a row)", kind, self._brain_errors)
+        if self._brain_errors >= 2:
+            for f in self.goodbye_frames:
+                self.tx.push(f)
+            self.request_end("brain_error")
+            return
+        for f in self.apology_frames:
+            self.tx.push(f)
+        self.last_activity_ns = now
+        self.state = "LISTENING"
+
     def _send_tts(self, unit: str, now: int) -> None:
         if self.timer.t3 is None:
             self.timer.t3 = now
@@ -300,6 +342,7 @@ class TurnController:
             self.history.append({"role": "assistant", "content": t.reply_text})
         self.on_turn(t)
         self.timer = None
+        self._brain_errors = 0  # a completed turn ends the streak
         self.last_activity_ns = time.monotonic_ns()
         self._new_gen()
         self.state = "LISTENING"

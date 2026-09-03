@@ -28,3 +28,12 @@ def test_log_appends_json_lines_and_report_prints_p50(tmp_path: Path):
     out = subprocess.run([sys.executable, "scripts/latency_report.py", str(tmp_path / "turns.jsonl")],
                          capture_output=True, text=True, check=True).stdout
     assert "first_audible_ms" in out and "p50=  600.0" in out and "GATE: PASS" in out
+
+
+def test_record_carries_brain_error_and_direction():
+    from ai_phone.pipeline.timing import TurnTimer
+    t = TurnTimer(gen=1)
+    t.brain_error, t.direction = "idle_timeout", "out"
+    rec = t.to_record("c", 3)
+    assert rec["brain_error"] == "idle_timeout" and rec["direction"] == "out"
+    assert TurnTimer(gen=2).to_record("c", 0)["brain_error"] is None

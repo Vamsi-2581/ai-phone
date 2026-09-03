@@ -151,3 +151,108 @@ async def test_speech_during_greeting_stops_it_and_is_heard():
         assert turns[0].t0_end and turns[0].t0_end > turns[0].t0
     finally:
         await teardown(stop, runner, rings, clients)
+
+
+async def _speak_then_silence(rx, seconds=0.6):
+    for f in speech_frames(seconds):
+        rx.push(f)
+        await asyncio.sleep(0.02)
+    for _ in range(25):
+        rx.push(SILENCE)
+        await asyncio.sleep(0.02)
+
+
+async def make_flaky_stack(loop, fail_calls="2", **kw):
+    rx, tx = FrameRing(None, 100), FrameRing(None, 400)
+    stt_in, tts_out = FrameRing(None, 400, frame_bytes=STT_IN_FRAME), FrameRing(None, 400, frame_bytes=TTS_OUT_FRAME)
+    stt = WorkerClient("stt", "ai_phone.services.backends.fake:FakeSTT", loop, stt_in, None, {})
+    llm = WorkerClient("llm", "ai_phone.services.backends.fake:FlakyLLM", loop, None, None, {"system_prompt": "sys"}, factory_args={"fail_calls": fail_calls})
+    tts = WorkerClient("tts", "ai_phone.services.backends.fake:FakeTTS", loop, None, tts_out, {})
+    await asyncio.gather(stt.start(), llm.start(), tts.start())
+    port, turns = StubPort(tx), []
+    apology, goodbye = [b"\x0a\x00" * 320] * 5, [b"\x0b\x00" * 320] * 5
+    tc = TurnController(ConversationConfig(endpoint_silence_ms=300), port, stt, llm, tts, rx, tx, stt_in, tts_out,
+                        Endpointer(EnergyVad()), [], "sys", turns.append, apology_frames=apology, goodbye_frames=goodbye, **kw)
+    return tc, port, turns, (rx, tx, stt_in, tts_out), (stt, llm, tts), apology, goodbye
+
+
+@pytest.mark.asyncio
+async def test_brain_error_plays_apology_and_call_continues():
+    loop = asyncio.get_running_loop()
+    tc, port, turns, rings, clients, apology, goodbye = await make_flaky_stack(loop)
+    rx, tx = rings[0], rings[1]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await _drain_tx(tx, port, 0.2)
+        await _speak_then_silence(rx)            # turn 1: FlakyLLM answers normally
+        await _drain_tx(tx, port, 2.0)
+        assert len(turns) == 1 and turns[0].brain_error is None
+        gen_before = tc.llm.current_gen
+        await _speak_then_silence(rx)            # turn 2: FlakyLLM raises http_503
+        popped = []
+        end = time.monotonic() + 2.0
+        while time.monotonic() < end:
+            f = tx.pop()
+            if f is not None:
+                popped.append(f)
+            await asyncio.sleep(0.02)
+        assert any(f == apology[0] for f in popped), "apology frames were not played"
+        assert tc.state == "LISTENING" and tc.end_reason is None
+        assert tc.llm.current_gen > gen_before
+        assert turns[-1].brain_error == "http_503"
+        await _speak_then_silence(rx)            # turn 3: FlakyLLM answers again; the counter reset
+        await _drain_tx(tx, port, 2.0)
+        assert turns[-1].brain_error is None and tc.end_reason is None
+    finally:
+        await teardown(stop, runner, rings, clients)
+
+
+@pytest.mark.asyncio
+async def test_two_consecutive_brain_errors_end_the_call():
+    loop = asyncio.get_running_loop()
+    tc, port, turns, rings, clients, apology, goodbye = await make_flaky_stack(loop, fail_calls="2,3")
+    rx, tx = rings[0], rings[1]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await _drain_tx(tx, port, 0.2)
+        await _speak_then_silence(rx)            # FlakyLLM: call 1 ok
+        await _drain_tx(tx, port, 2.0)
+        await _speak_then_silence(rx)            # FlakyLLM: call 2 raises -> apology, back to LISTENING
+        await _drain_tx(tx, port, 1.0)
+        await _speak_then_silence(rx)            # FlakyLLM: call 3 raises -> second error in a row -> goodbye + end
+        for _ in range(100):
+            if tc.end_reason:
+                break
+            await asyncio.sleep(0.05)
+        assert tc.end_reason == "brain_error" and tc.hangup_requested.is_set()
+    finally:
+        await teardown(stop, runner, rings, clients)
+
+
+@pytest.mark.asyncio
+async def test_outbound_opening_plays_then_listens():
+    loop = asyncio.get_running_loop()
+    opening = [b"\x0c\x00" * 320] * 8
+    tc, port, turns, rings, clients = await make_stack(loop, greeting=[b"\x10\x00" * 320] * 10)
+    tc.opening_frames, tc.direction = opening, "out"
+    rx, tx = rings[0], rings[1]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await asyncio.sleep(0.05)               # let run() start and pick the opening state
+        assert tc.state == "OUTBOUND_OPENING"
+        popped = []
+        end = time.monotonic() + 0.5
+        while time.monotonic() < end:
+            f = tx.pop()
+            if f is not None:
+                popped.append(f)
+            await asyncio.sleep(0.02)
+        assert popped[:8] == opening and tc.state == "LISTENING"
+        await _speak_then_silence(rx)
+        await _drain_tx(tx, port, 2.0)
+        assert turns and turns[0].direction == "out" and turns[0].to_record("c", 0)["direction"] == "out"
+    finally:
+        await teardown(stop, runner, rings, clients)

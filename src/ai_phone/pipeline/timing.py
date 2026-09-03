@@ -27,6 +27,8 @@ class TurnTimer:
     rx_overruns: int = 0
     tx_underruns: int = 0
     worker_timings: dict = field(default_factory=dict)
+    brain_error: str | None = None
+    direction: str = "in"
 
     def first_audible_ms(self) -> float | None:
         return None if self.t0 is None or self.t5 is None else (self.t5 - self.t0) / 1e6
@@ -45,6 +47,7 @@ class TurnTimer:
             "bargein_stop_ms": None if self.bargein_stop_ns is None else self.bargein_stop_ns / 1e6,
             "rx_overruns": self.rx_overruns, "tx_underruns": self.tx_underruns, "tokens": wt.get("llm_tokens"),
             "stt_text": self.stt_text, "reply_text": self.reply_text,
+            "brain_error": self.brain_error, "direction": self.direction,
         }
 
 
