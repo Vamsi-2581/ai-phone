@@ -753,7 +753,7 @@ ai-phone status                                    # per-line registration rows 
 | 2026-09-02 | Python; Go rejected by owner; TS/Swift/Rust evaluated and rejected | [D] |
 | 2026-09-02 | PJSIP via pjsua2, vendored into the platform wheel; AGPLv3 | [D] |
 | 2026-09-02 | Hand-rolled asyncio pipeline for M1; Pipecat only if it deletes more code than it adds | [D] |
-| 2026-09-02 | LLM in the daemon's own worker process; no Ollama or any external model server | [D] | Since Milestone 2 the user may configure an OpenAI-compatible endpoint as the brain (§14a.7); nothing external is required.
+| 2026-09-02 (amended 2026-09-03) | LLM in the daemon's own worker process; no Ollama or any external model server is required. Since Milestone 2 the user may configure an OpenAI-compatible endpoint as the brain (§14a.7); that is their choice, announced at start, not a dependency | [D] |
 | 2026-09-02 | mlx-audio for STT/TTS/VAD on Mac; parakeet-mlx fallback only | [D] |
 | 2026-09-02 | Media port at 16 kHz; VAD in main process; three workers; shared-memory audio, JSON control | [D]/[P] as marked |
 | 2026-09-02 | `lan` mode includes loopback and link-local | [D] |
