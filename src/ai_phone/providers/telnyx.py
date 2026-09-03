@@ -72,7 +72,7 @@ class TelnyxProvider:
             ci = n.get("cost_information") or {}
             cost = ci.get("monthly_cost")
             out.append(Number(n["phone_number"], float(cost) if cost is not None else None, ci.get("currency"),
-                              bool(n.get("requirements")), n["phone_number"]))
+                              bool(n.get("requirements")), n["phone_number"], country=country))
         return out
 
     def _exact_number(self, e164: str) -> None:
@@ -91,7 +91,11 @@ class TelnyxProvider:
                 journal.finish("profile", outbound_voice_profile_id=existing["id"])
             else:
                 try:
-                    rec = self._call("POST", "/outbound_voice_profiles", json={"name": name, "traffic_type": "conversational"})
+                    # Telnyx's default whitelist is US+CA; a UK owner of a US number could not call home. Allow the
+                    # number's own country as well; anything else is a portal/API change to the profile.
+                    allowed = sorted({"US", "CA", number.country.upper()} - {""})
+                    rec = self._call("POST", "/outbound_voice_profiles",
+                                     json={"name": name, "traffic_type": "conversational", "whitelisted_destinations": allowed})
                     journal.finish("profile", outbound_voice_profile_id=rec["id"])
                 except ProviderError as e:
                     # Trial and freshly paid accounts may hold one profile only ("You may only have 1 Outbound Voice

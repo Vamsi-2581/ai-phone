@@ -296,8 +296,9 @@ class Daemon:
                 elif isinstance(e, ev.CallStateChanged) and e.call_id == cid and e.state == "ended" and self._outbound is not None:
                     break  # ended before media became active
             if outcome == "rejected" and detail and detail.split(" ", 1)[0] in ("403", "603"):
-                detail += (" (the carrier refused the call: either the caller ID is not one of the line's numbers or a verified one,"
-                           " or the destination is not allowed at this account level; trial accounts can only call their verified number)")
+                if not any(w in detail.lower() for w in ("whitelist", "account level", "verified")):  # the carrier said why already
+                    detail += (" (the carrier refused the call: either the caller ID is not one of the line's numbers or a verified one,"
+                               " or the destination is not allowed for this account or its outbound voice profile)")
             await self._send_quiet(send, {"event": "ended", "reason": outcome, "detail": detail, "exit_code": EXIT.get(outcome, EXIT["rejected"])})
         finally:
             self._outbound = None

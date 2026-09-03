@@ -14,6 +14,7 @@ class Number:
     currency: str | None
     requires_regulatory: bool
     source_id: str
+    country: str = ""  # ISO 3166-1 alpha-2 of the number, when the carrier says
 
 
 @dataclass

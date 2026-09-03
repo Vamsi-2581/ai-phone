@@ -110,6 +110,7 @@ def test_search_and_provision_ready(tmp_path: Path):
     assert r.line["provider"]["resources"] == {"outbound_voice_profile_id": "p1", "connection_id": "c1", "order_id": "o1", "number_id": "n1"}
     conn = carrier.connections["c1"]
     assert conn["connection_name"] == "ai-phone:main" and conn["user_name"] == "aimain1234" and conn["outbound"]["outbound_voice_profile_id"] == "p1"
+    assert carrier.profiles["p1"]["whitelisted_destinations"] == ["CA", "GB", "US"], "the number's own country must be callable"
 
 
 def test_pending_order_then_poll(tmp_path: Path):
