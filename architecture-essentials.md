@@ -68,7 +68,7 @@ config:        ~/.ai-phone/config.yaml (0600) · models: ~/.ai-phone/models · l
 
 ## Lines (Milestone 2)
 
-An agent is reachable through lines: a number bought with your own Twilio/Telnyx key (belongs to the agent; direct dial and outbound), your existing number forwarded to it, a free SIP address for agent-to-agent calls, or a SIP trunk you bring. The daemon sees only SIP either way. Flagship job: the personal receptionist. Full sketch in `architecture.md` §14a.
+An agent is reachable through lines: a number bought with your own Twilio/Telnyx key (belongs to the agent; direct dial and outbound), your existing number forwarded to it, a free SIP address for agent-to-agent calls, or a SIP trunk you bring. The daemon sees only SIP either way. The brain is pluggable (local model by default, or any OpenAI-compatible endpoint you name). No flagship job; the receptionist is a persona preset. Full sketch in `architecture.md` §14a.
 
 ## Milestone gates
 
