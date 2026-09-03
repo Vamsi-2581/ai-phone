@@ -49,3 +49,15 @@ def test_empty_and_malformed_logs_fail_cleanly(tmp_path: Path):
     p.write_text("garbage\nmore garbage\n")
     r = analyse(p, "main")
     assert r["total_sec"] == 0 and r["registered_pct"] == 0 and not r["ok"](60, 99)
+
+
+def test_bad_timestamp_and_empty_log_are_ignored_not_fatal(tmp_path: Path):
+    p = tmp_path / "s.log"
+    p.write_text("")
+    r = analyse(p, "main")
+    assert r["total_sec"] == 0 and r["drops"] == [] and not r["ok"](60, 99)
+    p.write_text("2026-13-45 99:99:99,000 INFO registration line=main state=registered code=200 reason=OK\n"
+                 "2026-09-10 12:00:00,000 INFO registration line=main state=registered code=200 reason=OK\n"
+                 "2026-09-10 13:00:00,000 INFO soak end\n")
+    r = analyse(p, "main")
+    assert r["total_sec"] == 3600 and r["ok"](60, 99)

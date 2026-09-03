@@ -19,9 +19,12 @@ def analyse(path: Path, line_id: str) -> dict:
     for raw in Path(path).read_text().splitlines():
         m = LINE.match(raw)
         e = END.match(raw)
-        stamp = datetime.strptime((m or e).group(1), "%Y-%m-%d %H:%M:%S") if (m or e) else None
-        if stamp is None:
+        if not (m or e):
             continue
+        try:
+            stamp = datetime.strptime((m or e).group(1), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue  # a registration line with an unparseable timestamp is ignored, never fatal
         if e:
             last = stamp
             break
