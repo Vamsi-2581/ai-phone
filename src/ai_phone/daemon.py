@@ -185,7 +185,7 @@ class Daemon:
                 if isinstance(e, ev.IncomingCall):
                     log.info("incoming on %s from %s (%s)", e.line_id, e.from_uri, e.source_ip)
                     tel.answer(e.call_id)
-                    self.active_call = {"line_id": e.line_id, "remote": e.from_uri, "started_at": time.time(), "direction": "in"}
+                    self.active_call = {"call_id": e.call_id, "line_id": e.line_id, "remote": e.from_uri, "started_at": time.time(), "direction": "in"}
                     self._write_state()
                 elif isinstance(e, ev.CallRejected):
                     log.info("rejected on %s: %s with %s", e.line_id, e.source_ip, e.code)
@@ -208,7 +208,9 @@ class Daemon:
                     for q in self._call_waiters:
                         q.put_nowait(e)
                 elif isinstance(e, ev.CallStateChanged) and e.state == "ended":
-                    if self.active_call is not None:  # ended before media became active (caller hung up while ringing, busy, rejected…)
+                    if self.active_call is not None and self.active_call.get("call_id") == e.call_id:
+                        # the active call ended before media became active (caller hung up while ringing, busy, rejected…);
+                        # a rejected second caller's own "ended" carries a different id and must not touch it
                         self.active_call = None
                         self._write_state()
                     for q in self._call_waiters:
@@ -255,7 +257,7 @@ class Daemon:
                 return
             log.info("control: call on line %s to %s -> call_id %s", line_id, msg["to"], cid)
             self._outbound = {"call_id": cid, "persona": persona, "send": send}
-            self.active_call = {"line_id": line_id, "remote": msg["to"], "started_at": time.time(), "direction": "out"}
+            self.active_call = {"call_id": cid, "line_id": line_id, "remote": msg["to"], "started_at": time.time(), "direction": "out"}
             self._write_state()
             outcome = "rejected"
             while True:  # progress arrives via the main loop, which is the only consumer of the telephony queue
@@ -277,7 +279,7 @@ class Daemon:
         finally:
             self._outbound = None
             self._call_waiters.remove(q)
-            if self.active_call is not None and self.active_call.get("direction") == "out" and outcome != "answered":
+            if self.active_call is not None and self.active_call.get("call_id") == cid and outcome != "answered":
                 self.active_call = None  # never reached media, so _run_call never cleared it
                 self._write_state()
 

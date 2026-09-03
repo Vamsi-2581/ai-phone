@@ -98,11 +98,13 @@ def _call_and_wait(d, lines: queue.Queue, home: Path, turns: int = 1):
             peer.terminate()
     time.sleep(1.0)
     recs = [json.loads(l) for l in turns_path.read_text().splitlines() if l.strip()] if turns_path.exists() else []
-    if len(recs) < turns:
+    complete = [r for r in recs if not r.get("incomplete")]
+    # exactly `turns` complete turns, plus at most one incomplete tail record written when the peer hung up mid-turn
+    if len(complete) != turns or len(recs) > turns + 1 or any(r.get("incomplete") for r in recs[:turns]):
         tail = []
         while not lines.empty():
             tail.append(lines.get_nowait())
-        raise AssertionError(f"expected {turns} turn records, got {len(recs)}; daemon output tail:\n" + "".join(tail)[-3000:])
+        raise AssertionError(f"expected exactly {turns} complete turn records, got {recs}; daemon output tail:\n" + "".join(tail)[-3000:])
     return recs
 
 
