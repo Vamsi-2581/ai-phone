@@ -50,7 +50,10 @@ def cmd_call(a) -> int:
                     sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
-        threading.Timer(5.0, cut).start()
+        timer = threading.Timer(5.0, cut)
+        timer.daemon = True  # never keeps the process alive
+        holder["timer"] = timer
+        timer.start()
 
     previous = signal.signal(signal.SIGINT, on_sigint)
     try:
@@ -64,6 +67,9 @@ def cmd_call(a) -> int:
         return EXIT["daemon_gone"]
     finally:
         signal.signal(signal.SIGINT, previous)
+        timer = holder.get("timer")
+        if timer is not None:
+            timer.cancel()  # `ended` arrived (or the request failed): nothing left to cut
     if last.get("ok") is False:
         print(f"refused: {last.get('error')}")
         return EXIT["line_busy"] if last.get("error") == "busy" else EXIT["rejected"]

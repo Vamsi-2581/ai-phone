@@ -100,3 +100,30 @@ def test_sigint_handler_is_restored(sock_dir: Path, monkeypatch):
         assert signal.getsignal(signal.SIGINT) is before
     finally:
         stop.set(); t.join(2)
+
+
+def test_ctrl_c_hangs_up_and_exits_promptly_when_the_daemon_confirms(sock_dir: Path, monkeypatch):
+    import os, signal, threading, time
+    monkeypatch.setenv("AI_PHONE_HOME", str(sock_dir))
+    hung_up = threading.Event()
+
+    async def handler(msg, send):
+        if msg["cmd"] == "hangup":
+            hung_up.set()
+            await send({"ok": True})
+            return
+        await send({"event": "dialling", "uri": "sip:x"})
+        await send({"event": "answered"})
+        while not hung_up.is_set():
+            await asyncio.sleep(0.02)
+        await send({"event": "ended", "reason": "answered", "exit_code": 0})
+
+    stop, t = _serve(sock_dir / "control.sock", handler)
+    threading.Timer(0.3, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
+    t0 = time.monotonic()
+    try:
+        assert main(["call", "sip:x@127.0.0.1", "--yes"]) == 0
+        assert time.monotonic() - t0 < 3.0, "the 5 s cut-off timer must not delay a confirmed hangup"
+        assert all(not th.name.startswith("Timer") or th.daemon for th in threading.enumerate())
+    finally:
+        stop.set(); t.join(2)
