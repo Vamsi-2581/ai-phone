@@ -7,7 +7,7 @@ import httpx
 from ai_phone.lines.journal import Journal
 from ai_phone.providers.base import Number, ProviderError, ProvisionResult, ReleaseResult, VerificationStep
 
-TELNYX_API = "https://api.telnyx.com/v2"
+TELNYX_API = "https://api.telnyx.com"  # paths below carry the /v2 prefix themselves
 REGISTRAR = "sip:sip.telnyx.com"
 DIAL_DOMAIN = "sip.telnyx.com"
 # Telnyx SIP signalling addresses (the regional SIP proxies that send us INVITEs), from https://sip.telnyx.com/
@@ -39,9 +39,9 @@ class TelnyxProvider:
         self.http.headers["Authorization"] = f"Bearer {key}"
 
     # ---- http ---------------------------------------------------------------------------------
-    def _call(self, method: str, path: str, **kw) -> dict:
+    def _call(self, method: str, path: str, **kw) -> dict | list:
         try:
-            r = self.http.request(method, f"/v2{path}", **kw)
+            r = self.http.request(method, f"/v2{path}", timeout=20.0, **kw)  # per request, so an injected client cannot bypass it
         except httpx.HTTPError as e:
             raise ProviderError(f"telnyx {method} {path}: {type(e).__name__}", retryable=True) from None
         if r.status_code >= 400:
@@ -94,19 +94,25 @@ class TelnyxProvider:
             journal.finish("connection", connection_id=rec["id"])
         connection_id = journal.resources()["connection_id"]
 
-        st, data = journal.start("order", phone_number=number.e164)
+        ref = f"ai-phone:{line_id}"
+        st, data = journal.start("order", phone_number=number.e164, customer_reference=ref)
         if st != "done":
             existing = None
-            if st == "started":
-                owned = self._call("GET", "/phone_numbers", params={"filter[phone_number]": number.e164}) or []
-                if owned:
-                    existing = {"id": "reconciled", "status": "success", "number_id": owned[0]["id"]}
+            if st == "started":  # the POST may have gone through: find the order by our customer_reference, or the delivered number
+                for o in self._call("GET", "/number_orders", params={"filter[customer_reference]": ref}) or []:
+                    if any(p.get("phone_number") == number.e164 for p in o.get("phone_numbers", [])):
+                        existing = {"id": o["id"], "status": o.get("status", "pending")}
+                        break
+                if existing is None:
+                    owned = self._call("GET", "/phone_numbers", params={"filter[phone_number]": number.e164}) or []
+                    if owned:
+                        existing = {"id": "reconciled", "status": "success"}
             if existing is None:
                 self._exact_number(number.e164)
-                rec = self._call("POST", "/number_orders", json={"phone_numbers": [{"phone_number": number.e164}], "connection_id": connection_id})
+                rec = self._call("POST", "/number_orders", json={"phone_numbers": [{"phone_number": number.e164}], "connection_id": connection_id, "customer_reference": ref})
                 journal.finish("order", order_id=rec["id"], order_status=rec.get("status", "pending"))
             else:
-                journal.finish("order", order_id=existing["id"], order_status="success", number_id=existing["number_id"])
+                journal.finish("order", order_id=existing["id"], order_status=existing["status"])
         return self.poll(journal)
 
     def poll(self, journal: Journal) -> ProvisionResult:
@@ -123,9 +129,12 @@ class TelnyxProvider:
                 journal.set_state("pending")
                 why = "regulatory documents required (see the Telnyx portal → Numbers → Orders)" if order.get("requirements_met") is False else "order pending"
                 return ProvisionResult("pending", f"{e164}: {why}; run `ai-phone lines resume` later")
-        if not res.get("number_id"):  # delivered (now or at order time): record the number's own id for release
+        if not res.get("number_id"):  # delivered (now or at order time): the number's own id is what release deletes
             owned = self._call("GET", "/phone_numbers", params={"filter[phone_number]": e164}) or []
-            journal.finish("order", order_id=res.get("order_id", ""), order_status="success", number_id=owned[0]["id"] if owned else "")
+            if not owned:  # the order says success but the number is not listed yet: not ready until it is
+                journal.set_state("pending")
+                return ProvisionResult("pending", f"{e164}: the order succeeded but the number is not listed on the account yet; run `ai-phone lines resume` in a minute")
+            journal.finish("order", order_id=res.get("order_id", ""), order_status="success", number_id=owned[0]["id"])
         journal.set_state("ready")
         r = journal.resources()
         sip_user = next(s["planned"]["user_name"] for s in journal.doc["steps"] if s["name"] == "connection")

@@ -6,7 +6,7 @@ import pytest
 
 from ai_phone.lines.journal import Journal
 from ai_phone.providers.base import ProviderError
-from ai_phone.providers.telnyx import SIGNALLING_CIDRS, TelnyxProvider
+from ai_phone.providers.telnyx import SIGNALLING_CIDRS, TELNYX_API, TelnyxProvider
 
 
 class Carrier:
@@ -37,10 +37,17 @@ class Carrier:
         if m == "GET" and p == "/v2/credential_connections":
             return httpx.Response(200, json={"data": [{"id": k, **v} for k, v in self.connections.items()]})
         if m == "POST" and p == "/v2/number_orders":
-            oid = f"o{len(self.orders) + 1}"; self.orders[oid] = {"status": self.order_status, "phone_numbers": body["phone_numbers"], "connection_id": body.get("connection_id")}
+            oid = f"o{len(self.orders) + 1}"
+            self.orders[oid] = {"status": self.order_status, "phone_numbers": body["phone_numbers"], "connection_id": body.get("connection_id"),
+                                "customer_reference": body.get("customer_reference")}
             if self.order_status == "success":
                 self.numbers["n1"] = {"phone_number": body["phone_numbers"][0]["phone_number"], "connection_id": body.get("connection_id")}
+            if self.crash_on == "order":
+                return httpx.Response(500, json={"errors": [{"detail": "boom"}]})
             return httpx.Response(201, json={"data": {"id": oid, **self.orders[oid]}})
+        if m == "GET" and p == "/v2/number_orders":
+            ref = req.url.params.get("filter[customer_reference]")
+            return httpx.Response(200, json={"data": [{"id": k, **v} for k, v in self.orders.items() if v.get("customer_reference") == ref]})
         if m == "GET" and p.startswith("/v2/number_orders/"):
             oid = p.rsplit("/", 1)[1]
             return httpx.Response(200, json={"data": {"id": oid, **self.orders[oid]}})
@@ -61,7 +68,28 @@ class Carrier:
 
 
 def _provider(carrier):
-    return TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(carrier), base_url="https://api.telnyx.com"))
+    # the same base URL production uses, so the /v2 path composition under test is the real one
+    return TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(carrier), base_url=TELNYX_API))
+
+
+def test_default_client_targets_the_v2_api():
+    p = TelnyxProvider(key="KEY")
+    assert str(p.http.base_url).rstrip("/") == "https://api.telnyx.com"
+    req = p.http.build_request("GET", "/v2/available_phone_numbers")
+    assert str(req.url) == "https://api.telnyx.com/v2/available_phone_numbers"
+    assert p.http.timeout.read == 20.0
+
+
+def test_injected_client_still_gets_the_request_timeout():
+    seen = {}
+
+    def handler(req):
+        seen["timeout"] = req.extensions.get("timeout")
+        return httpx.Response(200, json={"data": []})
+
+    p = TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(handler), base_url=TELNYX_API, timeout=None))
+    p.search_numbers("GB", None, 1)
+    assert seen["timeout"]["read"] == 20.0
 
 
 def test_cidrs_are_pinned_and_valid():
@@ -105,6 +133,34 @@ def test_reconciles_by_name_after_a_crash(tmp_path: Path):
     carrier.crash_on = None
     r = p.provision(Journal.open(tmp_path, "main"), p.search_numbers("GB", None, 1)[0], "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
     assert r.state == "ready" and len(carrier.profiles) == 1 and r.line["provider"]["resources"]["outbound_voice_profile_id"] == "p1"
+
+
+def test_order_crash_is_reconciled_by_customer_reference(tmp_path: Path):
+    carrier = Carrier(crash_on="order")
+    p = _provider(carrier)
+    n = p.search_numbers("GB", None, 1)[0]
+    j = Journal.open(tmp_path, "main", "telnyx")
+    with pytest.raises(ProviderError):
+        p.provision(j, n, "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
+    assert len(carrier.orders) == 1 and carrier.orders["o1"]["customer_reference"] == "ai-phone:main"
+    carrier.crash_on = None
+    r = p.provision(Journal.open(tmp_path, "main"), n, "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
+    assert r.state == "ready" and len(carrier.orders) == 1 and r.line["provider"]["resources"]["order_id"] == "o1"
+
+
+def test_success_without_a_listed_number_stays_pending(tmp_path: Path):
+    carrier = Carrier()
+    p = _provider(carrier)
+    n = p.search_numbers("GB", None, 1)[0]
+    j = Journal.open(tmp_path, "main", "telnyx")
+    r = p.provision(j, n, "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
+    assert r.state == "ready"
+    carrier.numbers.clear()  # a fresh journal whose order succeeded but whose number is not visible yet
+    j2 = Journal.open(tmp_path, "later", "telnyx")
+    j2.start("profile", name="x"); j2.finish("profile", outbound_voice_profile_id="p1")
+    j2.start("connection", name="x", user_name="aimain1234"); j2.finish("connection", connection_id="c1")
+    j2.start("order", phone_number="+442079460000", customer_reference="ai-phone:later"); j2.finish("order", order_id="o9", order_status="success")
+    assert p.poll(j2).state == "pending" and j2.state == "pending"
 
 
 def test_release_deletes_in_reverse(tmp_path: Path):
