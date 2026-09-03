@@ -46,11 +46,26 @@ class Daemon:
         self.cfg, self.tier, self.log_dir, self.fake, self.lan = cfg, tier, Path(log_dir).expanduser(), fake, lan
         self.secrets = load_secrets(paths.secrets_path())
         self.remote_brain = cfg.brain.kind == "openai_compatible"
+        self._take_secrets_from_environment()
         self.line_status: dict[str, LineStatus] = {}
         self.state_file = StateFile(paths.state_path())
         self.active_call: dict | None = None
         self._call_waiters: list[asyncio.Queue] = []
         self._outbound: dict | None = None   # {"call_id", "persona", "send"} while a control-socket call is in flight
+
+    def _secret_env_names(self) -> list[str]:
+        names = [lc.password_env or line_password_env(lid) for lid, lc in self.cfg.lines.items() if lc.kind == "trunk"]
+        if self.cfg.brain.api_key_env:
+            names.append(self.cfg.brain.api_key_env)
+        return names
+
+    def _take_secrets_from_environment(self) -> None:
+        """Secrets the user exported in the shell move from os.environ into self.secrets before any worker is
+        spawned, so no child process inherits them (spawned workers copy the daemon's environment)."""
+        for name in self._secret_env_names():
+            value = os.environ.pop(name, None)
+            if value and name not in self.secrets:
+                self.secrets[name] = value
 
     # ---- personas and cached phrases ------------------------------------------------------------
     def system_prompt_for(self, persona: PersonaConfig) -> str:
@@ -84,7 +99,7 @@ class Daemon:
             password = None
             if lc.kind == "trunk":
                 env_name = lc.password_env or line_password_env(lid)
-                password = self.secrets.get(env_name) or os.environ.get(env_name)
+                password = self.secrets.get(env_name)
                 if not password:
                     log.error("line %s skipped: password variable %s is not set (secrets.env or the environment)", lid, env_name)
                     self.line_status[lid] = LineStatus(lid, lc.kind, lc.number or "", "skipped", lc.registrar, None, f"{env_name} not set", time.time())
@@ -122,7 +137,7 @@ class Daemon:
         stt = WorkerClient("stt", F["stt"], loop, stt_in, None, {})
         if self.remote_brain:
             b = self.cfg.brain
-            key = (self.secrets.get(b.api_key_env) or os.environ.get(b.api_key_env)) if b.api_key_env else None
+            key = self.secrets.get(b.api_key_env) if b.api_key_env else None
             host = b.base_url.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
             if host not in ("127.0.0.1", "localhost", "::1", "[::1]"):
                 log.warning("Brain: %s. Transcripts of what callers say, the system prompt and the conversation history are sent there "
@@ -193,6 +208,9 @@ class Daemon:
                     for q in self._call_waiters:
                         q.put_nowait(e)
                 elif isinstance(e, ev.CallStateChanged) and e.state == "ended":
+                    if self.active_call is not None:  # ended before media became active (caller hung up while ringing, busy, rejected…)
+                        self.active_call = None
+                        self._write_state()
                     for q in self._call_waiters:
                         q.put_nowait(e)
         finally:
@@ -242,7 +260,7 @@ class Daemon:
             outcome = "rejected"
             while True:  # progress arrives via the main loop, which is the only consumer of the telephony queue
                 e = await q.get()
-                if isinstance(e, ev.OutboundProgress) and e.call_id == cid:
+                if isinstance(e, ev.OutboundProgress) and (e.call_id == cid or (e.call_id == -1 and e.line_id == line_id)):  # -1: "dialling", before PJSIP assigns the id
                     await self._send_quiet(send, {"event": e.state, "code": e.code, "uri": e.reason if e.state == "dialling" else ""})
                     if e.state in ("busy", "no_answer", "rejected", "redirected"):
                         outcome = e.state
@@ -259,6 +277,9 @@ class Daemon:
         finally:
             self._outbound = None
             self._call_waiters.remove(q)
+            if self.active_call is not None and self.active_call.get("direction") == "out" and outcome != "answered":
+                self.active_call = None  # never reached media, so _run_call never cleared it
+                self._write_state()
 
     async def _send_quiet(self, send, msg: dict) -> None:
         try:

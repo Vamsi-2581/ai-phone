@@ -10,7 +10,8 @@ def test_home_honours_env(monkeypatch, tmp_path: Path):
     assert paths.secrets_path() == tmp_path / "secrets.env"
     assert paths.state_path() == tmp_path / "state.json"
     sock = paths.socket_path()  # falls back to a short /tmp path when the home is too deep for AF_UNIX
-    assert sock == tmp_path / "control.sock" if len(str(tmp_path / "control.sock").encode()) <= 100 else sock.parent == Path("/private/tmp")
+    short_tmp = Path("/private/tmp") if Path("/private/tmp").is_dir() else Path("/tmp")  # the same rule production uses
+    assert sock == tmp_path / "control.sock" if len(str(tmp_path / "control.sock").encode()) <= 100 else sock.parent == short_tmp
     assert paths.lines_dir() == tmp_path / "lines"
 
 

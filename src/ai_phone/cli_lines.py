@@ -11,8 +11,6 @@ from ai_phone.lines.config_writer import add_line, read_raw, remove_line, update
 from ai_phone.lines.credentials import generate_sip_password, generate_sip_user
 from ai_phone.lines.forward import WHEN, divert_codes
 from ai_phone.lines.journal import Journal
-from ai_phone.providers import PROVIDERS, load_provider
-from ai_phone.providers.base import Number, ProviderError
 from ai_phone.secrets import SecretsError, load_secrets, remove_secret, write_secret
 
 EXIT_OK, EXIT_PENDING, EXIT_ERROR = 0, 2, 3
@@ -37,7 +35,11 @@ def _env(name: str | None, what: str) -> str | None:
     return v
 
 
+PROVIDER_CHOICES = ("telnyx", "twilio", "fake")  # mirrors ai_phone.providers.PROVIDERS without importing it at CLI start
+
+
 def _provider(a):
+    from ai_phone.providers import load_provider  # here, not at import: `ai-phone run` never loads the providers package
     kw = {}
     if a.provider == "fake":  # test hooks for the in-memory carrier
         kw["pending_polls"] = int(os.environ.get("AI_PHONE_FAKE_PENDING", "0"))
@@ -92,6 +94,7 @@ def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, 
         journal.finish("credentials", **planned)
     creds = journal.resources() if pw_step == "done" else planned
     password = load_secrets(paths.secrets_path())[env_name]
+    from ai_phone.providers.base import ProviderError
     try:
         result = provider.provision(journal, number, line_id, creds["user"], password)
     except ProviderError as e:
@@ -224,6 +227,7 @@ def cmd_resume(a) -> int:
     password = load_secrets(paths.secrets_path()).get(env_name)
     if not password:
         _fail(f"{env_name} is missing from {paths.secrets_path()}; run `ai-phone lines remove {a.line_id} --local-only` and add the line again")
+    from ai_phone.providers.base import Number, ProviderError
     try:
         result = provider.provision(journal, Number(e164, None, None, False, e164), a.line_id, user, password)
     except ProviderError as e:
@@ -335,6 +339,7 @@ def cmd_verify(a) -> int:
 def _guarded(fn):
     """Provider and secrets failures anywhere in a command are reported, never traced, and exit 3."""
     def run(a) -> int:
+        from ai_phone.providers.base import ProviderError
         try:
             return fn(a)
         except (ProviderError, SecretsError, ValueError) as e:
@@ -351,7 +356,7 @@ def register(sub) -> None:
     s = p.add_subparsers(dest="lines_cmd", required=True)
 
     add = s.add_parser("add", help="add a line: telnyx | twilio | trunk | sip")
-    add.add_argument("provider", choices=sorted(set(PROVIDERS) | {"trunk", "sip"}))
+    add.add_argument("provider", choices=sorted(set(PROVIDER_CHOICES) | {"trunk", "sip"}))
     add.add_argument("--id")
     add.add_argument("--persona", default="default")
     add.add_argument("--yes", action="store_true")

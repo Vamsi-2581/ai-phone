@@ -17,8 +17,9 @@ class Brain(BaseHTTPRequestHandler):
 
     def do_POST(self):
         Brain.calls += 1
-        self.rfile.read(int(self.headers.get("content-length", 0)))
-        if Brain.calls == 2:            # the second turn fails
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+        last = (body.get("messages") or [{}])[-1].get("content", "")
+        if "fake utterance 2" in last:   # the caller's second utterance (warm-up and turn 1 succeed)
             self.send_response(503); self.end_headers(); return
         self.send_response(200); self.send_header("content-type", "text/event-stream"); self.end_headers()
         for tok in ["Hello", " there", "."]:
@@ -41,7 +42,7 @@ def test_brain_failover(tmp_path: Path, monkeypatch):
     d, lines = _start_daemon(tmp_path, cfg.read_text())
     try:
         recs = _call_and_wait(d, lines, tmp_path, turns=2)   # two utterances in one call
-        assert any(r.get("brain_error") == "http_503" for r in recs)
-        assert not any(r.get("state_at_end") == "ENDING" for r in recs)  # the call did not end because of one error
+        assert [r.get("brain_error") for r in recs[:2]] == [None, "http_503"]
+        assert recs[0]["reply_text"] == "Hello there." and not any(r.get("state_at_end") == "ENDING" for r in recs)  # the call went on
     finally:
         _stop_daemon(d); srv.shutdown()

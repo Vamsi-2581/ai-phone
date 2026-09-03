@@ -25,7 +25,11 @@ CFG = ('lines:\n  agents:\n    kind: sip\n    user: agents\n    aor: "sip:agents
 def test_outbound_call_through_control_socket(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
     d, lines = _start_daemon(tmp_path, CFG % tmp_path)
-    peer = subprocess.Popen(["pjsua", "--local-port", "5062", "--null-audio", "--auto-answer", "200", "--duration", "5",
+    from tests.integration.test_daemon_smoke import _tone
+    play = tmp_path / "callee.wav"
+    _tone(play, turns=1)  # the callee "speaks" once after answering, so the agent takes one outbound turn
+    peer = subprocess.Popen(["pjsua", "--local-port", "5062", "--null-audio", "--auto-answer", "200", "--duration", "9",
+                             "--play-file", str(play), "--auto-play",
                              "--dis-codec", "speex", "--dis-codec", "ilbc", "--dis-codec", "gsm", "--dis-codec", "g722", "--dis-codec", "opus",
                              "--app-log-level", "2", "--log-level", "2"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -35,7 +39,7 @@ def test_outbound_call_through_control_socket(tmp_path: Path, monkeypatch):
         recs = [json.loads(l) for l in (tmp_path / "turns.jsonl").read_text().splitlines()] if (tmp_path / "turns.jsonl").exists() else []
         state = json.loads((tmp_path / "state.json").read_text())
         assert state["active_call"] is None
-        assert all(r.get("direction") == "out" for r in recs)
+        assert recs and all(r.get("direction") == "out" for r in recs), f"expected outbound turn records, got {recs}"
     finally:
         try:
             peer.stdin.write(b"q\n"); peer.stdin.flush(); peer.wait(timeout=10)
@@ -52,6 +56,24 @@ def test_outbound_busy_exit_code(tmp_path: Path, monkeypatch):
     try:
         time.sleep(1.0)
         assert main(["call", "sip:peer@127.0.0.1:5062", "--line", "agents", "--timeout-sec", "10"]) == 5
+    finally:
+        try:
+            peer.stdin.write(b"q\n"); peer.stdin.flush(); peer.wait(timeout=10)
+        except Exception:
+            peer.terminate()
+        _stop_daemon(d)
+
+
+def test_busy_leaves_no_active_call_in_state(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    d, lines = _start_daemon(tmp_path, CFG % tmp_path)
+    peer = subprocess.Popen(["pjsua", "--local-port", "5062", "--null-audio", "--auto-answer", "486", "--duration", "5",
+                             "--app-log-level", "2", "--log-level", "2"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1.0)
+        assert main(["call", "sip:peer@127.0.0.1:5062", "--line", "agents", "--timeout-sec", "10"]) == 5
+        time.sleep(0.5)
+        assert json.loads((tmp_path / "state.json").read_text())["active_call"] is None
     finally:
         try:
             peer.stdin.write(b"q\n"); peer.stdin.flush(); peer.wait(timeout=10)

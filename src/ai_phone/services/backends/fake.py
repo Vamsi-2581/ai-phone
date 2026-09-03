@@ -100,3 +100,12 @@ class CountingSTT(FakeSTT):
     def finalize(self, gen_id):
         n = self._count.pop(gen_id, 0)
         return f"{n} samples", {"stt_ms": 1.0}
+
+
+class EnvProbeLLM(FakeLLM):
+    """Replies with the names of any line-password variables visible in the worker's environment (tests)."""
+
+    def stream(self, gen_id, messages, max_tokens):
+        import os
+        leaked = sorted(n for n in os.environ if n.startswith("AI_PHONE_LINE_") and n.endswith("_PASSWORD"))
+        yield ",".join(leaked) or "clean"

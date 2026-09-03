@@ -127,3 +127,10 @@ def test_ctrl_c_hangs_up_and_exits_promptly_when_the_daemon_confirms(sock_dir: P
         assert all(not th.name.startswith("Timer") or th.daemon for th in threading.enumerate())
     finally:
         stop.set(); t.join(2)
+
+
+def test_run_path_never_imports_carrier_code():
+    import subprocess, sys
+    code = "import ai_phone.cli, sys; print(sorted(m for m in sys.modules if m.startswith('ai_phone.providers')))"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
+    assert out == "[]", out

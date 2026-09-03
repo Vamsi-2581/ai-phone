@@ -137,3 +137,16 @@ async def test_factory_args_reach_the_backend():
     evs = await _collect(c, "done", g)
     assert "".join(e["text"] for e in evs if e["ev"] == "token") == "Custom."
     await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_workers_never_see_line_passwords(monkeypatch):
+    monkeypatch.setenv("AI_PHONE_LINE_MAIN_PASSWORD", "hunter2")
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", "ai_phone.services.backends.fake:EnvProbeLLM", loop, None, None, {})
+    await c.start()
+    g = c.next_gen()
+    c.send({"op": "llm.generate", "gen": g, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10})
+    evs = await _collect(c, "done", g)
+    assert "".join(e["text"] for e in evs if e["ev"] == "token") == "clean"
+    await c.stop()

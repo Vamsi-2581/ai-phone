@@ -55,6 +55,8 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    for name in [n for n in os.environ if n.startswith("AI_PHONE_LINE_") and n.endswith("_PASSWORD")]:
+        del os.environ[name]  # belt and braces: a worker never holds a line password, whatever the parent exported
     ain = FrameRing.attach(audio_in_name, frame_bytes=STT_IN_FRAME if kind == "stt" else 640) if audio_in_name else None
     aout = FrameRing.attach(audio_out_name, frame_bytes=TTS_OUT_FRAME if kind == "tts" else 640) if audio_out_name else None
     cancelled: set[int] = set()

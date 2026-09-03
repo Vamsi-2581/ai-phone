@@ -97,12 +97,13 @@ def _call_and_wait(d, lines: queue.Queue, home: Path, turns: int = 1):
         except Exception:
             peer.terminate()
     time.sleep(1.0)
-    if not turns_path.exists():
+    recs = [json.loads(l) for l in turns_path.read_text().splitlines() if l.strip()] if turns_path.exists() else []
+    if len(recs) < turns:
         tail = []
         while not lines.empty():
             tail.append(lines.get_nowait())
-        raise AssertionError("no turns.jsonl written; daemon output tail:\n" + "".join(tail)[-3000:])
-    return [json.loads(l) for l in turns_path.read_text().splitlines() if l.strip()]
+        raise AssertionError(f"expected {turns} turn records, got {len(recs)}; daemon output tail:\n" + "".join(tail)[-3000:])
+    return recs
 
 
 CFG = ('personas:\n  default:\n    greeting: "Hi."\n    system_prompt: "s"\n'
