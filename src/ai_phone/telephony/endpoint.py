@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass, field
 
 from ai_phone.config import AOR_RE, DISPLAY_RE, E164_RE, SIP_URI_RE, SIP_USER_RE, USER_RE, Config, LineConfig, host_of
@@ -119,6 +120,8 @@ def check_caller_id(spec: LineSpec) -> None:
     if spec.kind != "trunk":
         return
     cid = spec.caller_id or spec.number
+    if cid is None:
+        raise DialError(f"line {spec.id} has neither a number nor a caller_id; nothing can be presented as From")
     if cid != spec.number and cid not in spec.verified_caller_ids:
         raise DialError(f"caller_id {cid} is neither line {spec.id}'s number nor a verified caller id (run `ai-phone lines verify-caller-id`)")
 
@@ -141,11 +144,19 @@ class Telephony:
         self.transport_ids: dict[str, int] = {}
         self.current_call: AiCall | None = None
         self.peer_warnings: list[str] = []
-        self._answer_timeout: asyncio.TimerHandle | None = None  # holds the outbound AiCall; cancelled when the call ends
+        self._call_lock = threading.Lock()  # make_call (asyncio thread) and onIncomingCall (PJSIP thread) both claim current_call
 
     @property
     def current_call_id(self) -> int | None:
         return self.current_call.getId() if self.current_call is not None else None
+
+    def try_claim_call(self, call: AiCall) -> bool:
+        """The one-call-at-a-time gate, safe across the asyncio and PJSIP threads."""
+        with self._call_lock:
+            if self.current_call is not None:
+                return False
+            self.current_call = call
+            return True
 
     def line_of(self, call_id: int) -> str | None:
         c = self.current_call
@@ -259,8 +270,6 @@ class Telephony:
             self.current_call.hangup(op)
 
     def make_call(self, line_id: str, target: str, timeout_sec: float = 30) -> int:
-        if self.current_call is not None:
-            raise BusyError("a call is already active")
         acc = self.accounts[line_id]
         spec = acc.spec
         check_caller_id(spec)
@@ -268,20 +277,23 @@ class Telephony:
         op = pj.CallOpParam(True)
         op.txOption.localUri = local_uri(spec)
         call = AiCall(acc, pj.PJSUA_INVALID_ID, "out")
-        self.current_call = call
+        if not self.try_claim_call(call):
+            raise BusyError("a call is already active")
+        # "dialling" goes on the queue before makeCall, so no PJSIP callback can queue "ringing" ahead of it
+        self.events.put_nowait(ev.OutboundProgress(-1, line_id, "dialling", 0, uri))
         try:
             call.makeCall(uri, op)
         except Exception as e:
-            self.current_call = None
+            with self._call_lock:
+                self.current_call = None
             raise DialError(f"could not place the call: {e}") from e
         cid = call.getId()
-        self.loop.call_soon_threadsafe(self.events.put_nowait, ev.OutboundProgress(cid, line_id, "dialling", 0, uri))
-        self._answer_timeout = self.loop.call_later(timeout_sec, self._cancel_if_unanswered, call)
+        call.answer_timeout = self.loop.call_later(timeout_sec, self._cancel_if_unanswered, call)
         log.info("line %s: dialling %s", line_id, uri)
         return cid
 
     def _cancel_if_unanswered(self, call: AiCall) -> None:
-        self._answer_timeout = None
+        call.answer_timeout = None
         if self.current_call is call and not call.answered:
             call.cancelled = True
             try:
@@ -289,19 +301,24 @@ class Telephony:
             except Exception:
                 pass
 
-    def _drop_answer_timeout(self) -> None:
-        """A pending timer would keep the pjsua2 Call alive past libDestroy, which PJSIP aborts on."""
-        if self._answer_timeout is not None:
-            self._answer_timeout.cancel()
-            self._answer_timeout = None
+    @staticmethod
+    def _drop_answer_timeout(call: AiCall) -> None:
+        """A pending timer would keep the pjsua2 Call alive past libDestroy, which PJSIP aborts on. Per call, so a
+        new call's timer is never cancelled by an old call's cleanup."""
+        handle = getattr(call, "answer_timeout", None)
+        if handle is not None:
+            handle.cancel()
+            call.answer_timeout = None
 
     def _call_ended(self, call: AiCall) -> None:
-        if self.current_call is call:
-            self.current_call = None
-            self.loop.call_soon_threadsafe(self._drop_answer_timeout)
+        with self._call_lock:
+            if self.current_call is call:
+                self.current_call = None
+        self.loop.call_soon_threadsafe(self._drop_answer_timeout, call)
 
     def stop(self) -> None:
-        self._drop_answer_timeout()
+        if self.current_call is not None:
+            self._drop_answer_timeout(self.current_call)
         if self.current_call is not None:
             try:
                 self.hangup(self.current_call.getId())

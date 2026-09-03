@@ -65,3 +65,8 @@ def test_caller_id_must_be_own_number_or_verified():
     check_caller_id(_trunk(caller_id="+447700900123", verified_caller_ids=[__import__("ai_phone.config", fromlist=["VerifiedCallerId"]).VerifiedCallerId("+447700900123", "telnyx", "2026-09-10T00:00:00Z")]))
     with pytest.raises(DialError, match="verified"):
         check_caller_id(_trunk(caller_id="+447700900999"))
+
+
+def test_trunk_without_number_or_caller_id_is_refused():
+    with pytest.raises(DialError, match="neither"):
+        check_caller_id(_trunk(number=None, caller_id=None))

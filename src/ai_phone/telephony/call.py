@@ -20,6 +20,7 @@ class AiCall(pj.Call):
         self.media_connected = False
         self.answered = False
         self.cancelled = False  # set by Telephony when it CANCELs an unanswered outbound call
+        self.answer_timeout = None  # asyncio TimerHandle for the no-answer CANCEL, owned by this call
 
     def onCallState(self, prm) -> None:
         ci = self.getInfo()
@@ -86,12 +87,11 @@ class LineAccount(pj.Account):
             call.hangup(op)
             _post(self.loop, self.events, ev.CallRejected(prm.callId, self.line_id, source_ip, 403))
             return
-        if t.current_call is not None:
+        if not t.try_claim_call(call):  # one call at a time across every line, atomically against make_call
             op.statusCode = pj.PJSIP_SC_BUSY_HERE
             call.hangup(op)
             _post(self.loop, self.events, ev.CallRejected(prm.callId, self.line_id, source_ip, 486))
             return
-        t.current_call = call
         op.statusCode = pj.PJSIP_SC_RINGING
         call.answer(op)
         _post(self.loop, self.events, ev.IncomingCall(call.getId(), self.line_id, str(call.getInfo().remoteUri), source_ip))
