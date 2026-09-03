@@ -46,17 +46,19 @@ export TELNYX_API_KEY=…
 ai-phone lines add telnyx --key-env TELNYX_API_KEY --country GB --area 020
 ai-phone run
 
-# 2. Your own number, diverted when you don't answer
+# 2. Your own mobile number. It stays on your SIM, so this is two halves:
+#    calls OUT show your number once you have verified it (one SMS code) …
+ai-phone lines verify-caller-id telnyx +447700900123 --key-env TELNYX_API_KEY
+#    … and calls IN reach the agent through your carrier's divert (one dial code, printed here)
 ai-phone lines forward telnyx --when no-answer --from +447700900123
-#   … then dial the printed **61* code on your phone (##002# cancels every divert)
+#   dial the printed **61* code on your phone; ##002# cancels every divert
 
 # 3. A SIP address, no carrier (agents calling agents)
 ai-phone lines add sip --id agents --user agents --host home.example.org --trusted 203.0.113.7
 ai-phone call sip:agents@friend.example.org --line agents
 
-# Outbound from the agent's number, or from your mobile once it is verified
+# Outbound from the agent's number (or from your verified mobile number)
 ai-phone call +447700900123
-ai-phone lines verify-caller-id telnyx +447700900123 --key-env TELNYX_API_KEY
 ai-phone status
 
 # Any brain: LM Studio, llama.cpp, or your own agent behind an OpenAI-compatible endpoint
