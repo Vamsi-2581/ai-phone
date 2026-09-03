@@ -35,7 +35,7 @@ HF_HUB_OFFLINE=1 uv run ai-phone run --lan
 Then call `sip:ai@<your-mac-ip>` from any SIP softphone on the same network, or run the test
 caller: `scripts/pjsua_peer.sh scripts/utt/00.wav /tmp/rec.wav 18`.
 
-Packaging (`uv tool install`, Homebrew tap, Docker) and real trunk registration are Milestones 2–3.
+Packaging (`uv tool install`, Homebrew tap, Docker) is Milestone 3. Real numbers, diverts and SIP addresses are Milestone 2, below.
 
 ## Three ways to call it (Milestone 2)
 
@@ -62,7 +62,7 @@ ai-phone status
 #   brain: {kind: openai_compatible, base_url: "http://127.0.0.1:1234/v1", model: "…"}
 ```
 
-During a call the daemon opens no network connection except SIP/RTP to the peer and, only if you configured one, HTTP(S) to that brain endpoint. Buying a number talks to the carrier once, from the `lines` command, and the daemon never loads the carrier code. Provisioning is journaled: `ai-phone lines resume` picks up where a crash left off, `ai-phone lines remove` deletes everything the carrier created. Configuration applies at restart. The NAT and transport checks run before calling it done are in `docs/nat-checklist.md`; the 24 h registration soak is `scripts/soak.sh`.
+During a call the daemon opens no network connection except SIP/RTP to the peer and, only if you configured one, HTTP(S) to that brain endpoint. Buying a number talks to the carrier once, from the `lines` command, and the daemon never loads the carrier code. Provisioning is journaled: `ai-phone lines resume` picks up where a crash left off, `ai-phone lines remove` deletes what the carrier created and, if a deletion fails, lists exactly what is left for you to remove in the portal. Configuration applies at restart. The NAT and transport checks run before calling it done are in [docs/nat-checklist.md](docs/nat-checklist.md); the 24 h registration soak is `scripts/soak.sh`.
 
 ## License
 

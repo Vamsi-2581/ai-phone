@@ -4,9 +4,9 @@ Read this first. If it does not answer your question, the table at the bottom sa
 
 ## What it is
 
-One daemon, one SIP identity, one phone call at a time. It registers to a SIP trunk or PBX, answers and places calls, and runs speech-to-text → language model → text-to-speech entirely on the host. No cloud AI. During a call, no network connections other than SIP signalling and RTP media to the configured peer. Numbers come from lines (see below): a carrier key may be used once at setup to buy one, never on the call path.
+One daemon, one or more lines, one phone call at a time across them. It registers to SIP trunks or PBXs (or answers at a plain SIP address), answers and places calls, and runs speech-to-text → language model → text-to-speech on the host by default. During a call, no network connections other than SIP signalling and RTP media to the peer, plus HTTP(S) to the one brain endpoint you configured if you chose a remote brain. Numbers come from lines (see below): a carrier key is used once, by the `lines` command, never by the daemon.
 
-## The five invariants (never break these)
+## The six invariants (never break these)
 
 1. **During a call, no network except SIP/RTP to the peer, and HTTP(S) to the one brain endpoint you configured.** The default brain is the local model and uses no socket; a brain that is not on this machine must be `https` and the daemon says, at start and in `doctor`, that transcripts, the system prompt and the history go there. No model downloads at runtime (`HF_HUB_OFFLINE=1`), no telemetry, no update checks. STUN and trusted-peer DNS happen at start only. Buying a number uses a carrier API from `ai-phone lines …`, never from the daemon, which does not even import the carrier code (see `architecture.md` §14a).
 2. **The PJSIP thread never blocks and never touches models.** Media callbacks only copy 640-byte frames into ring buffers. Model work lives in three child processes.
