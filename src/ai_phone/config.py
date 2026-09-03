@@ -12,8 +12,11 @@ import typing
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
+from urllib.parse import urlsplit
 
 import yaml
+
+from ai_phone import paths
 
 
 class ConfigError(ValueError):
@@ -27,7 +30,7 @@ E164_RE = re.compile(r"^\+[1-9][0-9]{6,14}$")
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _HOST = r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
 HOST_RE = re.compile(rf"^{_HOST}(?::[0-9]{{1,5}})?$")
-SIP_URI_RE = re.compile(rf"^sips?:{_HOST}(?::[0-9]{{1,5}})?(?:;transport=(?:udp|tcp|tls))?$")
+SIP_URI_RE = re.compile(rf"^sip:{_HOST}(?::[0-9]{{1,5}})?(?:;transport=(?:udp|tcp|tls))?$")
 AOR_RE = re.compile(rf"^sip:[A-Za-z0-9._-]{{1,64}}@{_HOST}(?::[0-9]{{1,5}})?$")
 DISPLAY_RE = re.compile(r"^[\x20\x21\x23-\x5b\x5d-\x7e]{1,64}$")  # printable ASCII without '"' and '\'
 CIDR_RE = re.compile(r"^[0-9a-fA-F:.]+(/[0-9]{1,3})?$")
@@ -67,7 +70,7 @@ class RtpConfig:
 @dataclass
 class ModelsConfig:
     tier: Literal["auto", "t9", "t4"] = "auto"
-    home: str = "~/.ai-phone/models"
+    home: str = field(default_factory=lambda: str(paths.home() / "models"))
 
 
 @dataclass
@@ -243,8 +246,14 @@ _LEGACY_SIP_KEYS = {"user", "domain", "password", "password_env", "trusted_peers
 def _migrate_legacy(raw: dict) -> tuple[dict, list[str]]:
     raw = dict(raw)
     warnings: list[str] = []
-    sip = dict(raw.get("sip") or {})
-    bind = dict(sip.get("bind") or {})
+    sip = raw.get("sip") or {}
+    if not isinstance(sip, dict):
+        raise ConfigError("config.sip: expected a mapping")
+    sip = dict(sip)
+    bind = sip.get("bind") or {}
+    if not isinstance(bind, dict):
+        raise ConfigError("config.sip.bind: expected a mapping")
+    bind = dict(bind)
     if _LEGACY_SIP_KEYS & set(sip) or "addr" in bind or "port" in bind:
         if sip.get("password") is not None:
             raise ConfigError("config.sip.password: inline passwords are no longer accepted; use password_env")
@@ -264,7 +273,11 @@ def _migrate_legacy(raw: dict) -> tuple[dict, list[str]]:
             if mode == "registered_trunk":
                 mode = "trusted" if line["trusted_peers"] else "lan"
             line.update({"kind": "sip", "aor": f"sip:{user}@{host}", "accept_invites_from": mode})
-        port = int(bind.get("port", 5060))
+        port = bind.get("port", 5060)
+        if isinstance(port, bool) or not isinstance(port, int):
+            raise ConfigError(f"config.sip.bind.port: expected an integer, got {port!r}")
+        if not isinstance(bind.get("addr", "0.0.0.0"), str) or not isinstance(user, str):
+            raise ConfigError("config.sip: user and bind.addr must be strings")
         new_sip = {k: v for k, v in sip.items() if k not in _LEGACY_SIP_KEYS and k != "bind"}
         new_sip["bind"] = {"address": bind.get("addr", "0.0.0.0"), "udp_port": port, "tcp_port": port,
                            "tls_port": 5061 if port != 5061 else 5062}
@@ -272,9 +285,15 @@ def _migrate_legacy(raw: dict) -> tuple[dict, list[str]]:
         lines = dict(raw.get("lines") or {})
         lines.setdefault("main", line)
         raw["lines"] = lines
-    conv = dict(raw.get("conversation") or {})
+    conv = raw.get("conversation") or {}
+    if not isinstance(conv, dict):
+        raise ConfigError("config.conversation: expected a mapping")
+    conv = dict(conv)
     if "greeting" in conv or "system_prompt" in conv:
-        personas = dict(raw.get("personas") or {})
+        personas = raw.get("personas") or {}
+        if not isinstance(personas, dict) or not isinstance(personas.get("default") or {}, dict):
+            raise ConfigError("config.personas: expected a mapping of persona names to mappings")
+        personas = dict(personas)
         default = dict(personas.get("default") or {})
         if "greeting" in conv:
             default["greeting"] = conv.pop("greeting")
@@ -372,10 +391,14 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
                 _require(Path(f_).expanduser().exists(), f"config.sip.tls: file not found: {f_}")
     br = cfg.brain
     if br.kind == "openai_compatible":
-        _require(br.base_url.startswith(("http://", "https://")), "config.brain.base_url: expected http(s)://…")
-        host = br.base_url.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
-        loopback = host in ("127.0.0.1", "localhost", "::1", "[::1]")
-        _require(loopback or br.base_url.startswith("https://"), "config.brain.base_url: a brain that is not on this machine must use https")
+        try:
+            u = urlsplit(br.base_url)
+            host = u.hostname
+        except ValueError:
+            raise ConfigError("config.brain.base_url: not a valid URL") from None
+        _require(u.scheme in ("http", "https") and bool(host), "config.brain.base_url: expected http(s)://host[:port]/…")
+        loopback = host in ("127.0.0.1", "localhost", "::1")
+        _require(loopback or u.scheme == "https", "config.brain.base_url: a brain that is not on this machine must use https")
         if br.api_key_env is not None:
             _require(bool(ENV_RE.match(br.api_key_env)), "config.brain.api_key_env: must match " + ENV_RE.pattern)
     return warnings

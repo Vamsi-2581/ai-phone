@@ -41,6 +41,12 @@ personas:
     system_prompt: "You are a receptionist. Find out who is calling and why, take a message, and keep replies to one sentence."
     outbound_opening: "Hi, this is the office's AI assistant calling. Is now a good time?"
 
+rtp:
+  port_min: 10000
+  port_max: 10100
+models:
+  tier: auto                 # auto | t9 (24 GB+) | t4 (16 GB)
+
 brain:
   kind: local                # local | openai_compatible (any /v1/chat/completions server: LM Studio, llama.cpp, your own agent)
   base_url: "http://127.0.0.1:1234/v1"

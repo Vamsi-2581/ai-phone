@@ -56,3 +56,18 @@ def test_bad_key_name_is_refused(tmp_path: Path):
 def test_redact_hides_values_and_bearer_tokens():
     text = "Authorization: Bearer abc.def password=hunter2 ok"
     assert redact(text, ["hunter2"]) == "Authorization: Bearer *** password=*** ok"
+
+
+def test_symlinked_directory_is_refused(tmp_path: Path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "home"
+    link.symlink_to(real)
+    with pytest.raises(SecretsError, match="symlink"):
+        write_secret("A", "1", link / "secrets.env")
+
+
+def test_values_keep_their_spaces(tmp_path: Path):
+    p = tmp_path / "secrets.env"
+    write_secret("A", " padded value ", p)
+    assert load_secrets(p) == {"A": " padded value "}

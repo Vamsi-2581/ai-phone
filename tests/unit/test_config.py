@@ -153,3 +153,26 @@ def test_missing_password_env_is_a_warning_not_an_error(tmp_path: Path, monkeypa
 def test_unknown_key_is_rejected(tmp_path: Path):
     with pytest.raises(ConfigError, match="unknown key"):
         _load(tmp_path, V2 + "bogus: 1\n")
+
+
+def test_brain_host_is_parsed_not_split(tmp_path: Path):
+    sneaky = V2 + "brain:\n  kind: openai_compatible\n  base_url: \"http://127.0.0.1:80@brain.example.org/v1\"\n"
+    with pytest.raises(ConfigError, match="https"):
+        _load(tmp_path, sneaky)
+
+
+def test_sips_scheme_is_rejected(tmp_path: Path):
+    with pytest.raises(ConfigError, match="registrar"):
+        _load(tmp_path, V2.replace('registrar: "sip:sip.telnyx.com"', 'registrar: "sips:sip.telnyx.com"'))
+
+
+def test_malformed_legacy_sections_are_config_errors(tmp_path: Path):
+    with pytest.raises(ConfigError, match="config.sip"):
+        _load(tmp_path, "sip: 5\n")
+    with pytest.raises(ConfigError, match="bind.port"):
+        _load(tmp_path, 'sip:\n  user: "ai"\n  bind: {port: "five"}\n')
+
+
+def test_models_home_follows_ai_phone_home(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    assert _load(tmp_path, "").models.home == str(tmp_path / "models")

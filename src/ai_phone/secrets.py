@@ -19,8 +19,8 @@ class SecretsError(RuntimeError):
 
 
 def _check(path: Path) -> None:
-    if path.is_symlink():
-        raise SecretsError(f"{path} is a symlink; refusing to use it")
+    if path.is_symlink() or path.parent.is_symlink():
+        raise SecretsError(f"{path} (or its directory) is a symlink; refusing to use it")
     if path.exists():
         mode = stat.S_IMODE(path.stat().st_mode)
         if mode != 0o600:
@@ -32,15 +32,18 @@ def load_secrets(path: Path | None = None) -> dict[str, str]:
     _check(path)
     if not path.exists():
         return {}
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)  # no symlink swap between the check above and this read
+    with os.fdopen(fd) as f:
+        text = f.read()
     out: dict[str, str] = {}
-    for n, line in enumerate(path.read_text().splitlines(), 1):
-        line = line.strip()
-        if not line or line.startswith("#"):
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
         key, sep, value = line.partition("=")
+        key = key.strip()
         if not sep or not KEY_RE.match(key):
             raise SecretsError(f"{path}:{n}: expected KEY=VALUE")
-        out[key] = value
+        out[key] = value  # values keep their spaces
     return out
 
 
