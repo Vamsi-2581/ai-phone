@@ -101,6 +101,7 @@ async def test_worker_death_is_reported_once_as_an_error():
     c._proc.kill()
     e = await asyncio.wait_for(c.events.get(), 10)
     assert e["ev"] == "error" and "disconnected" in e["message"]
-    await asyncio.sleep(0.2)
-    assert c.events.empty(), "a dead pipe must not keep producing events"
+    # deterministic: the error path must already have unregistered the reader, so nothing can be enqueued again
+    assert not loop.remove_reader(c._parent.fileno()), "reader still registered on a dead pipe"
+    assert c.events.empty()
     await c.stop()
