@@ -11,15 +11,15 @@ one call at a time. See `PRD.md` for scope and `architecture-essentials.md` for 
 
 | Measure | p50 | p95 |
 |---|---|---|
-| First audible response, host swapping ~8 GB of other apps | 1257 ms | 1876 ms |
-| First audible response, quiet host (projection from stage measurements; clean run pending) | ~860 ms | |
-| Barge-in stop after the caller starts talking (5 interruptions) | 222 ms | 264 ms |
-| Endpoint wait / STT / LLM to first clause / TTS first chunk / egress, calm host | 299 / 94 / 259 / 199 / 7 ms | |
+| First audible response | **874 ms** | 1438 ms |
+| Barge-in stop after the caller starts talking (5 interruptions) | 219 ms | 259 ms |
+| Endpoint wait / STT / LLM to first clause / TTS first chunk / egress | 297 / 96 / 312 / 164 / 9 ms | |
 
 "First audible" is measured from the last voice-active 20 ms frame of the caller to the first
 non-silent RTP frame handed to the SIP stack; it includes the 300 ms endpoint wait. Add the phone's
-own jitter buffer (60–100 ms) for mouth-to-ear. An earlier figure of 977 ms was wrong (a ring bug
-stamped the first-audio time early) and has been withdrawn.
+own jitter buffer (60–100 ms) for mouth-to-ear. Measured while the host was also swapping about
+10 GB of other applications; a quiet machine does better. Callers who talk over the greeting are
+heard in full.
 
 ## Try it (macOS, Apple Silicon)
 
