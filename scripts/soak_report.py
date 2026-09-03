@@ -22,12 +22,13 @@ def analyse(path: Path, line_id: str) -> dict:
         stamp = datetime.strptime((m or e).group(1), "%Y-%m-%d %H:%M:%S") if (m or e) else None
         if stamp is None:
             continue
-        first = first or stamp
-        last = stamp
         if e:
+            last = stamp
             break
         if m.group(2) != line_id:
-            continue
+            continue  # other lines never move this line's clock
+        first = first or stamp
+        last = stamp
         state = m.group(3)
         if state == "registered" and t_reg_start is None:
             t_reg_start = stamp
