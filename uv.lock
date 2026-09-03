@@ -21,6 +21,8 @@ name = "ai-phone"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
+    { name = "certifi" },
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "misaki", extra = ["en"] },
     { name = "mlx-audio", extra = ["stt", "tts"], marker = "sys_platform == 'darwin'" },
@@ -41,6 +43,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", specifier = ">=2024" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=0.30" },
     { name = "misaki", extras = ["en"], specifier = ">=0.9.4" },
     { name = "mlx-audio", extras = ["stt", "tts"], marker = "sys_platform == 'darwin'", specifier = ">=0.5.1" },

@@ -1,11 +1,17 @@
-"""Typed loader for ~/.ai-phone/config.yaml (the Milestone 1 subset of architecture.md §8)."""
+"""Typed loader for ~/.ai-phone/config.yaml — Milestone 2 schema (architecture.md §8, §14a).
+
+sip:        transports and NAT for the whole daemon
+lines:      one entry per line (trunk or sip); each is a pjsua2 Account
+personas:   greeting, system prompt, outbound opening line
+brain:      local model or an OpenAI-compatible endpoint
+"""
 from __future__ import annotations
 
-import os
+import re
 import typing
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 import yaml
 
@@ -14,23 +20,42 @@ class ConfigError(ValueError):
     """A config file problem; the message names the offending key and the fix."""
 
 
+LINE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+USER_RE = re.compile(r"^[A-Za-z0-9]{4,32}$")          # trunk credentials: what Telnyx and Twilio accept
+SIP_USER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")     # sip lines: the user part of an AOR
+E164_RE = re.compile(r"^\+[1-9][0-9]{6,14}$")
+ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_HOST = r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
+HOST_RE = re.compile(rf"^{_HOST}(?::[0-9]{{1,5}})?$")
+SIP_URI_RE = re.compile(rf"^sips?:{_HOST}(?::[0-9]{{1,5}})?(?:;transport=(?:udp|tcp|tls))?$")
+AOR_RE = re.compile(rf"^sip:[A-Za-z0-9._-]{{1,64}}@{_HOST}(?::[0-9]{{1,5}})?$")
+DISPLAY_RE = re.compile(r"^[\x20\x21\x23-\x5b\x5d-\x7e]{1,64}$")  # printable ASCII without '"' and '\'
+CIDR_RE = re.compile(r"^[0-9a-fA-F:.]+(/[0-9]{1,3})?$")
+
+
 @dataclass
 class BindConfig:
-    addr: str = "0.0.0.0"
-    port: int = 5060
+    address: str = "0.0.0.0"
+    udp_port: int = 5060
+    tcp_port: int = 5060
+    tls_port: int = 5061
+
+
+@dataclass
+class TlsConfig:
+    cert_file: str | None = None
+    key_file: str | None = None
+    ca_file: str | None = None
 
 
 @dataclass
 class SipConfig:
-    user: str = "ai"
-    domain: str | None = None
-    password: str | None = None
-    password_env: str | None = None
-    register_expiry_sec: int = 300
     bind: BindConfig = field(default_factory=BindConfig)
+    tls: TlsConfig = field(default_factory=TlsConfig)
     public_addr: str | None = None
-    trusted_peers: list[str] = field(default_factory=list)
-    accept_invites_from: Literal["registered_trunk", "lan", "any"] = "registered_trunk"
+    stun_server: str | None = None
+    nameservers: list[str] = field(default_factory=list)
+    tcp_keepalive_sec: int = 30
 
 
 @dataclass
@@ -46,9 +71,65 @@ class ModelsConfig:
 
 
 @dataclass
-class ConversationConfig:
+class ProviderRef:
+    name: str = ""
+    state: Literal["pending", "ready", "failed", "rollback_failed"] = "pending"
+    resources: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class VerifiedCallerId:
+    number: str = ""
+    provider: str = ""
+    verified_at: str = ""
+
+
+@dataclass
+class LineConfig:
+    kind: Literal["trunk", "sip"] = "trunk"
+    number: str | None = None
+    aor: str | None = None
+    display_name: str = "ai-phone"
+    registrar: str | None = None
+    outbound_proxy: str | None = None
+    dial_domain: str | None = None
+    register_via_proxy: bool = True
+    transport: Literal["udp", "tcp", "tls"] = "udp"
+    user: str = "aiphone"
+    password_env: str | None = None
+    register_expiry_sec: int = 300
+    srtp: Literal["off", "optional", "required"] = "off"
+    accept_invites_from: Literal["registered_trunk", "trusted", "lan", "any"] = "registered_trunk"
+    trusted_cidrs: list[str] = field(default_factory=list)
+    trusted_peers: list[str] = field(default_factory=list)
+    caller_id: str | None = None
+    diverted_from: list[str] = field(default_factory=list)
+    verified_caller_ids: list[VerifiedCallerId] = field(default_factory=list)
+    persona: str = "default"
+    provider: ProviderRef | None = None
+
+
+@dataclass
+class PersonaConfig:
     greeting: str = "Hi, this is the house. What can I do for you?"
     system_prompt: str = "You are ai-phone, a local phone assistant. Answer in one short sentence."
+    outbound_opening: str = "Hi, this is an AI assistant calling on behalf of the owner of this number. Is now a good time?"
+
+
+@dataclass
+class BrainConfig:
+    kind: Literal["local", "openai_compatible"] = "local"
+    base_url: str = "http://127.0.0.1:1234/v1"
+    model: str = "local"
+    api_key_env: str | None = None
+    connect_timeout_ms: int = 2000
+    first_token_timeout_ms: int = 4000
+    stream_idle_timeout_ms: int = 4000
+    max_response_chars: int = 2000
+
+
+@dataclass
+class ConversationConfig:
     endpoint_silence_ms: int = 300
     bargein_min_speech_ms: int = 250
     bargein_playback_gain: float = 3.0
@@ -73,21 +154,32 @@ class Config:
     rtp: RtpConfig = field(default_factory=RtpConfig)
     codecs: list[str] = field(default_factory=lambda: ["PCMU", "PCMA"])
     models: ModelsConfig = field(default_factory=ModelsConfig)
+    lines: dict[str, LineConfig] = field(default_factory=dict)
+    personas: dict[str, PersonaConfig] = field(default_factory=dict)
+    brain: BrainConfig = field(default_factory=BrainConfig)
     conversation: ConversationConfig = field(default_factory=ConversationConfig)
     log: LogConfig = field(default_factory=LogConfig)
+    warnings: list[str] = field(default_factory=list, init=False, repr=False)
 
 
-def _check_type(value: Any, hint: Any, path: str) -> None:
-    """Reject values that do not match the field's annotation, so a bad config fails at startup, not mid-call."""
+# ---- structural loading ---------------------------------------------------------------------
+
+def _coerce(value: Any, hint: Any, path: str) -> Any:
     origin = typing.get_origin(hint)
+    if isinstance(hint, type) and is_dataclass(hint):
+        return _build(hint, value, path)
     if origin is Literal:
-        return  # validated separately with the allowed values
+        allowed = typing.get_args(hint)
+        if value not in allowed:
+            raise ConfigError(f"{path}: must be one of {list(allowed)}")
+        return value
     if origin is typing.Union or (origin is not None and origin.__name__ == "UnionType"):
+        if value is None and type(None) in typing.get_args(hint):
+            return None  # `provider: null` stays None instead of becoming a default ProviderRef()
         errors = []
         for member in typing.get_args(hint):
             try:
-                _check_type(value, member, path)
-                return
+                return _coerce(value, member, path)
             except ConfigError as e:
                 errors.append(str(e))
         raise ConfigError(f"{path}: {errors[-1]}")
@@ -95,29 +187,38 @@ def _check_type(value: Any, hint: Any, path: str) -> None:
         if not isinstance(value, list):
             raise ConfigError(f"{path}: expected a list")
         (elem,) = typing.get_args(hint) or (Any,)
-        for i, v in enumerate(value):
-            _check_type(v, elem, f"{path}[{i}]")
-        return
+        return [_coerce(v, elem, f"{path}[{i}]") for i, v in enumerate(value)]
+    if origin is dict:
+        if not isinstance(value, dict):
+            raise ConfigError(f"{path}: expected a mapping")
+        _kt, vt = typing.get_args(hint) or (Any, Any)
+        out = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ConfigError(f"{path}: keys must be strings, got {k!r}")
+            out[k] = _coerce(v, vt, f"{path}.{k}")
+        return out
     if hint is type(None):
         if value is not None:
             raise ConfigError(f"{path}: expected null")
-        return
+        return None
     if hint is bool:
         if not isinstance(value, bool):
             raise ConfigError(f"{path}: expected true or false")
-        return
+        return value
     if hint is int:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ConfigError(f"{path}: expected an integer, got {value!r}")
-        return
+        return value
     if hint is float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConfigError(f"{path}: expected a number, got {value!r}")
-        return
+        return value
     if hint is str:
         if not isinstance(value, str):
             raise ConfigError(f"{path}: expected a string, got {value!r}")
-        return
+        return value
+    return value
 
 
 def _build(cls: type, data: Any, path: str) -> Any:
@@ -126,44 +227,165 @@ def _build(cls: type, data: Any, path: str) -> Any:
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: expected a mapping")
     hints = typing.get_type_hints(cls)
-    known = {f.name: f for f in fields(cls)}
+    known = {f.name: f for f in fields(cls) if f.init}
     unknown = set(data) - set(known)
     if unknown:
         raise ConfigError(f"{path}: unknown key(s): {', '.join(sorted(unknown))}")
-    kwargs = {}
-    for name in known:
-        if name not in data:
-            continue
-        val = data[name]
-        ftype = hints[name]
-        if isinstance(ftype, type) and is_dataclass(ftype):
-            val = _build(ftype, val, f"{path}.{name}")
+    kwargs = {name: _coerce(data[name], hints[name], f"{path}.{name}") for name in known if name in data}
+    return cls(**kwargs)
+
+
+# ---- legacy (Milestone 1) migration ---------------------------------------------------------
+
+_LEGACY_SIP_KEYS = {"user", "domain", "password", "password_env", "trusted_peers", "accept_invites_from"}
+
+
+def _migrate_legacy(raw: dict) -> tuple[dict, list[str]]:
+    raw = dict(raw)
+    warnings: list[str] = []
+    sip = dict(raw.get("sip") or {})
+    bind = dict(sip.get("bind") or {})
+    if _LEGACY_SIP_KEYS & set(sip) or "addr" in bind or "port" in bind:
+        if sip.get("password") is not None:
+            raise ConfigError("config.sip.password: inline passwords are no longer accepted; use password_env")
+        warnings.append("config.sip: Milestone 1 keys found; mapped to sip.bind and lines.main. "
+                        "Update your config: this mapping is removed in the next release.")
+        user = sip.get("user", "aiphone")
+        mode = sip.get("accept_invites_from", "registered_trunk")
+        line: dict[str, Any] = {"user": user, "trusted_peers": list(sip.get("trusted_peers", []))}
+        if sip.get("domain"):
+            line.update({"kind": "trunk", "registrar": f"sip:{sip['domain']}", "dial_domain": sip["domain"],
+                         "accept_invites_from": mode})
+            if sip.get("password_env"):
+                line["password_env"] = sip["password_env"]
         else:
-            _check_type(val, ftype, f"{path}.{name}")
-        kwargs[name] = val
-    obj = cls(**kwargs)
-    _validate(obj, path)
-    return obj
+            host = bind.get("addr", "0.0.0.0")
+            host = "127.0.0.1" if host == "0.0.0.0" else host
+            if mode == "registered_trunk":
+                mode = "trusted" if line["trusted_peers"] else "lan"
+            line.update({"kind": "sip", "aor": f"sip:{user}@{host}", "accept_invites_from": mode})
+        port = int(bind.get("port", 5060))
+        new_sip = {k: v for k, v in sip.items() if k not in _LEGACY_SIP_KEYS and k != "bind"}
+        new_sip["bind"] = {"address": bind.get("addr", "0.0.0.0"), "udp_port": port, "tcp_port": port,
+                           "tls_port": 5061 if port != 5061 else 5062}
+        raw["sip"] = new_sip
+        lines = dict(raw.get("lines") or {})
+        lines.setdefault("main", line)
+        raw["lines"] = lines
+    conv = dict(raw.get("conversation") or {})
+    if "greeting" in conv or "system_prompt" in conv:
+        personas = dict(raw.get("personas") or {})
+        default = dict(personas.get("default") or {})
+        if "greeting" in conv:
+            default["greeting"] = conv.pop("greeting")
+        if "system_prompt" in conv:
+            default["system_prompt"] = conv.pop("system_prompt")
+        personas["default"] = default
+        raw["personas"], raw["conversation"] = personas, conv
+        warnings.append("config.conversation: greeting/system_prompt moved to personas.default")
+    return raw, warnings
 
 
-def _validate(obj: Any, path: str) -> None:
-    hints = typing.get_type_hints(type(obj))
-    for f in fields(obj):
-        ftype = hints[f.name]
-        if typing.get_origin(ftype) is Literal:
-            allowed = typing.get_args(ftype)
-            if getattr(obj, f.name) not in allowed:
-                raise ConfigError(f"{path}.{f.name}: must be one of {list(allowed)}")
+# ---- semantic validation --------------------------------------------------------------------
+
+def host_of(uri: str) -> str:
+    """'sip:host:port;transport=tls' -> 'host'. Grammar is validated before this is called."""
+    body = uri.split(":", 1)[1]
+    body = body.split(";", 1)[0]
+    return body.rsplit("@", 1)[-1].split(":", 1)[0]
+
+
+def line_password_env(line_id: str) -> str:
+    return f"AI_PHONE_LINE_{line_id.upper().replace('-', '_')}_PASSWORD"
+
+
+def _require(cond: bool, msg: str) -> None:
+    if not cond:
+        raise ConfigError(msg)
+
+
+def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[str]:
+    """Hard errors raise ConfigError; soft problems (a line whose password is not set) come back as warnings."""
+    import os
+    env = os.environ if env is None else env
+    warnings: list[str] = []
+    _require(cfg.rtp.port_min < cfg.rtp.port_max, "config.rtp: port_min must be less than port_max")
+    for c in cfg.codecs:
+        _require(c in ("PCMU", "PCMA"), f"config.codecs: only PCMU and PCMA are allowed, got {c}")
+    b = cfg.sip.bind
+    _require(b.tcp_port != b.tls_port, "config.sip.bind.tls_port: TLS cannot share the TCP port")
+    for ns in cfg.sip.nameservers:
+        _require(bool(HOST_RE.match(ns)), f"config.sip.nameservers: {ns!r} is not host[:port]")
+    if cfg.sip.stun_server is not None:
+        _require(bool(HOST_RE.match(cfg.sip.stun_server)), "config.sip.stun_server: expected host[:port]")
+    cfg.personas.setdefault("default", PersonaConfig())
+    users_seen: dict[str, str] = {}
+    uses_tls = False
+    for lid, ln in cfg.lines.items():
+        p = f"config.lines.{lid}"
+        _require(bool(LINE_ID_RE.match(lid)), f"{p}: line ids must match {LINE_ID_RE.pattern}")
+        if ln.kind == "trunk":
+            _require(bool(USER_RE.match(ln.user)), f"{p}.user: must match {USER_RE.pattern} (letters and digits, 4 to 32)")
+        else:
+            _require(bool(SIP_USER_RE.match(ln.user)), f"{p}.user: must match {SIP_USER_RE.pattern}")
+        _require(bool(DISPLAY_RE.match(ln.display_name)), f"{p}.display_name: printable ASCII, 1 to 64 characters, no quotes or backslashes")
+        _require(ln.persona in cfg.personas, f"{p}.persona: no persona named {ln.persona!r}")
+        _require(ln.srtp == "off" or ln.transport == "tls", f"{p}.srtp: SRTP needs transport: tls")
+        if ln.password_env is not None:
+            _require(bool(ENV_RE.match(ln.password_env)), f"{p}.password_env: must match {ENV_RE.pattern}")
+        for c in ln.trusted_cidrs:
+            _require(bool(CIDR_RE.match(c)), f"{p}.trusted_cidrs: {c!r} is not an IP or CIDR")
+        for n in ln.diverted_from:
+            _require(bool(E164_RE.match(n)), f"{p}.diverted_from: {n!r} is not E.164")
+        for v in ln.verified_caller_ids:
+            _require(bool(E164_RE.match(v.number)), f"{p}.verified_caller_ids: {v.number!r} is not E.164")
+        if ln.accept_invites_from == "trusted":
+            _require(bool(ln.trusted_peers), f"{p}.trusted_peers: accept_invites_from: trusted needs at least one peer")
+        uses_tls = uses_tls or ln.transport == "tls"
+        if ln.kind == "trunk":
+            _require(ln.registrar is not None and bool(SIP_URI_RE.match(ln.registrar)), f"{p}.registrar: expected sip:host[:port][;transport=…]")
+            _require(ln.dial_domain is not None and bool(HOST_RE.match(ln.dial_domain)), f"{p}.dial_domain: expected host[:port]")
+            if ln.outbound_proxy is not None:
+                _require(bool(SIP_URI_RE.match(ln.outbound_proxy)), f"{p}.outbound_proxy: expected sip:host[:port]")
+            if ln.number is not None:
+                _require(bool(E164_RE.match(ln.number)), f"{p}.number: expected E.164 like +442079460000")
+            if ln.caller_id is not None:
+                _require(bool(E164_RE.match(ln.caller_id)), f"{p}.caller_id: expected E.164 on a trunk line")
+            _require(ln.accept_invites_from != "trusted" or bool(ln.trusted_peers), f"{p}.trusted_peers: required")
+            if ln.accept_invites_from == "registered_trunk" and not ln.trusted_cidrs:
+                warnings.append(f"{p}.trusted_cidrs is empty: only the registrar's resolved addresses will be accepted")
+            _require(ln.user not in users_seen, f"{p}.user: {ln.user!r} is not unique (also used by line {users_seen.get(ln.user)!r})")
+            users_seen[ln.user] = lid
+            env_name = ln.password_env or line_password_env(lid)
+            if not env.get(env_name):
+                warnings.append(f"{p}: password variable {env_name} is not set; this line will be skipped at start")
+        else:
+            _require(ln.aor is not None and bool(AOR_RE.match(ln.aor)), f"{p}.aor: expected sip:user@host[:port]")
+            _require(ln.accept_invites_from != "registered_trunk", f"{p}.accept_invites_from: a sip line cannot use registered_trunk")
+            if ln.caller_id is not None:
+                _require(bool(AOR_RE.match(ln.caller_id)), f"{p}.caller_id: expected a sip: URI on a sip line")
+            if ln.transport == "tls":
+                _require(bool(cfg.sip.tls.cert_file and cfg.sip.tls.key_file), f"{p}.transport: tls on a sip line needs sip.tls.cert_file and key_file")
+    if uses_tls:
+        for f_ in (cfg.sip.tls.cert_file, cfg.sip.tls.key_file, cfg.sip.tls.ca_file):
+            if f_ is not None:
+                _require(Path(f_).expanduser().exists(), f"config.sip.tls: file not found: {f_}")
+    br = cfg.brain
+    if br.kind == "openai_compatible":
+        _require(br.base_url.startswith(("http://", "https://")), "config.brain.base_url: expected http(s)://…")
+        host = br.base_url.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
+        loopback = host in ("127.0.0.1", "localhost", "::1", "[::1]")
+        _require(loopback or br.base_url.startswith("https://"), "config.brain.base_url: a brain that is not on this machine must use https")
+        if br.api_key_env is not None:
+            _require(bool(ENV_RE.match(br.api_key_env)), "config.brain.api_key_env: must match " + ENV_RE.pattern)
+    return warnings
 
 
 def load_config(path: Path) -> Config:
     raw = yaml.safe_load(Path(path).expanduser().read_text()) or {}
+    if not isinstance(raw, dict):
+        raise ConfigError("config: expected a mapping at the top level")
+    raw, warnings = _migrate_legacy(raw)
     cfg = _build(Config, raw, "config")
-    if cfg.rtp.port_min >= cfg.rtp.port_max:
-        raise ConfigError("config.rtp: port_min must be less than port_max")
-    for c in cfg.codecs:
-        if c not in ("PCMU", "PCMA"):
-            raise ConfigError(f"config.codecs: only PCMU and PCMA are allowed, got {c}")
-    if cfg.sip.password is None and cfg.sip.password_env and not os.environ.get(cfg.sip.password_env):
-        raise ConfigError(f"config.sip.password_env: environment variable {cfg.sip.password_env} is not set")
+    cfg.warnings = warnings + validate_config(cfg)
     return cfg

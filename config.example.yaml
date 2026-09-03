@@ -1,12 +1,52 @@
-# ai-phone configuration (copy to ~/.ai-phone/config.yaml, chmod 600). Full schema: architecture.md §8
+# ai-phone configuration (copy to ~/.ai-phone/config.yaml, chmod 600). Full schema: architecture.md §8 and §14a.
+# Lines are usually added for you by `ai-phone lines add …`; the entries below show every field.
 sip:
-  user: "ai"
-  # domain: "sip.example.net"        # your SIP trunk or PBX; omit for LAN-only testing
-  # password_env: AI_PHONE_SIP_PASSWORD
-  accept_invites_from: lan           # registered_trunk (default for real trunks) | lan | any
+  bind: {address: 0.0.0.0, udp_port: 5060, tcp_port: 5060, tls_port: 5061}
+  tls: {cert_file: null, key_file: null, ca_file: null}   # ca_file null = the certifi bundle
+  public_addr: null          # set when you have a fixed public address; otherwise leave null
+  stun_server: null          # host:port; contacted at daemon start only, and only when public_addr is null
+  nameservers: []            # empty = read /etc/resolv.conf (needed for SRV lookups of the registrar)
+  tcp_keepalive_sec: 30
+
+lines:
+  main:                                   # a real phone number on a carrier (Telnyx shown; `ai-phone lines add telnyx` writes this)
+    kind: trunk
+    number: "+442079460000"
+    display_name: "Sam's assistant"
+    registrar: "sip:sip.telnyx.com"
+    dial_domain: "sip.telnyx.com"
+    user: "aimain7f3a"
+    password_env: AI_PHONE_LINE_MAIN_PASSWORD   # the password itself lives in ~/.ai-phone/secrets.env
+    accept_invites_from: registered_trunk       # registered_trunk | trusted | lan | any
+    trusted_cidrs: []                           # the carrier's signalling ranges; written by the provider
+    caller_id: "+442079460000"
+    persona: default
+  agents:                                 # a SIP address with no carrier (agents calling agents)
+    kind: sip
+    user: agents
+    aor: "sip:agents@home.example.org"
+    display_name: agents
+    accept_invites_from: trusted
+    trusted_peers: ["203.0.113.7"]
+    caller_id: "sip:agents@home.example.org"
+    persona: default
+
+personas:
+  default:
+    greeting: "Hi, this is the house. What can I do for you?"
+    system_prompt: "You are ai-phone, a local phone assistant. Answer in one short sentence."
+    outbound_opening: "Hi, this is an AI assistant calling on behalf of the owner of this number. Is now a good time?"
+  receptionist:
+    greeting: "Hello, you've reached the office. How can I help?"
+    system_prompt: "You are a receptionist. Find out who is calling and why, take a message, and keep replies to one sentence."
+    outbound_opening: "Hi, this is the office's AI assistant calling. Is now a good time?"
+
+brain:
+  kind: local                # local | openai_compatible (any /v1/chat/completions server: LM Studio, llama.cpp, your own agent)
+  base_url: "http://127.0.0.1:1234/v1"
+  model: "local"
+
 conversation:
-  greeting: "Hi, this is the house. What can I do for you?"
-  system_prompt: "You are ai-phone, a local phone assistant. Answer in one short sentence."
   endpoint_silence_ms: 300
 log:
   dir: "~/Library/Logs/ai-phone"
