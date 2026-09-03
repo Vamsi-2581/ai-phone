@@ -67,6 +67,8 @@ def test_noise_floor_is_not_seeded_by_a_speech_onset():
     class OnsetBlindVad:
         def __init__(self): self.n = 0
         def prob(self, chunk):
+            if not np.any(chunk):
+                return 0.0                       # silence is silence
             self.n += 1
             return 0.0 if self.n <= 3 else 1.0    # the VAD misses the first three chunks of speech
     ep = Endpointer(OnsetBlindVad())

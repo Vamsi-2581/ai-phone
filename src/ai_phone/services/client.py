@@ -50,7 +50,15 @@ class WorkerClient:
 
     def _on_readable(self) -> None:
         while self._parent.poll(0):
-            msg = ipc.recv(self._parent)
+            try:
+                msg = ipc.recv(self._parent)
+            except (EOFError, OSError) as e:  # the worker died: stop reading a dead pipe and report it once
+                try:
+                    self.loop.remove_reader(self._parent.fileno())
+                except Exception:
+                    pass
+                self.events.put_nowait({"ev": "error", "kind": self.kind, "message": f"{self.kind} worker disconnected: {e!r}"})
+                return
             msg["kind"] = self.kind
             if "gen" in msg and msg["gen"] != self._gen and msg["ev"] != "error":
                 continue  # stale generation: drop on receipt

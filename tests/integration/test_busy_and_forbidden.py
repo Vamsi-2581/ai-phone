@@ -29,10 +29,10 @@ def _quit(p):
         p.wait(timeout=5)
 
 
-async def _next(events, kind, timeout=10.0):
+async def _next(events, kind, timeout=10.0, **match):
     while True:
         e = await asyncio.wait_for(events.get(), timeout)
-        if isinstance(e, kind):
+        if isinstance(e, kind) and all(getattr(e, k) == v for k, v in match.items()):
             return e
 
 
@@ -57,7 +57,7 @@ def test_second_call_gets_486_and_public_source_gets_403():
         assert tel.current_call_id == first.call_id, "the rejected caller must not disturb the active call"
         _quit(p2)
         _quit(p1)
-        loop.run_until_complete(_next(events, ev.CallStateChanged))  # first call ends
+        loop.run_until_complete(_next(events, ev.CallStateChanged, call_id=first.call_id, state="ended"))
         tel.cfg.sip.accept_invites_from = "registered_trunk"  # no trunk configured → every LAN INVITE is disallowed
         p3 = _peer(5066)
         peers.append(p3)

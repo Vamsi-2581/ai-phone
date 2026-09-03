@@ -1,10 +1,12 @@
 """Barge-in detection: sustained caller speech, loud enough to beat speakerphone leak while we are playing."""
 from __future__ import annotations
 
+import math
+
 
 class BargeInDetector:
     def __init__(self, min_ms: int = 250, gain: float = 3.0, chunk_ms: int = 32, gap_tolerance: int = 1):
-        self.need = max(1, round(min_ms / chunk_ms))
+        self.need = max(1, math.ceil(min_ms / chunk_ms))  # never trigger before min_ms
         self.gain = gain
         self.gap_tolerance = gap_tolerance  # a single quiet chunk inside a word must not restart the count
         self._run = 0

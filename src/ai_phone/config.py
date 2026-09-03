@@ -77,6 +77,49 @@ class Config:
     log: LogConfig = field(default_factory=LogConfig)
 
 
+def _check_type(value: Any, hint: Any, path: str) -> None:
+    """Reject values that do not match the field's annotation, so a bad config fails at startup, not mid-call."""
+    origin = typing.get_origin(hint)
+    if origin is Literal:
+        return  # validated separately with the allowed values
+    if origin is typing.Union or (origin is not None and origin.__name__ == "UnionType"):
+        errors = []
+        for member in typing.get_args(hint):
+            try:
+                _check_type(value, member, path)
+                return
+            except ConfigError as e:
+                errors.append(str(e))
+        raise ConfigError(f"{path}: {errors[-1]}")
+    if origin is list:
+        if not isinstance(value, list):
+            raise ConfigError(f"{path}: expected a list")
+        (elem,) = typing.get_args(hint) or (Any,)
+        for i, v in enumerate(value):
+            _check_type(v, elem, f"{path}[{i}]")
+        return
+    if hint is type(None):
+        if value is not None:
+            raise ConfigError(f"{path}: expected null")
+        return
+    if hint is bool:
+        if not isinstance(value, bool):
+            raise ConfigError(f"{path}: expected true or false")
+        return
+    if hint is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"{path}: expected an integer, got {value!r}")
+        return
+    if hint is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(f"{path}: expected a number, got {value!r}")
+        return
+    if hint is str:
+        if not isinstance(value, str):
+            raise ConfigError(f"{path}: expected a string, got {value!r}")
+        return
+
+
 def _build(cls: type, data: Any, path: str) -> Any:
     if data is None:
         return cls()
@@ -95,6 +138,8 @@ def _build(cls: type, data: Any, path: str) -> Any:
         ftype = hints[name]
         if isinstance(ftype, type) and is_dataclass(ftype):
             val = _build(ftype, val, f"{path}.{name}")
+        else:
+            _check_type(val, ftype, f"{path}.{name}")
         kwargs[name] = val
     obj = cls(**kwargs)
     _validate(obj, path)

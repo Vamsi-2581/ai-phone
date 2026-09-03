@@ -18,6 +18,7 @@ DPID=$!; for i in $(seq 1 120); do grep -q "^ready" /tmp/ai-phone-quiet-daemon.l
 AI_PHONE_LOG_DIR=~/Library/Logs/ai-phone ./scripts/gate_run.sh > "$OUT" 2>&1; rc=$?
 cp ~/Library/Logs/ai-phone/turns.jsonl "${OUT%.txt}-turns.jsonl" 2>/dev/null; rm -f ~/Library/Logs/ai-phone/turns.jsonl
 for f in scripts/bargein/*.wav; do printf '' | { sleep 22; echo q; } | bash scripts/pjsua_peer.sh "$f" /tmp/ai-phone-rec.wav 22 >/dev/null 2>&1 || true; sleep 1; done
-uv run python scripts/latency_report.py ~/Library/Logs/ai-phone/turns.jsonl >> "$OUT" 2>&1
+uv run python scripts/latency_report.py ~/Library/Logs/ai-phone/turns.jsonl >> "$OUT" 2>&1; bargein_rc=$?
 kill $DPID 2>/dev/null
-echo "GATE_DONE rc=$rc"; grep -E "first_audible|GATE|turns:" "$OUT"
+echo "GATE_DONE rc=$rc bargein_rc=$bargein_rc"; grep -E "first_audible|GATE|turns:" "$OUT" || true
+[ "$rc" -eq 0 ] && [ "$bargein_rc" -eq 0 ]

@@ -41,3 +41,23 @@ def test_bad_acceptance_mode_is_an_error(tmp_path: Path):
     p.write_text(MINIMAL.replace("lan", "everyone"))
     with pytest.raises(ConfigError, match="accept_invites_from"):
         load_config(p)
+
+
+def test_wrong_scalar_type_is_an_error(tmp_path: Path):
+    p = tmp_path / "config.yaml"
+    p.write_text(MINIMAL.replace('greeting: "Hi, this is the house."', 'greeting: "Hi"\n  endpoint_silence_ms: "300"'))
+    with pytest.raises(ConfigError, match="endpoint_silence_ms"):
+        load_config(p)
+
+
+def test_list_element_type_is_checked(tmp_path: Path):
+    p = tmp_path / "config.yaml"
+    p.write_text(MINIMAL + "\ncodecs: [PCMU, 7]\n")
+    with pytest.raises(ConfigError, match="codecs"):
+        load_config(p)
+
+
+def test_nullable_field_accepts_null_and_string(tmp_path: Path):
+    p = tmp_path / "config.yaml"
+    p.write_text(MINIMAL.replace('user: "ai"', 'user: "ai"\n  domain: null'))
+    assert load_config(p).sip.domain is None

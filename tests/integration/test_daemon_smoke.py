@@ -1,8 +1,10 @@
 import json
 import math
+import queue
 import signal
 import struct
 import subprocess
+import threading
 import time
 import wave
 from pathlib import Path
@@ -30,14 +32,19 @@ def test_daemon_answers_and_logs_a_turn_with_fake_backends(tmp_path: Path):
                    '  system_prompt: "s"\n  endpoint_silence_ms: 300\nlog:\n  dir: "%s"\n' % tmp_path)
     d = subprocess.Popen(["uv", "run", "ai-phone", "run", "--config", str(cfg), "--lan", "--fake"],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines: queue.Queue = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(l) for l in d.stdout], daemon=True).start()  # readline would block forever
     try:
         deadline = time.time() + 60
-        while time.time() < deadline:
-            line = d.stdout.readline()
+        while True:
+            try:
+                line = lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise AssertionError("daemon never became ready")
             if line.strip() == "ready":
                 break
-        else:
-            raise AssertionError("daemon never became ready")
+            if time.time() > deadline:
+                raise AssertionError("daemon never became ready")
         play, rec = tmp_path / "tone.wav", tmp_path / "rec.wav"
         _tone(play)
         peer = subprocess.Popen(["bash", "scripts/pjsua_peer.sh", str(play), str(rec), "6"],
@@ -53,8 +60,11 @@ def test_daemon_answers_and_logs_a_turn_with_fake_backends(tmp_path: Path):
         turns = tmp_path / "turns.jsonl"
         if not turns.exists():
             d.send_signal(signal.SIGTERM)
-            out = d.stdout.read()
-            raise AssertionError("no turns.jsonl written; daemon output tail:\n" + out[-3000:])
+            time.sleep(1)
+            tail = []
+            while not lines.empty():
+                tail.append(lines.get_nowait())
+            raise AssertionError("no turns.jsonl written; daemon output tail:\n" + "".join(tail)[-3000:])
         rec_ = json.loads(turns.read_text().splitlines()[0])
         assert rec_["reply_text"] == "Hello, this is a fake reply." and rec_["first_audible_ms"] is not None
     finally:
