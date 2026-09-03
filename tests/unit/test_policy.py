@@ -34,3 +34,18 @@ def test_modes():
     assert source_allowed("trusted", "192.76.120.3", peers) and not source_allowed("trusted", "10.0.0.1", peers)
     assert not source_allowed("registered_trunk", "not-an-ip", peers)
     assert not source_allowed("bogus", "127.0.0.1", peers)
+
+
+def test_every_telephony_event_carries_line_id():
+    import dataclasses
+    from ai_phone.telephony import events as ev
+    for cls in (ev.IncomingCall, ev.CallStateChanged, ev.MediaActive, ev.Dtmf, ev.RegState, ev.CallRejected, ev.OutboundProgress):
+        assert "line_id" in {f.name for f in dataclasses.fields(cls)}, cls.__name__
+
+
+def test_outbound_progress_rejects_unknown_states():
+    import pytest
+    from ai_phone.telephony.events import OutboundProgress
+    OutboundProgress(1, "main", "ringing")
+    with pytest.raises(ValueError):
+        OutboundProgress(1, "main", "connected")

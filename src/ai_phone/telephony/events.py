@@ -22,11 +22,13 @@ class CallStateChanged:
 @dataclass(frozen=True)
 class MediaActive:
     call_id: int
+    line_id: str
 
 
 @dataclass(frozen=True)
 class Dtmf:
     call_id: int
+    line_id: str
     digit: str
 
 
@@ -47,10 +49,17 @@ class CallRejected:
     code: int  # 403 Forbidden or 486 Busy Here
 
 
+OUTBOUND_STATES = ("dialling", "ringing", "answered", "busy", "no_answer", "rejected", "redirected")
+
+
 @dataclass(frozen=True)
 class OutboundProgress:
     call_id: int
     line_id: str
-    state: str  # dialling | ringing | answered | busy | no_answer | rejected | redirected
+    state: str  # one of OUTBOUND_STATES
     code: int = 0
     reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.state not in OUTBOUND_STATES:
+            raise ValueError(f"OutboundProgress.state must be one of {OUTBOUND_STATES}, got {self.state!r}")

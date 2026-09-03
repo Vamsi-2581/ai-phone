@@ -1,4 +1,3 @@
-import json
 import stat
 from pathlib import Path
 

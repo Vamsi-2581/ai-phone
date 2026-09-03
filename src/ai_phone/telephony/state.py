@@ -53,7 +53,7 @@ class StateFile:
 
     @staticmethod
     def read(path: Path) -> dict:
-        path = Path(path)
-        if not path.exists():
-            raise StateError(f"{path} does not exist (daemon never started?)")
-        return json.loads(path.read_text())
+        try:
+            return json.loads(Path(path).read_text())
+        except FileNotFoundError:
+            raise StateError(f"{path} does not exist (daemon never started?)") from None
