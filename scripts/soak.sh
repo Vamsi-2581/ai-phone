@@ -13,14 +13,12 @@ PID=$!                      # the daemon itself (no pipeline, so the PID is the 
 trap 'kill -INT "$PID" 2>/dev/null || true' EXIT
 END=$(( $(date +%s) + HOURS * 3600 ))
 DIED=0
+died() { echo "$(date '+%Y-%m-%d %H:%M:%S'),000 ERROR soak end (daemon died)" >> "$LOG"; DIED=1; }
 while [ "$(date +%s)" -lt "$END" ]; do
-  if ! kill -0 "$PID" 2>/dev/null; then
-    DIED=1
-    echo "$(date '+%Y-%m-%d %H:%M:%S'),000 ERROR soak end (daemon died)" >> "$LOG"
-    break
-  fi
+  if ! kill -0 "$PID" 2>/dev/null; then died; break; fi
   sleep 30
 done
+if [ "$DIED" -eq 0 ] && ! kill -0 "$PID" 2>/dev/null; then died; fi   # it may have died during the last interval
 if [ "$DIED" -eq 0 ]; then
   kill -INT "$PID" 2>/dev/null || true
   for _ in $(seq 1 30); do    # the daemon stops its workers and PJSIP on SIGINT; give it up to 30 s

@@ -38,6 +38,26 @@ async def test_busy_while_an_inbound_call_is_active_replies_busy_and_keeps_the_c
     assert d.active_call["call_id"] == 3 and d._call_waiters == [] and d._outbound is None
 
 
+def test_default_line_selection(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    trunk = LineSpec.from_config("main", LineConfig(kind="trunk", number="+442079460000", registrar="sip:sip.telnyx.com", dial_domain="sip.telnyx.com",
+                                                    user="aimain1234", caller_id="+442079460000", trusted_cidrs=["192.0.2.0/24"]), "pw")
+    sip = _ctx(None)["specs"]["agents"]
+
+    class Acc:
+        registered = True
+
+    class Tel:
+        accounts = {"main": Acc(), "agents": Acc()}
+
+    pick = Daemon._default_line_for
+    assert pick("sip:x@host", {"main": trunk, "agents": sip}, Tel()) == "agents"
+    assert pick("sip:x@host", {"main": trunk}, Tel()) is None            # never a trunk for a sip: target
+    assert pick("+447700900123", {"agents": sip, "main": trunk}, Tel()) == "main"
+    Acc.registered = False
+    assert pick("+447700900123", {"main": trunk}, Tel()) is None         # an unregistered trunk is not a default
+
+
 @pytest.mark.asyncio
 async def test_dial_error_ends_with_rejected_and_touches_no_state(tmp_path, monkeypatch):
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))

@@ -71,6 +71,7 @@ def test_call_to_diverted_number_needs_yes(sock_dir: Path, monkeypatch, capsys):
         '    user: aimain1234\n    trusted_cidrs: ["192.0.2.0/24"]\n    diverted_from: ["+447700900123"]\n')
     assert main(["call", "+447700900123", "--line", "main"]) == 7
     assert "diverts" in capsys.readouterr().out
+    assert main(["call", "+447700900123"]) == 7  # without --line every line is checked, so the daemon's choice cannot dodge it
 
 
 def test_daemon_vanishing_mid_call_exits_9(sock_dir: Path, monkeypatch, capsys):

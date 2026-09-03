@@ -12,12 +12,14 @@ from ai_phone.control.protocol import EXIT
 
 def cmd_call(a) -> int:
     to = a.target
-    if paths.config_path().exists() and not a.yes:
+    if paths.config_path().exists() and not a.yes and not to.startswith("sip:"):
         from ai_phone.config import load_config
         cfg = load_config(paths.config_path())
-        line = cfg.lines.get(a.line) if a.line else next(iter(cfg.lines.values()), None)
-        if line is not None and to in line.diverted_from:
-            print(f"{to} diverts to this line ({line.number}); calling it would ring the agent itself. Pass --yes to do it anyway.")
+        # a diverted number rings the agent whichever line dials it, so check the named line or, without --line, every line
+        lines = [cfg.lines[a.line]] if a.line and a.line in cfg.lines else list(cfg.lines.values())
+        hit = next((ln for ln in lines if to in ln.diverted_from), None)
+        if hit is not None:
+            print(f"{to} diverts to this agent ({hit.number}); calling it would ring the agent itself. Pass --yes to do it anyway.")
             return EXIT["rejected"]
     if not probe(paths.socket_path()):
         print("ai-phone is not running (start it with `ai-phone run`).")

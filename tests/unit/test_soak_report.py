@@ -56,7 +56,7 @@ def test_a_dead_daemon_never_passes(tmp_path: Path):
     p.write_text("2026-09-10 12:00:00,000 INFO registration line=main state=registered code=200 reason=OK\n"
                  "2026-09-10 12:00:30,000 ERROR soak end (daemon died)\n")
     r = analyse(p, "main")
-    assert r["died"] and not r["ok"](60, 0)
+    assert r["died"] and not r["ok"](60, 0) and r["registered_pct"] == 0.0  # nothing is credited past the death
 
 
 def test_bad_timestamp_and_empty_log_are_ignored_not_fatal(tmp_path: Path):

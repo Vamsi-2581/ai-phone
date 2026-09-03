@@ -1,4 +1,5 @@
-"""A local OpenAI-compatible server that dies mid-call: the caller hears the apology and the call continues."""
+"""A local OpenAI-compatible server that answers the caller's second utterance with HTTP 503: the turn is recorded as a
+brain error, the apology path runs, and the call continues (the audio itself is not inspected here)."""
 import json
 import os
 import subprocess

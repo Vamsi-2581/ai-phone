@@ -155,12 +155,14 @@ class Daemon:
         control: ControlServer | None = None
         started: list[WorkerClient] = []
         try:  # from here on every failure tears down what exists: workers, rings, endpoint, socket
-            try:
-                warm = await asyncio.gather(stt.start(), llm.start(), tts.start())
-            except RuntimeError as e:
-                log.error("%s", redact(str(e), self.secrets.values()))
-                raise SystemExit(1)
-            started = [stt, llm, tts]
+            warm = []
+            for client in (stt, llm, tts):  # one at a time, so a failure part-way stops exactly the workers that exist
+                try:
+                    warm.append(await client.start())
+                except RuntimeError as e:
+                    log.error("%s", redact(str(e), self.secrets.values()))
+                    raise SystemExit(1)
+                started.append(client)
             cached = {"prompt": await self._cache_phrase(tts, tts_out, "Still there?"),
                       "warning": await self._cache_phrase(tts, tts_out, "This call will end in thirty seconds."),
                       "apology": await self._cache_phrase(tts, tts_out, APOLOGY),
@@ -219,7 +221,9 @@ class Daemon:
                         # a rejected second caller's own "ended" carries a different id and must not touch it
                         self.active_call = None
                         self._write_state()
-                        tel.release_call(e.call_id)  # no controller ran, so nothing else will release the claim
+                    # an `ended` seen here was not consumed by a controller (the controller runs inside this loop and eats its own),
+                    # so nothing else will release the claim; release_call is a no-op for any id that is not the claimed call
+                    tel.release_call(e.call_id)
                     for q in self._call_waiters:
                         q.put_nowait(e)
         finally:
@@ -295,9 +299,13 @@ class Daemon:
         finally:
             self._outbound = None
             self._call_waiters.remove(q)
-            if cid is not None and self.active_call is not None and self.active_call.get("call_id") == cid and outcome != "answered":
-                self.active_call = None  # never reached media, so _run_call never cleared it
-                self._write_state()
+            if cid is not None and outcome != "answered":
+                if self.active_call is not None and self.active_call.get("call_id") == cid:
+                    self.active_call = None  # never reached media, so _run_call never cleared it
+                    self._write_state()
+                # the main loop releases on `ended` too; both are idempotent, so the claim can never be left behind
+                if getattr(tel, "current_call", None) is not None and tel.current_call.getId() == cid and tel.current_call.ended:
+                    tel.release_call(cid)
 
     @staticmethod
     def _default_line_for(target: str, specs: dict, tel) -> str | None:
@@ -305,7 +313,7 @@ class Daemon:
         a phone number goes out on the first registered trunk line."""
         if target.startswith("sip:"):
             sip_lines = [lid for lid, s in specs.items() if s.kind == "sip"]
-            return sip_lines[0] if sip_lines else next(iter(specs), None)
+            return sip_lines[0] if sip_lines else None  # never a trunk by accident: say --line if that is really wanted
         for lid, s in specs.items():
             acc = tel.accounts.get(lid) if hasattr(tel, "accounts") else None
             if s.kind == "trunk" and s.dial_domain and (acc is None or acc.registered):

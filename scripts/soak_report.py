@@ -43,8 +43,8 @@ def analyse(path: Path, line_id: str) -> dict:
             registered += (stamp - t_reg_start).total_seconds()
             t_reg_start = None
             drops.append({"at": stamp.strftime("%Y-%m-%d %H:%M:%S"), "recover_sec": None, "_at": stamp})
-    if t_reg_start is not None and last is not None:
-        registered += (last - t_reg_start).total_seconds()
+    if t_reg_start is not None and last is not None and not died:
+        registered += (last - t_reg_start).total_seconds()  # a dead daemon earns nothing past its last registration event
     total = (last - first).total_seconds() if first and last else 0.0
     for d in drops:
         d.pop("_at", None)
