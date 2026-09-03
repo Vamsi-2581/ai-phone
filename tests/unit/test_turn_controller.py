@@ -221,11 +221,12 @@ async def test_two_consecutive_brain_errors_end_the_call():
         await _drain_tx(tx, port, 2.0)
         await _speak_then_silence(rx)            # FlakyLLM: call 2 raises -> apology, back to LISTENING
         await _drain_tx(tx, port, 1.0)
-        await _speak_then_silence(rx)            # FlakyLLM: call 3 raises -> second error in a row -> goodbye + end
-        for _ in range(100):
-            if tc.end_reason:
+        await _speak_then_silence(rx)            # FlakyLLM: call 3 raises -> second error in a row -> goodbye, drain, then hangup
+        for _ in range(200):
+            tx.pop()                              # PJSIP keeps draining the goodbye
+            if tc.hangup_requested.is_set():
                 break
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)
         assert tc.end_reason == "brain_error" and tc.hangup_requested.is_set()
     finally:
         await teardown(stop, runner, rings, clients)
@@ -254,5 +255,84 @@ async def test_outbound_opening_plays_then_listens():
         await _speak_then_silence(rx)
         await _drain_tx(tx, port, 2.0)
         assert turns and turns[0].direction == "out" and turns[0].to_record("c", 0)["direction"] == "out"
+    finally:
+        await teardown(stop, runner, rings, clients)
+
+
+class DeferredFlushPort(StubPort):
+    """Behaves like the real RingMediaPort: request_flush() only arms a flag; the (simulated) PJSIP thread flushes later."""
+
+    def __init__(self, tx):
+        super().__init__(tx)
+        self.flush_pending = False
+
+    def request_flush(self):
+        self.flush_pending = True
+
+    def pjsip_flush(self):
+        if self.flush_pending:
+            self.tx.flush()
+            self.flush_pending = False
+
+
+@pytest.mark.asyncio
+async def test_apology_is_not_lost_to_a_deferred_flush_and_partial_reply_is_kept():
+    loop = asyncio.get_running_loop()
+    tc, port, turns, rings, clients, apology, goodbye = await make_flaky_stack(loop)
+    rx, tx = rings[0], rings[1]
+    dport = DeferredFlushPort(tx)
+    tc.port = dport
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await _drain_tx(tx, dport, 0.2)
+        await _speak_then_silence(rx)            # turn 1 ok
+        await _drain_tx(tx, dport, 2.0)
+        await _speak_then_silence(rx)            # turn 2: brain error while the flush is still pending
+        for _ in range(100):
+            if dport.flush_pending:
+                break
+            await asyncio.sleep(0.02)
+        assert dport.flush_pending and tc._after_flush, "the apology must wait for the PJSIP-side flush"
+        assert tx.available() == 0 or all(f != apology[0] for f in [tx.pop() for _ in range(tx.available())])
+        dport.pjsip_flush()                       # the PJSIP thread performs the flush
+        popped = []
+        end = time.monotonic() + 1.0
+        while time.monotonic() < end:
+            f = tx.pop()
+            if f is not None:
+                popped.append(f)
+            await asyncio.sleep(0.02)
+        assert any(f == apology[0] for f in popped), "the apology was pushed after the flush"
+        assert any(h["content"].endswith("[interrupted]") for h in tc.history if h["role"] == "assistant") or not turns[-1].reply_text
+    finally:
+        await teardown(stop, runner, rings, clients)
+
+
+@pytest.mark.asyncio
+async def test_goodbye_drains_before_hangup_is_requested():
+    loop = asyncio.get_running_loop()
+    tc, port, turns, rings, clients, apology, goodbye = await make_flaky_stack(loop, fail_calls="2,3")
+    rx, tx = rings[0], rings[1]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await _drain_tx(tx, port, 0.2)
+        await _speak_then_silence(rx)
+        await _drain_tx(tx, port, 2.0)
+        await _speak_then_silence(rx)            # error 1 -> apology
+        await _drain_tx(tx, port, 1.0)
+        await _speak_then_silence(rx)            # error 2 -> goodbye, then hangup once drained
+        for _ in range(100):
+            if tc.state == "ENDING_DRAIN":
+                break
+            await asyncio.sleep(0.02)
+        assert tc.state == "ENDING_DRAIN" and not tc.hangup_requested.is_set() and tx.available() > 0
+        await _drain_tx(tx, port, 1.0)           # PJSIP drains the goodbye
+        for _ in range(100):
+            if tc.hangup_requested.is_set():
+                break
+            await asyncio.sleep(0.02)
+        assert tc.hangup_requested.is_set() and tc.end_reason == "brain_error" and tx.available() == 0
     finally:
         await teardown(stop, runner, rings, clients)

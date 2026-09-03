@@ -67,6 +67,8 @@ class TurnController:
         self.apology_frames, self.goodbye_frames = list(apology_frames), list(goodbye_frames)
         self.opening_frames, self.direction = opening_frames, direction
         self._brain_errors = 0  # consecutive brain failures in this call; reset by a completed turn
+        self._after_flush: list[bytes] = []  # cached frames queued while the PJSIP thread still owes us a flush
+        self._drain_deadline_ns: int | None = None  # ENDING_DRAIN: hang up once tx is empty or this passes
         self._rx_dump = open(f"{_DEBUG_RX}-{int(time.time())}.raw", "wb") if _DEBUG_RX else None
 
     # ---- generation bookkeeping ---------------------------------------------------------------
@@ -102,6 +104,7 @@ class TurnController:
             while (f := self.rx.pop()) is not None:
                 self._on_frame(f, now)
             self._pump_tts_out()
+            self._push_after_flush()
             self._drain_worker_events()
             if self.state in OPENING and self.tx.available() == 0:
                 self._greeting_over(now)
@@ -110,10 +113,12 @@ class TurnController:
                 self.port.playing = self.state in OPENING or self.state == "SPEAKING"
             if self.state == "SPEAKING" and self._llm_done and self._tts_done_seq >= self._seq - 1 and self.tx.available() == 0:
                 self._finish_turn()
+            if self.state == "ENDING_DRAIN" and ((self.tx.available() == 0 and not self._after_flush and not self._flush_pending())
+                                                 or now >= self._drain_deadline_ns):
+                self.state = "ENDING"  # the goodbye has been handed to PJSIP (or we waited long enough): now the BYE
+                self.hangup_requested.set()
             self._check_timers(now)
             await asyncio.sleep(0.005)
-        if self.end_reason == "brain_error":  # let the cached goodbye reach PJSIP before the daemon hangs up
-            await asyncio.sleep(min(2.0, 0.02 * len(self.goodbye_frames)))
 
     def _check_timers(self, now: int) -> None:
         """All call timers live here, none in PJSIP. Warning fires 30 s before the cap (0.5 s for caps <= 30 s)."""
@@ -229,6 +234,23 @@ class TurnController:
         for pcm in candidate:
             self._push_stt(pcm)
 
+    def _flush_pending(self) -> bool:
+        return bool(getattr(self.port, "flush_pending", False))
+
+    def _queue_cached(self, frames: list[bytes]) -> None:
+        """Cached phrases pushed right after a flush request would be discarded by the deferred flush; hold them."""
+        if self._flush_pending():
+            self._after_flush.extend(frames)
+        else:
+            for f in frames:
+                self.tx.push(f)
+
+    def _push_after_flush(self) -> None:
+        if self._after_flush and not self._flush_pending():
+            for f in self._after_flush:
+                self.tx.push(f)
+            self._after_flush = []
+
     def _flush_tx(self) -> None:
         """The PJSIP thread is the tx ring's consumer, so it performs the flush; a stub port flushes directly."""
         req = getattr(self.port, "request_flush", None)
@@ -302,18 +324,20 @@ class TurnController:
         t.brain_error = kind
         t.reply_text = "".join(self._reply_parts).strip()
         t.rx_overruns, t.tx_underruns = self.rx.overruns, self.tx.underruns
+        if t.reply_text:  # what was already said stays in history, marked, exactly as after a barge-in
+            self.history.append({"role": "assistant", "content": (t.reply_text + " [interrupted]").strip()})
         self.on_turn(t)
         self.timer = None
         self._new_gen()
         self._brain_errors += 1
         _log.warning("brain error %s (%d in a row)", kind, self._brain_errors)
         if self._brain_errors >= 2:
-            for f in self.goodbye_frames:
-                self.tx.push(f)
-            self.request_end("brain_error")
+            self._queue_cached(self.goodbye_frames)
+            self.end_reason = "brain_error"
+            self.state = "ENDING_DRAIN"  # hangup_requested is set once the goodbye has drained (see run())
+            self._drain_deadline_ns = now + int(3e9)
             return
-        for f in self.apology_frames:
-            self.tx.push(f)
+        self._queue_cached(self.apology_frames)
         self.last_activity_ns = now
         self.state = "LISTENING"
 

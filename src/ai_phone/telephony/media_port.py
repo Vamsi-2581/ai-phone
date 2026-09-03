@@ -36,6 +36,11 @@ class RingMediaPort(pj.AudioMediaPort):
         self.last_rx_ns = time.monotonic_ns()
         (self.tx if self.echo else self.rx).push(data)
 
+    @property
+    def flush_pending(self) -> bool:
+        """True between request_flush() and the PJSIP callback that performs it; frames pushed meanwhile would be lost."""
+        return bool(self._flush_requested)
+
     def request_flush(self) -> None:
         """Ask the PJSIP thread (the tx ring's only consumer) to discard queued audio at its next frame."""
         self._flush_requested = True
