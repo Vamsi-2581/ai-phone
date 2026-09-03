@@ -15,6 +15,7 @@ class RingMediaPort(pj.AudioMediaPort):
         self.first_nonsilent_ns: int | None = None
         self._armed = False
         self.playing = False  # set by the controller; silence while listening is not an underrun
+        self._flush_requested = False  # set by the controller; honoured here, on the consumer thread
         fmt = pj.MediaFormatAudio()
         fmt.type = pj.PJMEDIA_TYPE_AUDIO
         fmt.clockRate = 16000
@@ -35,7 +36,14 @@ class RingMediaPort(pj.AudioMediaPort):
         self.last_rx_ns = time.monotonic_ns()
         (self.tx if self.echo else self.rx).push(data)
 
+    def request_flush(self) -> None:
+        """Ask the PJSIP thread (the tx ring's only consumer) to discard queued audio at its next frame."""
+        self._flush_requested = True
+
     def onFrameRequested(self, frame) -> None:
+        if self._flush_requested:
+            self._flush_requested = False
+            self.tx.flush()
         data = self.tx.pop_or_silence() if self.playing else (self.tx.pop() or SILENCE)
         if self._armed and data != SILENCE:
             self.first_nonsilent_ns = time.monotonic_ns()

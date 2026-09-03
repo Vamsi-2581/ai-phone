@@ -21,6 +21,17 @@ def _load(factory: str):
     return getattr(importlib.import_module(mod), name)()
 
 
+def _drain_stt(ring: FrameRing, gen: int) -> list[bytes]:
+    """Pop every queued STT frame; keep the payloads tagged with `gen`, discard the rest."""
+    out = []
+    want = gen & 0xFFFFFFFF
+    while (f := ring.pop()) is not None:
+        g, payload = untag_frame(f)
+        if g == want:
+            out.append(payload)
+    return out
+
+
 def _drain_cancel(conn, cancelled: set[int], backend, gen: int, pending: list[dict]) -> bool:
     """Apply any cancel messages waiting on the pipe; queue every other message for the main loop.
     Returns True if `gen` is now cancelled."""
@@ -57,16 +68,8 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 continue
             gen = msg.get("gen")
             if op == "stt.push":
-                # consume the frames this push owns (even for a cancelled gen) and keep only those tagged with it
-                parts = []
-                for _ in range(msg["nframes"]):
-                    f = ain.pop()
-                    if f is None:
-                        break
-                    g, payload = untag_frame(f)
-                    if g == (gen & 0xFFFFFFFF):
-                        parts.append(payload)
-                frames = b"".join(parts)
+                # drain everything queued (counts cannot desynchronise); the tag decides which frames are ours
+                frames = b"".join(_drain_stt(ain, gen))
                 if gen in cancelled or not frames:
                     continue
                 pcm = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
@@ -77,6 +80,9 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
             if gen in cancelled:
                 continue
             if op == "stt.finalize":
+                tail = b"".join(_drain_stt(ain, gen))  # frames pushed after the last announcement
+                if tail:
+                    backend.push(gen, np.frombuffer(tail, dtype="<i2").astype(np.float32) / 32768.0)
                 text, t = backend.finalize(gen)
                 ipc.send(conn, {"ev": "final", "gen": gen, "text": text, "timings": t})
             elif op == "llm.generate":

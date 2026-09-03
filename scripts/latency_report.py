@@ -26,10 +26,10 @@ for k in ("endpoint_ms", "stt_ms", "llm_prompt_eval_ms", "llm_first_clause_ms", 
         print(f"{k:22s} p50={q(v, 50):7.1f}  p95={q(v, 95):7.1f}  n={len(v)}")
 fa = [r["first_audible_ms"] for r in rows if r.get("first_audible_ms") is not None]
 bs = [r["bargein_stop_ms"] for r in rows if r.get("bargein_stop_ms") is not None]
-ok = bool(fa) and q(fa, 50) < 1000.0 and (not bs or q(bs, 50) <= 300.0)
+ok = bool(fa) and q(fa, 50) < 1000.0 and (not bs or q(bs, 95) <= 300.0)
 if expect is not None and len(rows) < expect:
     print(f"only {len(rows)} complete turns, expected {expect}")
     ok = False
 print(f"under/overruns: tx={sum(r.get('tx_underruns', 0) for r in rows)} rx={sum(r.get('rx_overruns', 0) for r in rows)}")
-print("GATE:", "PASS" if ok else "FAIL", "(p50 first_audible < 1000 ms; barge-in stop p50 <= 300 ms" + (f"; {expect} complete turns" if expect else "") + ")")
+print("GATE:", "PASS" if ok else "FAIL", "(p50 first_audible < 1000 ms; barge-in stop p95 <= 300 ms" + (f"; {expect} complete turns" if expect else "") + ")")
 sys.exit(0 if ok else 1)

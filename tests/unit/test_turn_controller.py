@@ -13,9 +13,14 @@ from ai_phone.telephony.rings import FRAME_BYTES, SILENCE, FrameRing
 
 
 class StubPort:
-    def __init__(self):
+    def __init__(self, tx=None):
         self.first_nonsilent_ns = None
         self.armed = 0
+        self.tx = tx
+
+    def request_flush(self):
+        if self.tx is not None:
+            self.tx.flush()
 
     def arm_t5(self):
         self.armed += 1
@@ -50,7 +55,7 @@ async def make_stack(loop, cfg=None, greeting=None):
     llm = WorkerClient("llm", "ai_phone.services.backends.fake:FakeLLM", loop, None, None, {"system_prompt": "sys"})
     tts = WorkerClient("tts", "ai_phone.services.backends.fake:FakeTTS", loop, None, tts_out, {})
     await asyncio.gather(stt.start(), llm.start(), tts.start())
-    port, turns = StubPort(), []
+    port, turns = StubPort(tx), []
     tc = TurnController(cfg or ConversationConfig(endpoint_silence_ms=300), port, stt, llm, tts, rx, tx, stt_in, tts_out,
                         Endpointer(EnergyVad()), greeting if greeting is not None else [], "sys", turns.append)
     return tc, port, turns, (rx, tx, stt_in, tts_out), (stt, llm, tts)

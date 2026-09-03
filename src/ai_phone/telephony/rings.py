@@ -7,10 +7,17 @@ Every counter has exactly one writer: the producer owns `head` and `overruns`, t
 `tail` and `underruns`. Each is written with one aligned 8-byte store, which is atomic on arm64 and
 x86-64, so the two sides never clobber each other's position. A full ring drops the NEW frame
 (counted as an overrun) rather than overwriting the slot the consumer may be reading.
+
+Memory ordering: Python has no atomics, so the producer takes and releases an uncontended lock
+between writing the slot and publishing `head`, and the consumer does the same between reading
+`head` and the slot; a pthread mutex round-trip is a full barrier on arm64 and x86-64. Only the
+consumer may ever write `tail` (flush included): a producer-side or third-thread flush must be
+requested from the consumer (see RingMediaPort.request_flush).
 """
 from __future__ import annotations
 
 import struct
+import threading
 from multiprocessing import shared_memory
 
 FRAME_BYTES = 640  # 320 samples × int16 at 16 kHz = 20 ms
@@ -28,6 +35,7 @@ class FrameRing:
         size = _HDR_SIZE + frames * frame_bytes
         self._shm = shared_memory.SharedMemory(name=name, create=create, size=size)
         self._buf = self._shm.buf
+        self._fence_lock = threading.Lock()
         if create:
             for off in (_HEAD, _TAIL, _OVER, _UNDER):
                 _U64.pack_into(self._buf, off, 0)
@@ -57,6 +65,10 @@ class FrameRing:
     def _wr(self, off: int, value: int) -> None:
         _U64.pack_into(self._buf, off, value)
 
+    def _fence(self) -> None:
+        with self._fence_lock:
+            pass
+
     @property
     def overruns(self) -> int:
         return self._rd(_OVER)
@@ -78,6 +90,7 @@ class FrameRing:
             return
         off = _HDR_SIZE + (head % self.frames) * self.frame_bytes
         self._buf[off:off + self.frame_bytes] = frame  # data first,
+        self._fence()
         self._wr(_HEAD, head + 1)  # then publish
 
     # ---- consumer side --------------------------------------------------------------------
@@ -85,6 +98,7 @@ class FrameRing:
         tail = self._rd(_TAIL)
         if self._rd(_HEAD) == tail:
             return None
+        self._fence()
         off = _HDR_SIZE + (tail % self.frames) * self.frame_bytes
         frame = bytes(self._buf[off:off + self.frame_bytes])
         self._wr(_TAIL, tail + 1)
@@ -98,7 +112,7 @@ class FrameRing:
         return f
 
     def flush(self) -> None:
-        """Consumer-side: discard everything currently queued."""
+        """Consumer-side only: discard everything currently queued. Never call from a producer thread."""
         self._wr(_TAIL, self._rd(_HEAD))
 
     def close(self) -> None:

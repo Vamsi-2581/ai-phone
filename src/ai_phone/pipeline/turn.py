@@ -168,8 +168,8 @@ class TurnController:
         if t is not None and not was_greeting:
             for c in (self.stt, self.llm, self.tts):
                 c.cancel(t.gen)
-        self.tx.flush()
-        self.tts_out.flush()
+        self._flush_tx()
+        self.tts_out.flush()  # we are its consumer
         if t is not None and not was_greeting:
             t.bargein = True
             t.bargein_stop_ns = now - (self._interrupt_t or now)
@@ -185,6 +185,14 @@ class TurnController:
         self.state = "LISTENING"
         for pcm in candidate:
             self._push_stt(pcm)
+
+    def _flush_tx(self) -> None:
+        """The PJSIP thread is the tx ring's consumer, so it performs the flush; a stub port flushes directly."""
+        req = getattr(self.port, "request_flush", None)
+        if req is not None:
+            req()
+        else:
+            self.tx.flush()
 
     def _flush_stt_push(self) -> None:
         if self._pending_stt:
