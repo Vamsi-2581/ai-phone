@@ -285,7 +285,10 @@ class Telephony:
             call.makeCall(uri, op)
         except Exception as e:
             with self._call_lock:
-                self.current_call = None
+                if self.current_call is call:  # never erase a claim that another call made meanwhile
+                    self.current_call = None
+            # close the sequence that "dialling" opened, so consumers never see a dangling start
+            self.events.put_nowait(ev.OutboundProgress(-1, line_id, "rejected", 0, f"could not place the call: {e}"))
             raise DialError(f"could not place the call: {e}") from e
         cid = call.getId()
         call.answer_timeout = self.loop.call_later(timeout_sec, self._cancel_if_unanswered, call)
