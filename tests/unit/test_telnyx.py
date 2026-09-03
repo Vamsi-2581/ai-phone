@@ -195,3 +195,41 @@ def test_errors_never_leak_the_key_the_password_or_the_body(tmp_path: Path):
     with pytest.raises(ProviderError) as e2:
         p.provision(j, Number("+442079460000", 1.0, "GBP", False, "x"), "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
     assert "Passw0rd" not in str(e2.value) and "<html>" not in str(e2.value) and "non-JSON" in str(e2.value)
+
+
+def test_profile_cap_shares_the_accounts_profile_and_release_keeps_it(tmp_path: Path):
+    """Telnyx: 'You may only have 1 Outbound Voice Profile(s) at your account level' (seen on a freshly paid account)."""
+    carrier = Carrier()
+    carrier.profiles["p0"] = {"name": "default", "traffic_type": "conversational"}
+    inner = carrier.__call__
+
+    def capped(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path == "/v2/outbound_voice_profiles":
+            carrier.calls.append((req.method, req.url.path))
+            return httpx.Response(403, json={"errors": [{"detail": "You may only have 1 Outbound Voice Profile(s) at your account level."}]})
+        return inner(req)
+
+    p = TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(capped), base_url=TELNYX_API))
+    j = Journal.open(tmp_path, "gate", "telnyx")
+    r = p.provision(j, p.search_numbers("GB", None, 1)[0], "gate", "aigate1234", "Passw0rdPassw0rdPassw0rd")
+    assert r.state == "ready"
+    assert r.line["provider"]["resources"]["outbound_voice_profile_id"] == "p0" and r.line["provider"]["resources"]["profile_shared"] is True
+    assert carrier.connections["c1"]["outbound"]["outbound_voice_profile_id"] == "p0"
+    rel = p.release(j)
+    assert rel.ok and "p0" in carrier.profiles, "the account's own profile must survive `lines remove`"
+    assert "c1" not in carrier.connections and "n1" not in carrier.numbers
+
+
+def test_profile_cap_without_any_profile_is_an_error(tmp_path: Path):
+    carrier = Carrier()
+    inner = carrier.__call__
+
+    def capped(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path == "/v2/outbound_voice_profiles":
+            return httpx.Response(403, json={"errors": [{"detail": "You may only have 1 Outbound Voice Profile(s) at your account level."}]})
+        return inner(req)
+
+    p = TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(capped), base_url=TELNYX_API))
+    j = Journal.open(tmp_path, "gate", "telnyx")
+    with pytest.raises(ProviderError, match="no outbound voice profile to share"):
+        p.provision(j, p.search_numbers("GB", None, 1)[0], "gate", "aigate1234", "Passw0rdPassw0rdPassw0rd")

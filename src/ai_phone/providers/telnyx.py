@@ -47,7 +47,8 @@ class TelnyxProvider:
         except httpx.HTTPError as e:
             raise ProviderError(f"telnyx {method} {path}: {type(e).__name__}", retryable=True) from None
         if r.status_code >= 400:
-            raise ProviderError(f"telnyx {method} {path} -> {r.status_code}: {self._redact(_detail(r))}", retryable=r.status_code >= 500)
+            raise ProviderError(f"telnyx {method} {path} -> {r.status_code}: {self._redact(_detail(r))}", retryable=r.status_code >= 500,
+                                status=r.status_code)
         return r.json().get("data", {}) if r.content else {}
 
     def _redact(self, text: str) -> str:
@@ -86,8 +87,21 @@ class TelnyxProvider:
         st, data = journal.start("profile", name=name)
         if st != "done":
             existing = self._find("/outbound_voice_profiles", "name", name) if st == "started" else None
-            rec = existing or self._call("POST", "/outbound_voice_profiles", json={"name": name, "traffic_type": "conversational"})
-            journal.finish("profile", outbound_voice_profile_id=rec["id"])
+            if existing:
+                journal.finish("profile", outbound_voice_profile_id=existing["id"])
+            else:
+                try:
+                    rec = self._call("POST", "/outbound_voice_profiles", json={"name": name, "traffic_type": "conversational"})
+                    journal.finish("profile", outbound_voice_profile_id=rec["id"])
+                except ProviderError as e:
+                    # Trial and freshly paid accounts may hold one profile only ("You may only have 1 Outbound Voice
+                    # Profile(s) at your account level"). Share the account's existing profile; `release` leaves it alone.
+                    if e.status != 403:
+                        raise
+                    shared = next(iter(self._call("GET", "/outbound_voice_profiles")), None)
+                    if not shared:
+                        raise ProviderError(f"{e}; and the account has no outbound voice profile to share") from None
+                    journal.finish("profile", outbound_voice_profile_id=shared["id"], profile_shared=True)
         profile_id = journal.resources()["outbound_voice_profile_id"]
 
         st, data = journal.start("connection", name=name, user_name=sip_user)
@@ -153,7 +167,7 @@ class TelnyxProvider:
         line = {"kind": "trunk", "number": e164, "caller_id": e164, "registrar": REGISTRAR, "dial_domain": DIAL_DOMAIN,
                 "register_via_proxy": True, "transport": "udp", "trusted_cidrs": list(SIGNALLING_CIDRS),
                 "provider": {"name": self.name, "state": state,
-                             "resources": {k: r[k] for k in ("outbound_voice_profile_id", "connection_id", "order_id", "number_id") if r.get(k)}}}
+                             "resources": {k: r[k] for k in ("outbound_voice_profile_id", "profile_shared", "connection_id", "order_id", "number_id") if r.get(k)}}}
         if sip_user:
             line["user"] = sip_user
         return line
@@ -164,7 +178,7 @@ class TelnyxProvider:
         for kind, key, path in (("number", "number_id", "/phone_numbers/"), ("connection", "connection_id", "/credential_connections/"),
                                 ("profile", "outbound_voice_profile_id", "/outbound_voice_profiles/")):
             rid = r.get(key)
-            if not rid:
+            if not rid or (kind == "profile" and r.get("profile_shared")):  # a shared profile is the account's, not ours
                 continue
             try:
                 self._call("DELETE", f"{path}{rid}")
