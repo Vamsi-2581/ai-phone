@@ -59,6 +59,50 @@ def test_too_long_is_cut_off():
     assert e.value.kind == "too_long"
 
 
+def test_first_token_deadline_beats_a_long_idle_timeout_and_keepalives():
+    def slow(req):
+        def gen():
+            for _ in range(20):
+                time.sleep(0.1)
+                yield b": keepalive\n\n"   # SSE comments arrive but no token does
+            yield from _sse(["late"])
+        return httpx.Response(200, stream=httpx.ByteStream(b"".join(gen())))
+
+    b = _backend(slow, first_token_timeout_ms=300, stream_idle_timeout_ms=10000)
+    t0 = time.monotonic()
+    with pytest.raises(BrainError) as e:
+        list(b.stream(1, [{"role": "user", "content": "hi"}], 10))
+    assert e.value.kind == "first_token_timeout" and time.monotonic() - t0 < 5
+
+
+def test_first_token_deadline_in_total_silence():
+    class Silent(httpx.SyncByteStream):
+        def __iter__(self):
+            time.sleep(1.2)
+            yield from _sse(["late"])
+
+    b = _backend(lambda req: httpx.Response(200, stream=Silent()), first_token_timeout_ms=300, stream_idle_timeout_ms=10000)
+    t0 = time.monotonic()
+    with pytest.raises(BrainError) as e:
+        list(b.stream(1, [{"role": "user", "content": "hi"}], 10))
+    assert e.value.kind == "first_token_timeout" and time.monotonic() - t0 < 5
+
+
+def test_non_text_content_is_malformed_not_a_crash():
+    bad = json.dumps({"choices": [{"delta": {"content": 42}}]})
+    b = _backend(lambda req: httpx.Response(200, content=f"data: {bad}\n\n".encode()))
+    with pytest.raises(BrainError) as e:
+        list(b.stream(1, [{"role": "user", "content": "hi"}], 10))
+    assert e.value.kind == "malformed"
+
+
+def test_eof_without_done_is_malformed():
+    b = _backend(lambda req: httpx.Response(200, content=b"".join(_sse(["a", "b"], done=False))))
+    with pytest.raises(BrainError) as e:
+        list(b.stream(1, [{"role": "user", "content": "hi"}], 10))
+    assert e.value.kind == "malformed"
+
+
 def test_connect_failure():
     def handler(req):
         raise httpx.ConnectError("refused")

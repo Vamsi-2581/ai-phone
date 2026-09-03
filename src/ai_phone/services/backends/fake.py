@@ -36,7 +36,7 @@ class FakeLLM:
 
     def __init__(self, reply: str | None = None):
         self._cancelled: set[int] = set()
-        self.tokens = [reply] if reply else self.TOKENS
+        self.tokens = [reply] if reply is not None else self.TOKENS
 
     def warmup(self, system_prompt: str = ""):
         return {"warm_ms": 1.0}
