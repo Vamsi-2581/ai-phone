@@ -246,6 +246,8 @@ class Daemon:
             return
         q: asyncio.Queue = asyncio.Queue()
         self._call_waiters.append(q)
+        cid: int | None = None   # set once PJSIP has a call; cleanup below must not assume it
+        outcome = "rejected"
         try:
             try:
                 cid = tel.make_call(line_id, msg["to"], float(msg.get("timeout_sec", 30)))
@@ -259,7 +261,6 @@ class Daemon:
             self._outbound = {"call_id": cid, "persona": persona, "send": send}
             self.active_call = {"call_id": cid, "line_id": line_id, "remote": msg["to"], "started_at": time.time(), "direction": "out"}
             self._write_state()
-            outcome = "rejected"
             while True:  # progress arrives via the main loop, which is the only consumer of the telephony queue
                 e = await q.get()
                 if isinstance(e, ev.OutboundProgress) and (e.call_id == cid or (e.call_id == -1 and e.line_id == line_id)):  # -1: "dialling", before PJSIP assigns the id
@@ -279,7 +280,7 @@ class Daemon:
         finally:
             self._outbound = None
             self._call_waiters.remove(q)
-            if self.active_call is not None and self.active_call.get("call_id") == cid and outcome != "answered":
+            if cid is not None and self.active_call is not None and self.active_call.get("call_id") == cid and outcome != "answered":
                 self.active_call = None  # never reached media, so _run_call never cleared it
                 self._write_state()
 
