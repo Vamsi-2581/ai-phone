@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ai_phone.providers.base import Provider
 
 PROVIDERS = {
     "fake": "ai_phone.providers.fake:FakeProvider",
@@ -10,7 +14,7 @@ PROVIDERS = {
 }
 
 
-def load_provider(name: str, key: str, secret: str | None = None, **kw):
+def load_provider(name: str, key: str, secret: str | None = None, **kw) -> "Provider":
     try:
         target = PROVIDERS[name]
     except KeyError:

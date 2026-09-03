@@ -5,10 +5,15 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal
+
+LINE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")  # same rule as config.LINE_ID_RE; enforced here too because Journal.open is public
+STATES = ("pending", "ready", "failed", "rollback_failed")
 
 
 def _private_dir(d: Path) -> Path:
@@ -22,12 +27,16 @@ def _private_dir(d: Path) -> Path:
 @contextmanager
 def line_lock(d: Path):
     d = _private_dir(Path(d))
-    with open(d / ".lock", "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    fd = os.open(d / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)  # never follows a planted symlink; 0600
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 class Journal:
@@ -36,6 +45,8 @@ class Journal:
 
     @classmethod
     def open(cls, d: Path, line_id: str, provider: str | None = None) -> "Journal":
+        if not LINE_ID_RE.fullmatch(line_id):
+            raise ValueError(f"line id {line_id!r} must match {LINE_ID_RE.pattern}")
         d = _private_dir(Path(d))
         path = d / f"{line_id}.journal.json"
         if path.is_symlink():
@@ -54,7 +65,9 @@ class Journal:
     def state(self) -> str:
         return self.doc["state"]
 
-    def set_state(self, state: str) -> None:
+    def set_state(self, state: Literal["pending", "ready", "failed", "rollback_failed"]) -> None:
+        if state not in STATES:
+            raise ValueError(f"journal state must be one of {STATES}, got {state!r}")
         self.doc["state"] = state
         self._save()
 

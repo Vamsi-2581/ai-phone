@@ -48,3 +48,33 @@ def test_credentials_follow_carrier_rules():
     for _ in range(50):
         p = generate_sip_password()
         assert len(p) == 24 and any(c.isdigit() for c in p) and any(c.isupper() for c in p) and any(c.islower() for c in p)
+
+
+def test_open_rejects_path_traversal_and_bad_ids(tmp_path: Path):
+    for bad in ("../outside", "Main", "a b", "x" * 33, ""):
+        with pytest.raises(ValueError):
+            Journal.open(tmp_path / "lines", bad)
+    assert not (tmp_path / "outside.journal.json").exists()
+
+
+def test_set_state_is_validated(tmp_path: Path):
+    j = Journal.open(tmp_path / "lines", "main")
+    with pytest.raises(ValueError):
+        j.set_state("done")
+
+
+def test_lock_file_is_private_and_never_a_symlink(tmp_path: Path):
+    import os, stat
+    d = tmp_path / "lines"
+    d.mkdir(mode=0o700)
+    target = tmp_path / "victim"
+    target.write_text("keep me")
+    (d / ".lock").symlink_to(target)
+    with pytest.raises(OSError):
+        with line_lock(d):
+            pass
+    assert target.read_text() == "keep me"
+    (d / ".lock").unlink()
+    with line_lock(d):
+        pass
+    assert stat.S_IMODE((d / ".lock").stat().st_mode) == 0o600
