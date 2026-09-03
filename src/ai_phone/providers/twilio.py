@@ -55,7 +55,8 @@ class TwilioProvider:
                 msg = str(r.json().get("message", ""))[:300]  # the carrier's message, never the body
             except ValueError:
                 msg = "(non-JSON error response)"
-            raise ProviderError(f"twilio {method} {shown} -> {r.status_code}: {self._redact(msg)}", retryable=r.status_code >= 500)
+            raise ProviderError(f"twilio {method} {shown} -> {r.status_code}: {self._redact(msg)}", retryable=r.status_code >= 500,
+                                status=r.status_code)
         return r.json() if r.content else {}
 
     def _acct(self, path: str) -> str:
@@ -126,11 +127,34 @@ class TwilioProvider:
             journal.finish("number", number_sid=rec["sid"])
 
         st, planned = journal.start("trunk", trunk_domain=f"ai-phone-{line_id}-{secrets.token_hex(3)}.pstn.twilio.com", name=name)
-        trunk_domain = planned["trunk_domain"]
+        # a resumed inbound-only line has a done trunk step with no domain: plan a fresh one for the retry below
+        trunk_domain = planned.get("trunk_domain") or f"ai-phone-{line_id}-{secrets.token_hex(3)}.pstn.twilio.com"
         if st != "done":
-            rec = (self._find_trunk(name) if st == "started" else None) or self._call("POST", f"{TRUNKING}/Trunks", data={"FriendlyName": name, "DomainName": trunk_domain})
+            rec = self._find_trunk(name) if st == "started" else None
+            if rec is None:
+                try:
+                    rec = self._call("POST", f"{TRUNKING}/Trunks", data={"FriendlyName": name, "DomainName": trunk_domain})
+                except ProviderError as e:
+                    # Elastic SIP Trunking is not offered to trial accounts ("SIP trunking is only available after you
+                    # upgrade your account"). The line still answers calls through the SIP domain; outbound waits for the
+                    # upgrade and `lines resume`, which re-runs this step.
+                    if e.status not in (401, 403):
+                        raise
+                    journal.finish("trunk", trunk_sid=None, trunk_domain=None, outbound_unavailable=str(e))
+                    journal.set_state("ready")
+                    return self._result(journal, number.e164)
             journal.finish("trunk", trunk_sid=rec["sid"], trunk_domain=rec.get("domain_name", trunk_domain))
         trunk_sid = journal.resources()["trunk_sid"]
+        if not trunk_sid:  # a resumed inbound-only line: try trunking again (the account may have been upgraded since)
+            try:
+                rec = self._find_trunk(name) or self._call("POST", f"{TRUNKING}/Trunks", data={"FriendlyName": name, "DomainName": trunk_domain})
+            except ProviderError as e:
+                if e.status not in (401, 403):
+                    raise
+                journal.set_state("ready")
+                return self._result(journal, number.e164)
+            journal.finish("trunk", trunk_sid=rec["sid"], trunk_domain=rec.get("domain_name", trunk_domain))
+            trunk_sid = rec["sid"]
 
         st, planned = journal.start("trunk_credential_list", trunk_sid=trunk_sid, credential_list_sid=cl_sid)
         if st != "done":
@@ -147,11 +171,16 @@ class TwilioProvider:
 
     def _result(self, journal: Journal, e164: str) -> ProvisionResult:
         r = journal.resources()
-        line = {"kind": "trunk", "number": e164, "caller_id": e164, "registrar": f"sip:{r['domain_name']}",
-                "outbound_proxy": f"sip:{r['trunk_domain']}", "dial_domain": r["trunk_domain"], "register_via_proxy": False,
+        line = {"kind": "trunk", "number": e164, "caller_id": e164, "registrar": f"sip:{r['domain_name']}", "register_via_proxy": False,
                 "transport": "udp", "user": r["user"], "trusted_cidrs": list(SIGNALLING_CIDRS),
-                "provider": {"name": self.name, "state": "ready", "resources": {k: r[k] for k in ("credential_list_sid", "domain_sid", "number_sid", "trunk_sid")}}}
-        return ProvisionResult("ready", f"{e164} is provisioned", line)
+                "provider": {"name": self.name, "state": "ready",
+                             "resources": {k: r[k] for k in ("credential_list_sid", "domain_sid", "number_sid", "trunk_sid") if r.get(k)}}}
+        if r.get("trunk_domain"):
+            line.update(outbound_proxy=f"sip:{r['trunk_domain']}", dial_domain=r["trunk_domain"])
+            return ProvisionResult("ready", f"{e164} is provisioned", line)
+        return ProvisionResult("ready", f"{e164} is provisioned for inbound calls only: Twilio refused to create a SIP trunk "
+                                        f"({r.get('outbound_unavailable', 'trunking unavailable')}). Trial accounts cannot use Elastic SIP "
+                                        f"Trunking; after upgrading, run `ai-phone lines resume <line> --key-env … --secret-env …` to add outbound.", line)
 
     def _find_credlist(self, name):
         return next((c for c in self._call("GET", self._acct("/SIP/CredentialLists.json")).get("credential_lists", []) if c.get("friendly_name") == name), None)

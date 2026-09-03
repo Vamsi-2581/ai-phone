@@ -13,9 +13,10 @@ SID = "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 
 class Carrier:
-    def __init__(self):
+    def __init__(self, trial: bool = False):
         self.credlists, self.creds, self.domains, self.mappings, self.numbers, self.trunks, self.trunk_cls, self.callerids = {}, {}, {}, {}, {}, {}, {}, {}
         self.calls = []
+        self.trial = trial  # trial accounts get no Elastic SIP Trunking
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         self.calls.append((req.method, req.url.host, req.url.path))
@@ -49,6 +50,8 @@ class Carrier:
             want = req.url.params.get("PhoneNumber")
             return httpx.Response(200, json={"incoming_phone_numbers": [{"sid": k, "phone_number": v["PhoneNumber"]} for k, v in self.numbers.items() if v["PhoneNumber"] == want]})
         if host == "trunking.twilio.com" and m == "POST" and p == "/v1/Trunks":
+            if self.trial:
+                return httpx.Response(403, json={"code": 20003, "message": "SIP trunking is only available after you upgrade your account"})
             sid = f"TK{len(self.trunks) + 1}"; self.trunks[sid] = form; return httpx.Response(201, json={"sid": sid, **form})
         if host == "trunking.twilio.com" and m == "GET" and p == "/v1/Trunks":
             return httpx.Response(200, json={"trunks": [{"sid": k, "friendly_name": v["FriendlyName"], "domain_name": v["DomainName"]} for k, v in self.trunks.items()]})
@@ -202,3 +205,22 @@ def test_domain_name_collision_gets_one_fresh_suffix(tmp_path: Path):
     r = p.provision(j, p.search_numbers("GB", None, 1)[0], "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
     assert r.state == "ready" and len(seen) == 2 and seen[0] != seen[1]
     assert next(s["planned"]["domain_name"] for s in j.doc["steps"] if s["name"] == "domain") == seen[1] == r.line["registrar"][4:]
+
+
+def test_trial_account_gets_an_inbound_only_line_and_resume_adds_outbound_after_upgrade(tmp_path: Path):
+    carrier = Carrier(trial=True)
+    p = _provider(carrier)
+    j = Journal.open(tmp_path, "tw", "twilio")
+    num = p.search_numbers("GB", None, 1)[0]
+    r = p.provision(j, num, "tw", "aitw1234", "Passw0rdPassw0rdPassw0rd")
+    assert r.state == "ready" and "inbound calls only" in r.message and "resume" in r.message
+    assert "dial_domain" not in r.line and "outbound_proxy" not in r.line and "trunk_sid" not in r.line["provider"]["resources"]
+    assert r.line["registrar"].endswith(".sip.twilio.com") and carrier.numbers and carrier.domains and not carrier.trunks
+    # the account is upgraded later: resume re-runs only the trunk steps
+    carrier.trial = False
+    r2 = p.provision(j, num, "tw", "aitw1234", "Passw0rdPassw0rdPassw0rd")
+    assert r2.state == "ready" and "inbound calls only" not in r2.message
+    assert r2.line["dial_domain"].endswith(".pstn.twilio.com") and len(carrier.trunks) == 1 and len(carrier.numbers) == 1
+    assert list(carrier.trunk_cls.values()) == [r2.line["provider"]["resources"]["credential_list_sid"]]
+    rel = p.release(j)
+    assert rel.ok and not carrier.trunks and not carrier.numbers and not carrier.domains and not carrier.credlists
