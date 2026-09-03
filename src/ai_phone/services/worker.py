@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sys
 import traceback
 
 import numpy as np
@@ -25,10 +26,14 @@ def _drain_stt(ring: FrameRing, gen: int) -> list[bytes]:
     """Pop every queued STT frame; keep the payloads tagged with `gen`, discard the rest."""
     out = []
     want = gen & 0xFFFFFFFF
+    seen: dict[int, int] = {}
     while (f := ring.pop()) is not None:
         g, payload = untag_frame(f)
+        seen[g] = seen.get(g, 0) + 1
         if g == want:
             out.append(payload)
+    if os.environ.get("AI_PHONE_DEBUG_RX"):
+        print(f"[stt-worker] drain gen={want} kept={len(out)} seen_by_tag={seen} ring_over={ring.overruns}", file=sys.stderr, flush=True)
     return out
 
 
@@ -71,6 +76,8 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 # drain everything queued (counts cannot desynchronise); the tag decides which frames are ours
                 frames = b"".join(_drain_stt(ain, gen))
                 if gen in cancelled or not frames:
+                    if os.environ.get("AI_PHONE_DEBUG_RX"):
+                        print(f"[stt-worker] push gen={gen} skipped (cancelled={gen in cancelled}, frames={len(frames)})", file=sys.stderr, flush=True)
                     continue
                 pcm = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
                 partial = backend.push(gen, pcm)

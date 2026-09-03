@@ -74,6 +74,14 @@ class Endpointer:
         self._last_pos_t = 0
         self.noise_rms = 0.0
 
+    def _track_noise(self, rms: float) -> None:
+        """Background level from non-speech chunks. It falls fast and rises slowly, so a speech onset the VAD
+        has not yet flagged (or a single loud chunk) cannot lift it; digital silence keeps it at the floor."""
+        if rms < self.noise_rms:
+            self.noise_rms = 0.5 * self.noise_rms + 0.5 * rms
+        else:
+            self.noise_rms = min(0.98 * self.noise_rms + 0.02 * rms, self.noise_rms + 0.002)
+
     def feed(self, frame640: bytes, t_ns: int) -> list[EndpointEvent]:
         pcm = np.frombuffer(frame640, dtype="<i2").astype(np.float32) / 32768.0
         self._carry = np.concatenate([self._carry, pcm])
@@ -100,8 +108,7 @@ class Endpointer:
                     out.append(SpeechChunk(chunk, t_ns))
             else:
                 self._pos = 0
-                rms = float(np.sqrt(np.mean(chunk * chunk)))
-                self.noise_rms = rms if self.noise_rms == 0.0 else 0.95 * self.noise_rms + 0.05 * rms
+                self._track_noise(float(np.sqrt(np.mean(chunk * chunk))))
             return out
         self._utt.append(chunk)
         out.append(SpeechChunk(chunk, t_ns))

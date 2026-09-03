@@ -7,6 +7,8 @@ workers; anything tagged with a stale gen_id is dropped on receipt by the Worker
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import time
 from typing import Callable, Protocol
 
@@ -20,6 +22,10 @@ from ai_phone.pipeline.vad import Endpointer, SpeechChunk, SpeechEnd, SpeechStar
 from ai_phone.services.client import WorkerClient
 from ai_phone.services.ipc import tag_frame, untag_frame
 from ai_phone.telephony.rings import FrameRing
+
+
+_log = logging.getLogger("ai-phone.turn")
+_DEBUG_RX = os.environ.get("AI_PHONE_DEBUG_RX")  # path prefix: every call's inbound audio is written as <prefix>-<n>.raw (16 kHz int16)
 
 
 class PortLike(Protocol):
@@ -56,6 +62,7 @@ class TurnController:
         self._warned = False
         self._start_ns = 0
         self._candidate: list[np.ndarray] = []  # speech chunks seen while not listening; replayed on barge-in
+        self._rx_dump = open(f"{_DEBUG_RX}-{int(time.time())}.raw", "wb") if _DEBUG_RX else None
 
     # ---- generation bookkeeping ---------------------------------------------------------------
     def _new_gen(self) -> int:
@@ -86,8 +93,7 @@ class TurnController:
             self._pump_tts_out()
             self._drain_worker_events()
             if self.state == "GREETING" and self.tx.available() == 0:
-                self.state = "LISTENING"
-                self.last_activity_ns = now
+                self._greeting_over(now)
             playing = getattr(self.port, "playing", None)
             if playing is not None:
                 self.port.playing = self.state in ("GREETING", "SPEAKING")
@@ -121,7 +127,12 @@ class TurnController:
 
     # ---- inbound audio ------------------------------------------------------------------------
     def _on_frame(self, frame: bytes, t_ns: int) -> None:
+        if self._rx_dump is not None:
+            self._rx_dump.write(frame)
         for e in self.ep.feed(frame, t_ns):
+            if _DEBUG_RX and isinstance(e, (SpeechStart, SpeechEnd)):
+                _log.info("endpointer %s state=%s%s", type(e).__name__, self.state,
+                          f" utter={len(e.utterance_f32) / 16000:.2f}s" if isinstance(e, SpeechEnd) else "")
             if isinstance(e, SpeechChunk):
                 rms = float(np.sqrt(np.mean(e.pcm_f32 * e.pcm_f32)))
                 playing = self.tx.available() > 0 or self.state in ("GREETING", "SPEAKING")
@@ -130,6 +141,9 @@ class TurnController:
                     if self._interrupt_t is None:
                         self._interrupt_t = e.t_ns
                     self._candidate.append(e.pcm_f32)
+                    if _DEBUG_RX and len(self._candidate) <= 40:
+                        _log.info("bargein-in %s rms=%.4f noise=%.4f playing=%s run=%d tx_avail=%d", self.state, rms, self.ep.noise_rms,
+                                  playing, self.bargein._run, self.tx.available())
                     if self.bargein.update(True, rms, self.ep.noise_rms, playing):
                         self._interrupt(t_ns)  # replays the candidate audio, including this chunk
                     continue
@@ -137,7 +151,11 @@ class TurnController:
             else:
                 self.bargein.update(False, 0.0, self.ep.noise_rms, False)
                 self._interrupt_t = None
-                self._candidate = []
+                if isinstance(e, SpeechEnd) and self.state == "GREETING" and self._candidate:
+                    self._flush_tx()  # they have spoken; answering beats finishing the greeting
+                    self._greeting_over(t_ns)  # replays what was heard, then the SpeechEnd below finalises it
+                else:
+                    self._candidate = []
             if isinstance(e, SpeechStart):
                 self.last_activity_ns = t_ns
                 self._prompted = False  # the caller is back
@@ -153,6 +171,18 @@ class TurnController:
                 self.timer.t0_end = t_ns
                 self.stt.send({"op": "stt.finalize", "gen": self.stt.current_gen})
                 self.state = "THINKING"
+
+    def _greeting_over(self, now: int) -> None:
+        """The greeting finished (or was cut). Anything the caller said meanwhile becomes the start of their turn."""
+        self.state = "LISTENING"
+        self.last_activity_ns = now
+        candidate, self._candidate = self._candidate, []
+        self._interrupt_t = None
+        self.bargein.reset()
+        if candidate:
+            self.timer = TurnTimer(gen=self.stt.current_gen)
+            for pcm in candidate:
+                self._push_stt(pcm)
 
     def _push_stt(self, pcm_f32: np.ndarray) -> None:
         self.stt_in.push(tag_frame(self.stt.current_gen, (np.clip(pcm_f32, -1, 1) * 32767).astype("<i2").tobytes()))

@@ -60,3 +60,18 @@ def test_noise_rms_tracks_silence_level():
     quiet = ep.noise_rms
     run(ep, [(1.0, 0.005)])
     assert ep.noise_rms > quiet
+
+
+def test_noise_floor_is_not_seeded_by_a_speech_onset():
+    """Digital silence, then speech: the floor must stay near zero, not jump to the onset's level."""
+    class OnsetBlindVad:
+        def __init__(self): self.n = 0
+        def prob(self, chunk):
+            self.n += 1
+            return 0.0 if self.n <= 3 else 1.0    # the VAD misses the first three chunks of speech
+    ep = Endpointer(OnsetBlindVad())
+    run(ep, [(1.0, 0.0)])                        # exact digital silence
+    assert ep.noise_rms == 0.0
+    ep2 = Endpointer(OnsetBlindVad())
+    run(ep2, [(1.0, 0.0), (0.5, 0.3)])           # then loud speech the VAD flags late
+    assert ep2.noise_rms < 0.01, ep2.noise_rms

@@ -67,3 +67,19 @@ class FakeTTS:
 
     def cancel(self, gen_id):
         self._cancelled.add(gen_id)
+
+
+class CountingSTT(FakeSTT):
+    """Reports how many samples it received, as text: "<n> samples"."""
+
+    def __init__(self):
+        super().__init__()
+        self._count: dict[int, int] = {}
+
+    def push(self, gen_id, pcm):
+        self._count[gen_id] = self._count.get(gen_id, 0) + len(pcm)
+        return None
+
+    def finalize(self, gen_id):
+        n = self._count.pop(gen_id, 0)
+        return f"{n} samples", {"stt_ms": 1.0}
