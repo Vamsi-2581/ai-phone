@@ -123,7 +123,54 @@ def test_planned_domain_name_is_journaled_before_creation_and_reused(tmp_path: P
     crash["armed"] = False
     r = p.provision(Journal.open(tmp_path, "main"), n, "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
     assert len(c.domains) == 1 and next(iter(c.domains.values()))["DomainName"] == planned and r.state == "ready"
-    assert c.mappings["SD1"] == "CL1" and len(c.creds) == 1 and c.trunk_cls["TK1"] == "CL1"  # every half-done step was completed, none duplicated
+    assert c.mappings["SD1"] == "CL1" and len(c.creds) == 1 and c.trunk_cls["TK1"] == "CL1"  # the steps after the crash ran once each
+
+
+MUTATING = 7  # credential list, credential, domain, mapping, number, trunk, trunk credential list
+
+
+@pytest.mark.parametrize("crash_at", list(range(1, MUTATING + 1)))
+def test_a_lost_response_after_any_step_is_reconciled_without_duplicates(tmp_path: Path, crash_at: int):
+    c = Carrier()
+    posts = {"n": 0, "armed": True}
+
+    def handler(req):
+        r = c(req)  # the carrier always processes the request; we lose the response on the crash_at-th mutation
+        if req.method == "POST" and posts["armed"]:
+            posts["n"] += 1
+            if posts["n"] == crash_at:
+                raise httpx.ConnectError("lost")
+        return r
+
+    p = TwilioProvider(key=SID, secret="tok", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    n = p.search_numbers("GB", None, 1)[0]
+    with pytest.raises(ProviderError):
+        p.provision(Journal.open(tmp_path, "main", "twilio"), n, "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
+    posts["armed"] = False
+    r = p.provision(Journal.open(tmp_path, "main"), n, "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
+    assert r.state == "ready"
+    assert (len(c.credlists), len(c.creds), len(c.domains), len(c.mappings), len(c.numbers), len(c.trunks), len(c.trunk_cls)) == (1, 1, 1, 1, 1, 1, 1)
+
+
+def test_errors_never_leak_the_sid_or_token():
+    def boom(req):
+        return httpx.Response(401, json={"message": f"bad auth for {SID} with tok"})
+    p = TwilioProvider(key=SID, secret="tok", http=httpx.Client(transport=httpx.MockTransport(boom)))
+    with pytest.raises(ProviderError) as e:
+        p.search_numbers("GB", None, 1)
+    assert SID not in str(e.value) and "tok" not in str(e.value).replace("token", "")
+
+
+def test_injected_client_still_gets_the_request_timeout():
+    seen = {}
+
+    def handler(req):
+        seen["timeout"] = req.extensions.get("timeout")
+        return httpx.Response(200, json={"available_phone_numbers": [], "phone_number_prices": [], "price_unit": "USD"})
+
+    p = TwilioProvider(key=SID, secret="tok", http=httpx.Client(transport=httpx.MockTransport(handler), timeout=None))
+    p.search_numbers("GB", None, 1)
+    assert seen["timeout"]["read"] == 20.0
 
 
 def test_release_and_caller_id(tmp_path: Path):

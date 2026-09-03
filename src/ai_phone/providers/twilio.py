@@ -39,17 +39,21 @@ class TwilioProvider:
         self.http = http or httpx.Client(timeout=20.0)
         self.http.auth = (key, secret)
 
+    def _redact(self, text: str) -> str:
+        return text.replace(self._token, "***").replace(self.sid, "AC***")
+
     def _call(self, method: str, url: str, **kw) -> dict:
+        shown = self._redact(url.split("?")[0])
         try:
-            r = self.http.request(method, url, **kw)
+            r = self.http.request(method, url, timeout=20.0, **kw)  # per request, so an injected client cannot bypass it
         except httpx.HTTPError as e:
-            raise ProviderError(f"twilio {method} {url.split('?')[0]}: {type(e).__name__}", retryable=True) from None
+            raise ProviderError(f"twilio {method} {shown}: {type(e).__name__}", retryable=True) from None
         if r.status_code >= 400:
             try:
                 msg = r.json().get("message", "")
             except ValueError:
                 msg = r.text[:200]
-            raise ProviderError(f"twilio {method} {url.split('?')[0]} -> {r.status_code}: {msg.replace(self._token, '***')}", retryable=r.status_code >= 500)
+            raise ProviderError(f"twilio {method} {shown} -> {r.status_code}: {self._redact(msg)}", retryable=r.status_code >= 500)
         return r.json() if r.content else {}
 
     def _acct(self, path: str) -> str:
