@@ -1,4 +1,5 @@
-"""Supervisor: spawns the three model workers, starts PJSIP, and runs one TurnController per call."""
+"""Supervisor: spawns the three model workers, starts PJSIP with one account per line, serves the control socket,
+and runs one TurnController per call (inbound or outbound)."""
 from __future__ import annotations
 
 import asyncio
@@ -7,38 +8,55 @@ import os
 import platform
 import signal
 import socket
+import time
 from pathlib import Path
 
-from ai_phone.config import Config
+from ai_phone import paths
+from ai_phone.config import Config, LineConfig, PersonaConfig, line_password_env
+from ai_phone.control.protocol import EXIT
+from ai_phone.control.server import ControlServer
 from ai_phone.pipeline.timing import TurnLog
 from ai_phone.pipeline.turn import TurnController
 from ai_phone.pipeline.vad import Endpointer, EnergyVad, SileroVad
+from ai_phone.secrets import load_secrets, redact
 from ai_phone.services.client import WorkerClient
 from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, untag_frame
 from ai_phone.telephony import events as ev
-from ai_phone.telephony.endpoint import Telephony
+from ai_phone.telephony.endpoint import BusyError, DialError, LineSpec, Telephony
 from ai_phone.telephony.rings import FrameRing
+from ai_phone.telephony.state import LineStatus, StateFile, next_state
 
 log = logging.getLogger("ai-phone")
 FACTORIES = {
     "real": {"stt": "ai_phone.services.backends.mlx_parakeet:ParakeetSTT",
-             "llm": {"t9": "ai_phone.services.backends.mlx_lm_backend:make_t9",
-                     "t4": "ai_phone.services.backends.mlx_lm_backend:make_t4"},
+             "llm": {"t9": "ai_phone.services.backends.mlx_lm_backend:make_t9", "t4": "ai_phone.services.backends.mlx_lm_backend:make_t4"},
              "tts": "ai_phone.services.backends.mlx_kokoro:KokoroTTS"},
     "fake": {"stt": "ai_phone.services.backends.fake:FakeSTT",
              "llm": {"t9": "ai_phone.services.backends.fake:FakeLLM", "t4": "ai_phone.services.backends.fake:FakeLLM"},
              "tts": "ai_phone.services.backends.fake:FakeTTS"},
 }
+APOLOGY = "Sorry, I lost my train of thought. Could you say that again?"
+GOODBYE = "I'm having trouble thinking right now. Please call back later. Goodbye."
 
 
 class Daemon:
     def __init__(self, cfg: Config, tier: str, log_dir: Path, lan: bool, fake: bool = False):
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
-        if lan:
-            cfg.sip.accept_invites_from = "lan"
-        self.cfg, self.tier, self.log_dir, self.fake = cfg, tier, Path(log_dir).expanduser(), fake
-        self.system_prompt = f"{cfg.conversation.system_prompt} You are running on {socket.gethostname()} ({platform.machine()})."
+        self.cfg, self.tier, self.log_dir, self.fake, self.lan = cfg, tier, Path(log_dir).expanduser(), fake, lan
+        self.secrets = load_secrets(paths.secrets_path())
+        self.remote_brain = cfg.brain.kind == "openai_compatible"
+        self.line_status: dict[str, LineStatus] = {}
+        self.state_file = StateFile(paths.state_path())
+        self.active_call: dict | None = None
+        self._call_waiters: list[asyncio.Queue] = []
+        self._outbound: dict | None = None   # {"call_id", "persona", "send"} while a control-socket call is in flight
+
+    # ---- personas and cached phrases ------------------------------------------------------------
+    def system_prompt_for(self, persona: PersonaConfig) -> str:
+        if self.remote_brain:
+            return persona.system_prompt  # no host metadata leaves the machine
+        return f"{persona.system_prompt} You are running on {socket.gethostname()} ({platform.machine()})."
 
     async def _cache_phrase(self, tts: WorkerClient, ring: FrameRing, text: str) -> list[bytes]:
         gen = tts.next_gen()
@@ -54,27 +72,94 @@ class Daemon:
                 frames.append(payload)
         return frames
 
+    # ---- lines -----------------------------------------------------------------------------------
+    def _line_specs(self) -> list[LineSpec]:
+        lines = dict(self.cfg.lines)
+        if not lines:
+            lines["local"] = LineConfig(kind="sip", user="ai", aor="sip:ai@127.0.0.1", display_name="ai", accept_invites_from="lan", caller_id="sip:ai@127.0.0.1")
+        specs = []
+        for lid, lc in lines.items():
+            if self.lan:
+                lc.accept_invites_from = "lan"
+            password = None
+            if lc.kind == "trunk":
+                env_name = lc.password_env or line_password_env(lid)
+                password = self.secrets.get(env_name) or os.environ.get(env_name)
+                if not password:
+                    log.error("line %s skipped: password variable %s is not set (secrets.env or the environment)", lid, env_name)
+                    self.line_status[lid] = LineStatus(lid, lc.kind, lc.number or "", "skipped", lc.registrar, None, f"{env_name} not set", time.time())
+                    continue
+            specs.append(LineSpec.from_config(lid, lc, password))
+            self.line_status[lid] = LineStatus(lid, lc.kind, lc.number or lc.aor or "", "registering" if lc.kind == "trunk" else "unregistered",
+                                               lc.registrar, None, None, time.time())
+        return specs
+
+    def _write_state(self) -> None:
+        brain = {"kind": self.cfg.brain.kind, "base_url": self.cfg.brain.base_url if self.remote_brain else None}
+        self.state_file.write(self.line_status, self.active_call, brain)
+
+    def _on_reg(self, e: ev.RegState) -> None:
+        st = self.line_status.get(e.line_id)
+        if st is None:
+            return
+        new = next_state(st.state, e.active, e.code)
+        if new != st.state:
+            st.since = time.time()
+        st.state, st.last_error = new, (None if e.active else f"{e.code} {e.reason}")
+        st.expires_at = time.time() + e.expires_sec if e.active else None
+        log.info("registration line=%s state=%s code=%s reason=%s", e.line_id, new, e.code, e.reason)
+        self._write_state()
+
+    # ---- main --------------------------------------------------------------------------------------
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         events: asyncio.Queue = asyncio.Queue()
         rx, tx = FrameRing(None, 100), FrameRing(None, 400)
         stt_in, tts_out = FrameRing(None, 400, frame_bytes=STT_IN_FRAME), FrameRing(None, 400, frame_bytes=TTS_OUT_FRAME)
         F = FACTORIES["fake" if self.fake else "real"]
+        personas = dict(self.cfg.personas) or {"default": PersonaConfig()}
+        default_prompt = self.system_prompt_for(personas["default"])
         stt = WorkerClient("stt", F["stt"], loop, stt_in, None, {})
-        llm = WorkerClient("llm", F["llm"][self.tier], loop, None, None, {"system_prompt": self.system_prompt})
+        if self.remote_brain:
+            b = self.cfg.brain
+            key = (self.secrets.get(b.api_key_env) or os.environ.get(b.api_key_env)) if b.api_key_env else None
+            host = b.base_url.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
+            if host not in ("127.0.0.1", "localhost", "::1", "[::1]"):
+                log.warning("Brain: %s. Transcripts of what callers say, the system prompt and the conversation history are sent there "
+                            "(not audio). What that service keeps is up to that service.", b.base_url)
+            llm = WorkerClient("llm", "ai_phone.services.backends.openai_compat:make_openai", loop, None, None, {"system_prompt": default_prompt},
+                               factory_args={"base_url": b.base_url, "model": b.model, "api_key": key, "connect_timeout_ms": b.connect_timeout_ms,
+                                             "first_token_timeout_ms": b.first_token_timeout_ms, "stream_idle_timeout_ms": b.stream_idle_timeout_ms,
+                                             "max_response_chars": b.max_response_chars})
+        else:
+            llm = WorkerClient("llm", F["llm"][self.tier], loop, None, None, {"system_prompt": default_prompt})
         tts = WorkerClient("tts", F["tts"], loop, None, tts_out, {})
-        warm = await asyncio.gather(stt.start(), llm.start(), tts.start())
-        c = self.cfg.conversation
-        greeting = await self._cache_phrase(tts, tts_out, c.greeting)
-        prompt = await self._cache_phrase(tts, tts_out, "Still there?")
-        warning = await self._cache_phrase(tts, tts_out, "This call will end in thirty seconds.")
-        tel = Telephony(self.cfg, loop, events, rx, tx)
+        try:
+            warm = await asyncio.gather(stt.start(), llm.start(), tts.start())
+        except RuntimeError as e:
+            log.error("%s", redact(str(e), self.secrets.values()))
+            raise SystemExit(1)
+        cached = {"prompt": await self._cache_phrase(tts, tts_out, "Still there?"),
+                  "warning": await self._cache_phrase(tts, tts_out, "This call will end in thirty seconds."),
+                  "apology": await self._cache_phrase(tts, tts_out, APOLOGY),
+                  "goodbye": await self._cache_phrase(tts, tts_out, GOODBYE)}
+        greetings = {name: await self._cache_phrase(tts, tts_out, p.greeting) for name, p in personas.items()}
+        openings = {name: await self._cache_phrase(tts, tts_out, p.outbound_opening) for name, p in personas.items()}
+        specs = self._line_specs()
+        tel = Telephony(self.cfg, specs, loop, events, rx, tx)
         tel.start()
+        for w in tel.peer_warnings:
+            log.warning(w)
+        self._write_state()
         turn_log = TurnLog(self.log_dir / "turns.jsonl")
         stop = asyncio.Event()
         for s in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(s, stop.set)
-        log.info("ready mode=%s tier=%s warm=%s", self.cfg.sip.accept_invites_from, self.tier, warm)
+        ctx = dict(tel=tel, stt=stt, llm=llm, tts=tts, rx=rx, tx=tx, stt_in=stt_in, tts_out=tts_out, cached=cached,
+                   greetings=greetings, openings=openings, personas=personas, turn_log=turn_log, events=events, stop=stop, specs={s.id: s for s in specs})
+        control = ControlServer(paths.socket_path(), lambda msg, send: self._control(msg, send, ctx))
+        await control.start()
+        log.info("ready lines=%s brain=%s tier=%s warm=%s", [s.id for s in specs], self.cfg.brain.kind, self.tier, warm)
         print("ready", flush=True)
         try:
             while not stop.is_set():
@@ -83,34 +168,129 @@ class Daemon:
                 except asyncio.TimeoutError:
                     continue
                 if isinstance(e, ev.IncomingCall):
-                    log.info("incoming from %s (%s)", e.from_uri, e.source_ip)
+                    log.info("incoming on %s from %s (%s)", e.line_id, e.from_uri, e.source_ip)
                     tel.answer(e.call_id)
+                    self.active_call = {"line_id": e.line_id, "remote": e.from_uri, "started_at": time.time(), "direction": "in"}
+                    self._write_state()
                 elif isinstance(e, ev.CallRejected):
-                    log.info("rejected %s with %s", e.source_ip, e.code)
+                    log.info("rejected on %s: %s with %s", e.line_id, e.source_ip, e.code)
                 elif isinstance(e, ev.MediaActive):
-                    await self._run_call(e.call_id, tel, stt, llm, tts, rx, tx, stt_in, tts_out,
-                                         greeting, prompt, warning, turn_log, events, stop)
+                    lid = tel.line_of(e.call_id) or next(iter(ctx["specs"]))
+                    ob = self._outbound if self._outbound and self._outbound["call_id"] == e.call_id else None
+                    if ob is None:
+                        await self._run_call(e.call_id, lid, "in", None, ctx)
+                    else:  # the control handler is waiting on its queue; the main loop is the only consumer of `events`
+                        send = ob["send"]
+                        await self._run_call(e.call_id, lid, "out", ob["persona"], ctx,
+                                             on_turn_event=lambda rec: self._send_quiet(send, {"event": "turn", **{k: rec[k] for k in ("turn", "first_audible_ms", "bargein")}}))
+                        for q in self._call_waiters:
+                            q.put_nowait(("call_done", e.call_id))
+                        self._outbound = None
                 elif isinstance(e, ev.RegState):
-                    log.info("registration active=%s code=%s %s", e.active, e.code, e.reason)
+                    self._on_reg(e)
+                elif isinstance(e, ev.OutboundProgress):
+                    log.info("outbound line=%s call=%s state=%s code=%s %s", e.line_id, e.call_id, e.state, e.code, e.reason)
+                    for q in self._call_waiters:
+                        q.put_nowait(e)
+                elif isinstance(e, ev.CallStateChanged) and e.state == "ended":
+                    for q in self._call_waiters:
+                        q.put_nowait(e)
         finally:
+            await control.stop()
             tel.stop()
             await asyncio.gather(stt.stop(), llm.stop(), tts.stop())
             for r in (rx, tx, stt_in, tts_out):
                 r.close()
                 r.unlink()
 
-    async def _run_call(self, call_id, tel, stt, llm, tts, rx, tx, stt_in, tts_out, greeting, prompt, warning, turn_log, events, stop):
+    # ---- control socket -------------------------------------------------------------------------------
+    async def _control(self, msg: dict, send, ctx: dict) -> None:
+        tel = ctx["tel"]
+        if msg["cmd"] == "status":
+            await send({"ok": True, "lines": {k: v.__dict__ for k, v in self.line_status.items()}, "active_call": self.active_call})
+            return
+        if msg["cmd"] == "hangup":
+            cid = tel.current_call_id
+            if cid is not None:
+                tel.hangup(cid)
+            await send({"ok": True, "hung_up": cid is not None})
+            return
+        # call
+        line_id = msg.get("line") or next(iter(ctx["specs"]), None)
+        if line_id not in ctx["specs"]:
+            await send({"ok": False, "error": f"no such line {line_id!r}"})
+            return
+        persona = msg.get("persona") or ctx["specs"][line_id].persona
+        if persona not in ctx["personas"]:
+            await send({"ok": False, "error": f"no such persona {persona!r}"})
+            return
+        q: asyncio.Queue = asyncio.Queue()
+        self._call_waiters.append(q)
+        try:
+            try:
+                cid = tel.make_call(line_id, msg["to"], float(msg.get("timeout_sec", 30)))
+            except BusyError:
+                await send({"ok": False, "error": "busy"})
+                return
+            except DialError as e:
+                await send({"event": "ended", "reason": "rejected", "detail": str(e), "exit_code": EXIT["rejected"]})
+                return
+            log.info("control: call on line %s to %s -> call_id %s", line_id, msg["to"], cid)
+            self._outbound = {"call_id": cid, "persona": persona, "send": send}
+            self.active_call = {"line_id": line_id, "remote": msg["to"], "started_at": time.time(), "direction": "out"}
+            self._write_state()
+            outcome = "rejected"
+            while True:  # progress arrives via the main loop, which is the only consumer of the telephony queue
+                e = await q.get()
+                if isinstance(e, ev.OutboundProgress) and e.call_id == cid:
+                    await self._send_quiet(send, {"event": e.state, "code": e.code, "uri": e.reason if e.state == "dialling" else ""})
+                    if e.state in ("busy", "no_answer", "rejected", "redirected"):
+                        outcome = e.state
+                        break
+                    if e.state == "answered":
+                        outcome = "answered"
+                        continue  # keep waiting: the main loop runs the conversation and posts call_done
+                elif isinstance(e, tuple) and e[0] == "call_done" and e[1] == cid:
+                    outcome = "answered"  # the conversation ran, whatever order PJSIP delivered media and CONFIRMED in
+                    break
+                elif isinstance(e, ev.CallStateChanged) and e.call_id == cid and e.state == "ended" and self._outbound is not None:
+                    break  # ended before media became active
+            await self._send_quiet(send, {"event": "ended", "reason": outcome, "exit_code": EXIT.get(outcome, EXIT["rejected"])})
+        finally:
+            self._outbound = None
+            self._call_waiters.remove(q)
+
+    async def _send_quiet(self, send, msg: dict) -> None:
+        try:
+            await send(msg)
+        except ConnectionError:
+            pass  # the CLI went away; the call continues
+
+    # ---- one call --------------------------------------------------------------------------------------
+    async def _run_call(self, call_id, line_id, direction, persona_name, ctx, on_turn_event=None):
+        tel, stt, llm, tts = ctx["tel"], ctx["stt"], ctx["llm"], ctx["tts"]
+        rx, tx, stt_in, tts_out, cached = ctx["rx"], ctx["tx"], ctx["stt_in"], ctx["tts_out"], ctx["cached"]
+        spec = ctx["specs"][line_id]
+        persona_name = persona_name or spec.persona
+        persona = ctx["personas"][persona_name]
         vad = EnergyVad() if self.fake else SileroVad()
         n = [0]
+        turn_log, events, stop = ctx["turn_log"], ctx["events"], ctx["stop"]
 
         def on_turn(t):
-            turn_log.write(t.to_record(str(call_id), n[0]))
+            rec = t.to_record(str(call_id), n[0])
+            rec["line_id"], rec["persona"] = line_id, persona_name
+            turn_log.write(rec)
             n[0] += 1
-            log.info("turn %s first_audible=%s bargein=%s", n[0], t.first_audible_ms(), t.bargein)
+            log.info("turn %s line=%s first_audible=%s bargein=%s brain_error=%s", n[0], line_id, t.first_audible_ms(), t.bargein, t.brain_error)
+            if on_turn_event is not None:
+                asyncio.get_running_loop().create_task(on_turn_event(rec))
 
         tc = TurnController(self.cfg.conversation, tel.port, stt, llm, tts, rx, tx, stt_in, tts_out,
-                            Endpointer(vad, self.cfg.conversation.endpoint_silence_ms), greeting, self.system_prompt, on_turn,
-                            prompt_frames=prompt, warning_frames=warning, rtp_last_rx_ns=lambda: tel.port.last_rx_ns)
+                            Endpointer(vad, self.cfg.conversation.endpoint_silence_ms), ctx["greetings"][persona_name],
+                            self.system_prompt_for(persona), on_turn, prompt_frames=cached["prompt"], warning_frames=cached["warning"],
+                            rtp_last_rx_ns=lambda: tel.port.last_rx_ns, apology_frames=cached["apology"], goodbye_frames=cached["goodbye"],
+                            opening_frames=ctx["openings"][persona_name] if direction == "out" else None, direction=direction)
         call_stop = asyncio.Event()
         runner = asyncio.create_task(tc.run(call_stop))
         while not call_stop.is_set() and not stop.is_set():
@@ -126,17 +306,24 @@ class Daemon:
                 if e.call_id == call_id:
                     break
                 log.info("ignoring end of unrelated call %s while call %s is active", e.call_id, call_id)
-            if isinstance(e, ev.CallRejected):
-                log.info("rejected %s with %s", e.source_ip, e.code)
+            elif isinstance(e, ev.CallRejected):
+                log.info("rejected on %s: %s with %s", e.line_id, e.source_ip, e.code)
+            elif isinstance(e, ev.OutboundProgress):
+                # PJSIP can report media active before CONFIRMED, so "answered" may arrive while the call already runs
+                log.info("outbound line=%s call=%s state=%s code=%s %s", e.line_id, e.call_id, e.state, e.code, e.reason)
+                for q in self._call_waiters:
+                    q.put_nowait(e)
+            elif isinstance(e, ev.RegState):
+                self._on_reg(e)   # registration changes keep flowing during a call
         call_stop.set()
         await runner
-        for c in (stt, llm, tts):  # abandon anything still queued for this call before touching the rings
+        for c in (stt, llm, tts):
             c.cancel(c.current_gen)
-        if tc.timer is not None and tc.timer.t0 is not None:  # the caller hung up mid-turn: log what we have
+        if tc.timer is not None and tc.timer.t0 is not None:
             rec = tc.timer.to_record(str(call_id), n[0])
-            rec["incomplete"] = True
-            rec["state_at_end"] = tc.state
+            rec.update(incomplete=True, state_at_end=tc.state, line_id=line_id, persona=persona_name)
             turn_log.write(rec)
-            log.info("turn %s incomplete at call end (state=%s)", n[0] + 1, tc.state)
-        for r in (rx, tx, tts_out):  # stt_in is drained by the STT worker itself (a queued push may still own frames)
+        for r in (rx, tx, tts_out):
             r.flush()
+        self.active_call = None
+        self._write_state()

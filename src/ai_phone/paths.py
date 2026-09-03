@@ -22,7 +22,15 @@ def state_path() -> Path:
 
 
 def socket_path() -> Path:
-    return home() / "control.sock"
+    """The control socket. AF_UNIX paths are capped (104 bytes on macOS, 108 on Linux), so a home directory that
+    is too deep gets a short, deterministic socket under /tmp instead — both the daemon and the CLI derive it here."""
+    candidate = home() / "control.sock"
+    if len(str(candidate).encode()) <= 100:
+        return candidate
+    import hashlib
+    digest = hashlib.sha256(str(home()).encode()).hexdigest()[:12]
+    base = Path("/private/tmp") if Path("/private/tmp").is_dir() else Path("/tmp")
+    return base / f"ai-phone-{os.getuid()}-{digest}.sock"
 
 
 def lines_dir() -> Path:

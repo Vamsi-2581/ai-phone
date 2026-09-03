@@ -1,5 +1,9 @@
+"""End-to-end with fake model backends: the daemon answers a LAN call and writes a turn record.
+
+The helpers here (_tone, _start_daemon, _call_and_wait) are shared with the other daemon integration tests."""
 import json
 import math
+import os
 import queue
 import signal
 import struct
@@ -14,62 +18,104 @@ import pytest
 pytestmark = pytest.mark.integration
 
 
-def _tone(path: Path, seconds=1.2, rate=8000, tail_silence=3.0):
-    """A tone followed by silence: the endpointer needs silence after speech to close the turn."""
-    n = int(seconds * rate)
-    frames = b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * 300 * i / rate))) for i in range(n))
-    frames += bytes(2 * int(tail_silence * rate))
+def _tone(path: Path, seconds=1.2, rate=8000, tail_silence=3.0, turns=1):
+    """`turns` tones, each followed by silence: the endpointer needs silence after speech to close a turn."""
+    one = b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * 300 * i / rate))) for i in range(int(seconds * rate)))
+    one += bytes(2 * int(tail_silence * rate))
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(rate)
-        w.writeframes(frames)
+        w.writeframes(one * turns)
 
 
-def test_daemon_answers_and_logs_a_turn_with_fake_backends(tmp_path: Path):
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text('sip:\n  user: "ai"\n  accept_invites_from: lan\nconversation:\n  greeting: "Hi."\n'
-                   '  system_prompt: "s"\n  endpoint_silence_ms: 300\nlog:\n  dir: "%s"\n' % tmp_path)
-    d = subprocess.Popen(["uv", "run", "ai-phone", "run", "--config", str(cfg), "--lan", "--fake"],
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+def _start_daemon(home: Path, cfg_text: str, extra_args=()):
+    cfg = home / "config.yaml"
+    cfg.write_text(cfg_text)
+    # start_new_session: `uv run` is a parent of the real daemon; killing only uv would leave the daemon (and port 5060) behind
+    d = subprocess.Popen(["uv", "run", "ai-phone", "run", "--config", str(cfg), "--lan", "--fake", *extra_args],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env={**os.environ, "AI_PHONE_HOME": str(home)},
+                         start_new_session=True)
     lines: queue.Queue = queue.Queue()
     threading.Thread(target=lambda: [lines.put(l) for l in d.stdout], daemon=True).start()  # readline would block forever
-    try:
-        deadline = time.time() + 60
-        while True:
-            try:
-                line = lines.get(timeout=max(0.1, deadline - time.time()))
-            except queue.Empty:
-                raise AssertionError("daemon never became ready")
-            if line.strip() == "ready":
+    seen = []  # everything read while waiting, so a failure message can show it
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            line = lines.get(timeout=1)
+        except queue.Empty:
+            if d.poll() is not None:
                 break
-            if time.time() > deadline:
-                raise AssertionError("daemon never became ready")
-        play, rec = tmp_path / "tone.wav", tmp_path / "rec.wav"
-        _tone(play)
-        peer = subprocess.Popen(["bash", "scripts/pjsua_peer.sh", str(play), str(rec), "6"],
-                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(8)
+            continue
+        seen.append(line)
+        if line.strip() == "ready":
+            return d, lines
+    time.sleep(0.5)
+    while not lines.empty():
+        seen.append(lines.get_nowait())
+    _kill_group(d)
+    raise AssertionError("daemon never became ready; output tail:\n" + "".join(seen)[-3000:])
+
+
+def _kill_group(d):
+    try:
+        os.killpg(os.getpgid(d.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _stop_daemon(d):
+    try:
+        os.killpg(os.getpgid(d.pid), signal.SIGTERM)  # the daemon and uv alike
+    except ProcessLookupError:
+        return
+    try:
+        d.wait(15)
+    except subprocess.TimeoutExpired:
+        _kill_group(d)
+
+
+def _call_and_wait(d, lines: queue.Queue, home: Path, turns: int = 1):
+    """One LAN call from pjsua playing `turns` utterances; returns the call's turn records once `turns` are written."""
+    play, rec = home / "tone.wav", home / "rec.wav"
+    _tone(play, turns=turns)
+    duration = 4 + 5 * turns
+    peer = subprocess.Popen(["bash", "scripts/pjsua_peer.sh", str(play), str(rec), str(duration)],
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    turns_path = home / "turns.jsonl"
+    deadline = time.time() + duration + 15
+    try:
+        while time.time() < deadline:
+            if turns_path.exists() and len(turns_path.read_text().splitlines()) >= turns:
+                break
+            time.sleep(0.5)
+    finally:
         try:
             peer.stdin.write(b"q\n")
             peer.stdin.flush()
             peer.wait(timeout=10)
         except Exception:
             peer.terminate()
-        time.sleep(1.0)
-        turns = tmp_path / "turns.jsonl"
-        if not turns.exists():
-            d.send_signal(signal.SIGTERM)
-            time.sleep(1)
-            tail = []
-            while not lines.empty():
-                tail.append(lines.get_nowait())
-            raise AssertionError("no turns.jsonl written; daemon output tail:\n" + "".join(tail)[-3000:])
-        rec_ = json.loads(turns.read_text().splitlines()[0])
-        assert rec_["reply_text"] == "Hello, this is a fake reply." and rec_["first_audible_ms"] is not None
+    time.sleep(1.0)
+    if not turns_path.exists():
+        tail = []
+        while not lines.empty():
+            tail.append(lines.get_nowait())
+        raise AssertionError("no turns.jsonl written; daemon output tail:\n" + "".join(tail)[-3000:])
+    return [json.loads(l) for l in turns_path.read_text().splitlines() if l.strip()]
+
+
+CFG = ('personas:\n  default:\n    greeting: "Hi."\n    system_prompt: "s"\n'
+       'conversation:\n  endpoint_silence_ms: 300\nlog:\n  dir: "%s"\n')
+
+
+def test_daemon_answers_and_logs_a_turn_with_fake_backends(tmp_path: Path):
+    d, lines = _start_daemon(tmp_path, CFG % tmp_path)
+    try:
+        recs = _call_and_wait(d, lines, tmp_path, turns=1)
+        assert recs[0]["reply_text"] == "Hello, this is a fake reply." and recs[0]["first_audible_ms"] is not None
+        assert recs[0]["line_id"] == "local" and recs[0]["direction"] == "in"
+        state = json.loads((tmp_path / "state.json").read_text())
+        assert state["lines"]["local"]["kind"] == "sip" and state["brain"]["kind"] == "local"
     finally:
-        d.send_signal(signal.SIGTERM)
-        try:
-            d.wait(10)
-        except subprocess.TimeoutExpired:
-            d.kill()
+        _stop_daemon(d)
