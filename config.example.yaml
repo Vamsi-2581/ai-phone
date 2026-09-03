@@ -1,0 +1,12 @@
+# ai-phone configuration (copy to ~/.ai-phone/config.yaml, chmod 600). Full schema: architecture.md §8
+sip:
+  user: "ai"
+  # domain: "sip.example.net"        # your SIP trunk or PBX; omit for LAN-only testing
+  # password_env: AI_PHONE_SIP_PASSWORD
+  accept_invites_from: lan           # registered_trunk (default for real trunks) | lan | any
+conversation:
+  greeting: "Hi, this is the house. What can I do for you?"
+  system_prompt: "You are ai-phone, a local phone assistant. Answer in one short sentence."
+  endpoint_silence_ms: 300
+log:
+  dir: "~/Library/Logs/ai-phone"

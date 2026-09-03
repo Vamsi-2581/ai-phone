@@ -586,6 +586,16 @@ macOS: `ai-phone install-service` writes `~/Library/LaunchAgents/com.ai-phone.da
 | 2026-09-02 | `lan` mode includes loopback and link-local | [D] |
 | 2026-09-02 | English-only, single-call, no web UI, no SMS through launch | [D] |
 | 2026-09-02 | Home Assistant is an integration, not an add-on | [D] |
+| 2026-09-02 | Spike B (9B, quiet machine, no telephony): stt 26.9 ms, llm_ttft 221, llm_first_clause 408, tts_first 161, trio 600 ms p50 → projected first-audible ≈ 1000 ms, no margin | [D] |
+| 2026-09-03 | **M1 gate PASSED, 4B tier, 20/20 LAN PCMU calls: first_audible p50 874 ms / p95 1438** (endpoint 297, STT 96, LLM prompt-eval 229, LLM first clause 312, TTS first chunk 164, egress 9; 0 underruns) with the host swapping ~10 GB. Barge-in, 5 interrupting callers: stop 218–259 ms after onset, all under 300; interrupting sentences transcribed whole. **Default tier is t4.** An earlier 977 ms figure was an artifact (ring geometry bug stamped t5 early) and is withdrawn; the 9B tier does not fit beside normal apps on 24 GB | [D] |
+| 2026-09-03 | Endpointer noise floor is an asymmetric tracker (falls fast, rises slowly) so a speech onset the VAD flags late cannot seed it; speech heard during the greeting is kept whether or not the barge-in detector fires (it is replayed when the greeting ends or is cut). Before this fix, callers who spoke over the greeting lost everything said before it ended | [D] |
+| 2026-09-03 | Shared-memory rings: every counter single-writer; geometry stored in the header (macOS page-rounds segments, so attach() must not infer the frame count); publish/consume fence via a lock round-trip; the tx ring is flushed only on the PJSIP thread, by request. Audio frames crossing a generation boundary carry the gen_id (STT input, TTS output). STT worker drains its whole ring per push. Call end cancels the workers' generation and filters events by call_id | [D] |
+| 2026-09-02 | pjsua2 build: 18 s, not 15–30 min; needs `and_string.i` too and `-L` for keg-only openssl@3/opus; codec ids carry a channel suffix (`PCMU/8000/1`), match by prefix; `setNullDev()` required; release Account/port before `libDestroy` or PJSIP aborts at exit | [V] |
+| 2026-09-02 | parakeet checkpoint loads as float32 (2.47 GB); cast to float16 (1.24 GB), identical transcripts, same speed; `generate()` takes an `mx.array` | [D] |
+| 2026-09-02 | mlx-audio Kokoro fetches voices from `prince-canuma/Kokoro-82M` (hard-coded), not the model repo; `doctor` must pre-fetch `voices/<voice>.safetensors` from it | [V] |
+| 2026-09-03 | Qwen3.5's prompt cache is hybrid (24 ArraysCache + 8 KVCache) and cannot be trimmed; the system prefix is evaluated once and each turn starts from a deep copy (0.2 ms); history is re-evaluated each turn | [D] |
+| 2026-09-03 | Speech during the greeting stops it (barge-in on greeting); STT worker owns draining its ring and the daemon cancels the workers' generation at call end (otherwise consecutive calls' audio blended); TTS resamples in its worker; STT partials not streamed in M1; first TTS unit is 4–8 tokens, later units 6–12 | [D] |
+| 2026-09-03 | Dev-machine finding: the 9B tier (≈8.5 GB with fp16 parakeet) swaps beside a normal app load on 24 GB; minimum-hardware tiers stand (16 GB → t4) | [D] |
 
 ## 16. Verified facts (2026-09-02)
 
