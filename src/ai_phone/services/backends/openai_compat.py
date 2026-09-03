@@ -47,9 +47,13 @@ class OpenAICompatLLM:
         q: queue.Queue = queue.Queue()
         holder: dict = {}
 
+        # The helper thread's own read timeout is the larger of the two deadlines, so it never pre-empts the consumer's
+        # verdict, and a request that stalls before headers (nothing to close yet) still ends within that bound.
+        thread_timeout = httpx.Timeout(connect=self.timeout.connect, read=max(self.first_token_s, self.timeout.read or self.first_token_s), write=5.0, pool=5.0)
+
         def pump():
             try:
-                with self.http.stream("POST", f"{self.base_url}/chat/completions", json=body, timeout=self.timeout) as r:
+                with self.http.stream("POST", f"{self.base_url}/chat/completions", json=body, timeout=thread_timeout) as r:
                     holder["response"] = r
                     q.put(("status", r.status_code))
                     for line in r.iter_lines():
@@ -59,6 +63,7 @@ class OpenAICompatLLM:
                 q.put(("error", e))
 
         worker = threading.Thread(target=pump, name="brain-stream", daemon=True)
+        self._last_thread = worker  # tests check the helper thread ends within its own read-timeout bound
         worker.start()
 
         def close_response():
@@ -78,7 +83,6 @@ class OpenAICompatLLM:
 
         deadline_first = time.monotonic() + self.first_token_s
         idle_s = self.timeout.read or self.first_token_s
-        finished = False
         try:
             while True:
                 if gen_id in self._cancelled:
@@ -108,16 +112,14 @@ class OpenAICompatLLM:
                         raise BrainError("connect", type(e).__name__) from None
                     raise BrainError("malformed", type(e).__name__) from None
                 if kind == "eof":
-                    if not finished:
-                        raise BrainError("malformed", "stream ended without [DONE]")
-                    return
+                    raise BrainError("malformed", "stream ended without [DONE]")
                 line = payload
                 if not line.startswith("data:"):
                     continue  # SSE comments / keepalives
                 data = line[5:].strip()
                 if data == "[DONE]":
-                    finished = True
-                    continue
+                    close_response()  # complete: do not wait for the server to hang up
+                    return
                 try:
                     piece = json.loads(data)["choices"][0].get("delta", {}).get("content")
                 except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:

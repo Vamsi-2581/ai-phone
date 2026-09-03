@@ -85,6 +85,21 @@ def test_first_token_deadline_while_waiting_for_headers():
     with pytest.raises(BrainError) as e:
         list(b.stream(1, [{"role": "user", "content": "hi"}], 10))
     assert e.value.kind == "first_token_timeout" and time.monotonic() - t0 < 1.0
+    b._last_thread.join(3.0)
+    assert not b._last_thread.is_alive(), "the helper thread must end once the request completes or its own read timeout fires"
+
+
+def test_done_completes_even_if_the_server_keeps_the_connection_open():
+    class Lingering(httpx.SyncByteStream):
+        def __iter__(self):
+            yield from _sse(["ok"])       # …[DONE] is sent, but the server never closes
+            time.sleep(2.0)
+            yield b": still here\n\n"
+
+    b = _backend(lambda req: httpx.Response(200, stream=Lingering()), first_token_timeout_ms=4000, stream_idle_timeout_ms=300)
+    t0 = time.monotonic()
+    assert list(b.stream(1, [{"role": "user", "content": "hi"}], 10)) == ["ok"]
+    assert time.monotonic() - t0 < 1.0
 
 
 def test_idle_timeout_after_the_first_token_uses_the_idle_deadline():
