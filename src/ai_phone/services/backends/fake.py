@@ -34,14 +34,15 @@ class FakeLLM:
     REPLY = "Hello, this is a fake reply."
     TOKENS = ["Hello", ",", " this", " is", " a", " fake", " reply", "."]
 
-    def __init__(self):
+    def __init__(self, reply: str | None = None):
         self._cancelled: set[int] = set()
+        self.tokens = [reply] if reply else self.TOKENS
 
     def warmup(self, system_prompt: str = ""):
         return {"warm_ms": 1.0}
 
     def stream(self, gen_id, messages, max_tokens):
-        for tok in self.TOKENS:
+        for tok in self.tokens:
             if gen_id in self._cancelled:
                 return
             time.sleep(0.01)
@@ -49,6 +50,22 @@ class FakeLLM:
 
     def cancel(self, gen_id):
         self._cancelled.add(gen_id)
+
+
+class FlakyLLM(FakeLLM):
+    """Fails the listed generations (1-based call numbers) with a recoverable BrainError (tests the brain_error path)."""
+
+    def __init__(self, fail_calls: str = "2"):
+        super().__init__()
+        self._calls = 0
+        self._fail = {int(x) for x in fail_calls.split(",") if x.strip()}
+
+    def stream(self, gen_id, messages, max_tokens):
+        from ai_phone.services.errors import BrainError
+        self._calls += 1
+        if self._calls in self._fail:
+            raise BrainError("http_503")
+        yield from super().stream(gen_id, messages, max_tokens)
 
 
 class FakeTTS:

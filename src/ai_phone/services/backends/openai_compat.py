@@ -1,0 +1,92 @@
+"""Any OpenAI-compatible /v1/chat/completions endpoint as the brain (LM Studio, llama.cpp, vLLM, your own agent).
+
+Streams `delta.content` tokens into the same clause chunker as the local model. Failures raise BrainError with a
+kind the controller can log; there are no retries because the caller is waiting on the line.
+"""
+from __future__ import annotations
+
+import json
+import time
+
+import httpx
+
+from ai_phone.services.base import Message
+from ai_phone.services.errors import BrainError
+
+
+class OpenAICompatLLM:
+    def __init__(self, base_url: str, model: str, api_key: str | None = None, connect_timeout_ms: int = 2000,
+                 first_token_timeout_ms: int = 4000, stream_idle_timeout_ms: int = 4000, max_response_chars: int = 2000,
+                 http: httpx.Client | None = None):
+        self.base_url, self.model, self.max_chars = base_url.rstrip("/"), model, max_response_chars
+        self.first_token_s = first_token_timeout_ms / 1000
+        timeout = httpx.Timeout(connect=connect_timeout_ms / 1000, read=stream_idle_timeout_ms / 1000, write=5.0, pool=5.0)
+        self.http = http or httpx.Client(timeout=timeout, follow_redirects=False)
+        self.http.follow_redirects = False
+        if api_key:
+            self.http.headers["Authorization"] = f"Bearer {api_key}"
+        self._cancelled: set[int] = set()
+        self.last_timings: dict = {}
+
+    def warmup(self, system_prompt: str = "") -> dict:
+        t = time.monotonic_ns()
+        list(self.stream(0, [{"role": "system", "content": system_prompt or "You are a phone assistant."},
+                            {"role": "user", "content": "Say hi."}], 4))
+        return {"warm_ms": (time.monotonic_ns() - t) / 1e6, "endpoint": self.base_url}
+
+    def stream(self, gen_id: int, messages: list[Message], max_tokens: int):
+        body = {"model": self.model, "messages": messages, "max_tokens": max_tokens, "stream": True}
+        t0 = time.monotonic_ns()
+        t_first = None
+        n = chars = 0
+        try:
+            with self.http.stream("POST", f"{self.base_url}/chat/completions", json=body) as r:
+                if r.status_code >= 300:
+                    raise BrainError(f"http_{r.status_code}")
+                for line in r.iter_lines():
+                    if gen_id in self._cancelled:
+                        raise BrainError("cancelled")
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        piece = json.loads(data)["choices"][0].get("delta", {}).get("content")
+                    except (ValueError, KeyError, IndexError, TypeError) as e:
+                        raise BrainError("malformed", str(e)[:80]) from None
+                    if not piece:
+                        continue
+                    if t_first is None:
+                        t_first = time.monotonic_ns()
+                        if (t_first - t0) / 1e9 > self.first_token_s:
+                            raise BrainError("first_token_timeout")
+                    n += 1
+                    chars += len(piece)
+                    if chars > self.max_chars:
+                        raise BrainError("too_long", f"> {self.max_chars} chars")
+                    yield piece
+        except httpx.ConnectError as e:
+            raise BrainError("connect", str(e)[:80]) from None
+        except httpx.ReadTimeout:
+            raise BrainError("first_token_timeout" if t_first is None else "idle_timeout") from None
+        except httpx.HTTPError as e:
+            raise BrainError("connect", type(e).__name__) from None
+        except BrainError as e:
+            if e.kind == "cancelled":
+                self._cancelled.discard(gen_id)
+                return
+            raise
+        finally:
+            t_end = time.monotonic_ns()
+            first = t_first or t_end
+            self.last_timings = {"prompt_eval_ms": (first - t0) / 1e6, "first_token_ms": (first - t0) / 1e6,
+                                 "gen_ms": (t_end - first) / 1e6, "tokens": n}
+        self._cancelled.discard(gen_id)
+
+    def cancel(self, gen_id: int) -> None:
+        self._cancelled.add(gen_id)
+
+
+def make_openai(**kw) -> OpenAICompatLLM:
+    return OpenAICompatLLM(**kw)

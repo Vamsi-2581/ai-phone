@@ -105,3 +105,35 @@ async def test_worker_death_is_reported_once_as_an_error():
     assert not loop.remove_reader(c._parent.fileno()), "reader still registered on a dead pipe"
     assert c.events.empty()
     await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_llm_worker_reports_brain_error_and_survives():
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", "ai_phone.services.backends.fake:FlakyLLM", loop, None, None, {})
+    await c.start()
+    g1 = c.next_gen()
+    c.send({"op": "llm.generate", "gen": g1, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10})
+    evs = await _collect(c, "done", g1)
+    assert "".join(e["text"] for e in evs if e["ev"] == "token")
+    g2 = c.next_gen()
+    c.send({"op": "llm.generate", "gen": g2, "messages": [{"role": "user", "content": "again"}], "max_tokens": 10})
+    evs = await _collect(c, "brain_error", g2)
+    assert evs[-1]["kind"] == "http_503" and not any(e["ev"] == "done" and e["gen"] == g2 for e in evs)
+    g3 = c.next_gen()
+    c.send({"op": "llm.generate", "gen": g3, "messages": [{"role": "user", "content": "third"}], "max_tokens": 10})
+    evs = await _collect(c, "done", g3)   # the worker is still alive
+    assert any(e["ev"] == "token" for e in evs)
+    await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_factory_args_reach_the_backend():
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", "ai_phone.services.backends.fake:FakeLLM", loop, None, None, {}, factory_args={"reply": "Custom."})
+    await c.start()
+    g = c.next_gen()
+    c.send({"op": "llm.generate", "gen": g, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10})
+    evs = await _collect(c, "done", g)
+    assert "".join(e["text"] for e in evs if e["ev"] == "token") == "Custom."
+    await c.stop()

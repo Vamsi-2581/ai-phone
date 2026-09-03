@@ -10,8 +10,10 @@ from ai_phone.telephony.rings import FrameRing
 
 
 class WorkerClient:
-    def __init__(self, kind, backend_factory, loop, audio_in: FrameRing | None, audio_out: FrameRing | None, warm_args: dict):
+    def __init__(self, kind, backend_factory, loop, audio_in: FrameRing | None, audio_out: FrameRing | None, warm_args: dict,
+                 factory_args: dict | None = None):
         self.kind, self.factory, self.loop, self.warm_args = kind, backend_factory, loop, warm_args
+        self.factory_args = factory_args
         self.audio_in, self.audio_out = audio_in, audio_out
         self.events: asyncio.Queue = asyncio.Queue()
         self._gen = 0
@@ -39,7 +41,7 @@ class WorkerClient:
             target=run_worker, name=f"{self.kind}-worker", daemon=True,
             args=(self.kind, self.factory, self._child,
                   self.audio_in.name if self.audio_in else None,
-                  self.audio_out.name if self.audio_out else None, self.warm_args))
+                  self.audio_out.name if self.audio_out else None, self.warm_args, self.factory_args))
         self._proc.start()
         self._child.close()  # the child owns its end now
         ready = await self.loop.run_in_executor(None, ipc.recv, self._parent)
@@ -59,7 +61,7 @@ class WorkerClient:
                     pass
                 self.events.put_nowait({"ev": "error", "kind": self.kind, "message": f"{self.kind} worker disconnected: {e!r}"})
                 return
-            msg["kind"] = self.kind
+            msg.setdefault("kind", self.kind)  # an event's own kind wins: brain_error carries the failure kind
             if "gen" in msg and msg["gen"] != self._gen and msg["ev"] != "error":
                 continue  # stale generation: drop on receipt
             self.events.put_nowait(msg)

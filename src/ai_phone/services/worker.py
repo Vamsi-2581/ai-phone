@@ -13,13 +13,14 @@ import traceback
 import numpy as np
 
 from ai_phone.services import ipc
+from ai_phone.services.errors import BrainError
 from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, tag_frame, untag_frame
 from ai_phone.telephony.rings import FrameRing
 
 
-def _load(factory: str):
+def _load(factory: str, factory_args: dict | None = None):
     mod, _, name = factory.partition(":")
-    return getattr(importlib.import_module(mod), name)()
+    return getattr(importlib.import_module(mod), name)(**(factory_args or {}))
 
 
 def _drain_stt(ring: FrameRing, gen: int) -> list[bytes]:
@@ -50,7 +51,7 @@ def _drain_cancel(conn, cancelled: set[int], backend, gen: int, pending: list[di
     return gen in cancelled
 
 
-def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_name, warm_args: dict) -> None:
+def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_name, warm_args: dict, factory_args: dict | None = None) -> None:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -59,7 +60,7 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
     cancelled: set[int] = set()
     pending: list[dict] = []  # messages read during a mid-stream cancel check, processed next
     try:
-        backend = _load(backend_factory)
+        backend = _load(backend_factory, factory_args)
         timings = backend.warmup(**warm_args) if warm_args else backend.warmup()
         ipc.send(conn, {"ev": "ready", "timings": timings})
         while True:
@@ -93,10 +94,14 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 text, t = backend.finalize(gen)
                 ipc.send(conn, {"ev": "final", "gen": gen, "text": text, "timings": t})
             elif op == "llm.generate":
-                for tok in backend.stream(gen, msg["messages"], msg["max_tokens"]):
-                    if gen in cancelled or (conn.poll(0) and _drain_cancel(conn, cancelled, backend, gen, pending)):
-                        break
-                    ipc.send(conn, {"ev": "token", "gen": gen, "text": tok})
+                try:
+                    for tok in backend.stream(gen, msg["messages"], msg["max_tokens"]):
+                        if gen in cancelled or (conn.poll(0) and _drain_cancel(conn, cancelled, backend, gen, pending)):
+                            break
+                        ipc.send(conn, {"ev": "token", "gen": gen, "text": tok})
+                except BrainError as e:  # recoverable: tell the controller, keep serving
+                    ipc.send(conn, {"ev": "brain_error", "gen": gen, "kind": e.kind})
+                    continue
                 ipc.send(conn, {"ev": "done", "gen": gen, "timings": getattr(backend, "last_timings", {})})
             elif op == "tts.synth":
                 n = 0
