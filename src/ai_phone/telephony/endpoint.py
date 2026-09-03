@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import socket
 from dataclasses import dataclass, field
 
-from ai_phone.config import Config, LineConfig, host_of
+from ai_phone.config import AOR_RE, DISPLAY_RE, E164_RE, SIP_URI_RE, SIP_USER_RE, USER_RE, Config, LineConfig, host_of
 from ai_phone.telephony.call import AiCall, LineAccount
 from ai_phone.telephony.media_port import RingMediaPort
 from ai_phone.telephony.pj import pj
@@ -49,12 +48,34 @@ class LineSpec:
 
     @classmethod
     def from_config(cls, line_id: str, c: LineConfig, password: str | None) -> "LineSpec":
+        """Builds the spec and re-checks every part that ends up inside a SIP header, so a LineConfig built in code
+        (not through load_config) can never smuggle quotes or delimiters into a name-addr."""
+        _grammar(c)
         return cls(id=line_id, kind=c.kind, user=c.user, password=password, display_name=c.display_name, number=c.number,
                    aor=c.aor, registrar=c.registrar, outbound_proxy=c.outbound_proxy, dial_domain=c.dial_domain,
                    register_via_proxy=c.register_via_proxy, transport=c.transport, register_expiry_sec=c.register_expiry_sec,
                    srtp=c.srtp, accept_invites_from=c.accept_invites_from, trusted_cidrs=list(c.trusted_cidrs),
                    trusted_peers=list(c.trusted_peers), caller_id=c.caller_id,
                    verified_caller_ids=[v.number for v in c.verified_caller_ids], persona=c.persona)
+
+
+def _grammar(c: LineConfig) -> None:
+    checks = [(DISPLAY_RE, c.display_name, "display_name")]
+    if c.kind == "trunk":
+        checks += [(USER_RE, c.user, "user"), (SIP_URI_RE, c.registrar or "", "registrar")]
+        if c.number is not None:
+            checks.append((E164_RE, c.number, "number"))
+        if c.caller_id is not None:
+            checks.append((E164_RE, c.caller_id, "caller_id"))
+        if c.outbound_proxy is not None:
+            checks.append((SIP_URI_RE, c.outbound_proxy, "outbound_proxy"))
+    else:
+        checks += [(SIP_USER_RE, c.user, "user"), (AOR_RE, c.aor or "", "aor")]
+        if c.caller_id is not None:
+            checks.append((AOR_RE, c.caller_id, "caller_id"))
+    for rx, value, name in checks:
+        if not rx.match(value):
+            raise ValueError(f"line {name} {value!r} does not match {rx.pattern}")
 
 
 def id_uri(spec: LineSpec) -> str:

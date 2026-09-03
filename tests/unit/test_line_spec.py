@@ -1,3 +1,7 @@
+import pytest
+
+pytest.importorskip("ai_phone.vendor.pjsua2")  # endpoint.py imports the pjsua2 extension at module load
+
 from ai_phone.config import LineConfig
 from ai_phone.telephony.endpoint import LineSpec, id_uri, local_uri, srtp_values
 
@@ -25,8 +29,17 @@ def test_sip_line_uris_use_the_aor_verbatim():
     assert s.registrar_host is None
 
 
+def test_from_config_refuses_unvalidated_parts():
+    with pytest.raises(ValueError, match="display_name"):
+        _trunk(display_name='evil" <sip:x@y>')
+    with pytest.raises(ValueError, match="user"):
+        _trunk(user="a b")
+    with pytest.raises(ValueError, match="aor"):
+        LineSpec.from_config("s", LineConfig(kind="sip", user="ok", aor="sip:ok@host;evil", display_name="ok"), None)
+
+
 def test_srtp_mapping():
-    from ai_phone.telephony.pj import pj  # integration environments only; skip cleanly otherwise
+    from ai_phone.telephony.pj import pj
     assert srtp_values(_trunk()) == (pj.PJMEDIA_SRTP_DISABLED, 0)
     assert srtp_values(_trunk(transport="tls", srtp="optional")) == (pj.PJMEDIA_SRTP_OPTIONAL, 1)
     assert srtp_values(_trunk(transport="tls", srtp="required")) == (pj.PJMEDIA_SRTP_MANDATORY, 1)

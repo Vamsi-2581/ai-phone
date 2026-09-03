@@ -7,6 +7,7 @@ import pytest
 from ai_phone.config import Config, LineConfig
 from ai_phone.telephony import events as ev
 from ai_phone.telephony.endpoint import LineSpec, Telephony
+from ai_phone.telephony.policy import build_peer_set
 from ai_phone.telephony.rings import FrameRing
 
 pytestmark = pytest.mark.integration
@@ -59,7 +60,10 @@ def test_second_call_gets_486_and_public_source_gets_403():
         _quit(p2)
         _quit(p1)
         loop.run_until_complete(_next(events, ev.CallStateChanged, call_id=first.call_id, state="ended"))
-        tel.accounts["main"].spec.accept_invites_from = "trusted"  # policy is per line; an empty trusted set disallows every source
+        acc = tel.accounts["main"]  # switch the line to the trusted policy with one far-away peer, as a config would
+        acc.spec.accept_invites_from = "trusted"
+        acc.spec.trusted_peers = ["203.0.113.9"]
+        acc.peers = build_peer_set(acc.spec.trusted_peers)[0]
         p3 = _peer(5066)
         peers.append(p3)
         rej = loop.run_until_complete(_next(events, ev.CallRejected))
