@@ -185,7 +185,8 @@ def _coerce(value: Any, hint: Any, path: str) -> Any:
                 return _coerce(value, member, path)
             except ConfigError as e:
                 errors.append(str(e))
-        raise ConfigError(f"{path}: {errors[-1]}")
+        # report the member that matches the value's shape (a mapping → the dataclass), not the trailing "expected null"
+        raise ConfigError(errors[0] if isinstance(value, (dict, list)) else f"{path}: {errors[-1]}")
     if origin is list:
         if not isinstance(value, list):
             raise ConfigError(f"{path}: expected a list")

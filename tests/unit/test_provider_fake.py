@@ -19,6 +19,7 @@ def test_provision_release_round_trip(tmp_path: Path):
     j = Journal.open(tmp_path, "main", "fake")
     r = p.provision(j, n, "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
     assert r.state == "ready" and r.line["registrar"] == "sip:sip.fake.invalid" and r.line["user"] == "aimain1234"
+    assert r.line["number"] == n.e164 and r.line["caller_id"] == n.e164 and set(r.line["provider"]["resources"]) == {"profile_id", "connection_id", "number_id"}
     assert set(p.carrier) == {"profile", "connection", "number"} and j.steps_done() == ["profile", "connection", "number"]
     assert p.release(j).ok and p.carrier == {}
 

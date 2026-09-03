@@ -54,9 +54,11 @@ class FakeProvider:
         return ProvisionResult("ready", "ready", self._line(journal, None))
 
     def _line(self, journal: Journal, sip_user: str | None) -> dict:
-        d = {"kind": "trunk", "registrar": "sip:sip.fake.invalid", "dial_domain": "sip.fake.invalid", "transport": "udp",
-             "register_via_proxy": True, "trusted_cidrs": list(self.signalling_cidrs),
-             "provider": {"name": self.name, "state": journal.state, "resources": journal.resources()}}
+        e164 = next((s["planned"]["name"] for s in journal.doc["steps"] if s["name"] == "number"), None)
+        ids = {k: v for k, v in journal.resources().items() if k.endswith("_id")}  # carrier ids only, as the real providers do
+        d = {"kind": "trunk", "number": e164, "caller_id": e164, "registrar": "sip:sip.fake.invalid", "dial_domain": "sip.fake.invalid",
+             "transport": "udp", "register_via_proxy": True, "trusted_cidrs": list(self.signalling_cidrs),
+             "provider": {"name": self.name, "state": journal.state, "resources": ids}}
         if sip_user:
             d["user"] = sip_user
         return d
