@@ -71,3 +71,14 @@ def test_values_keep_their_spaces(tmp_path: Path):
     p = tmp_path / "secrets.env"
     write_secret("A", " padded value ", p)
     assert load_secrets(p) == {"A": " padded value "}
+
+
+def test_symlinked_ancestor_is_refused(tmp_path: Path):
+    real = tmp_path / "real"
+    (real / "deeper").mkdir(parents=True)
+    link = tmp_path / "home"
+    link.symlink_to(real)
+    with pytest.raises(SecretsError, match="symlink"):
+        write_secret("A", "1", link / "deeper" / "secrets.env")
+    with pytest.raises(SecretsError, match="symlink"):
+        load_secrets(link / "deeper" / "secrets.env")

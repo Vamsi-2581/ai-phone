@@ -19,10 +19,12 @@ class SecretsError(RuntimeError):
 
 
 def _check(path: Path) -> None:
-    if path.is_symlink() or path.parent.is_symlink():
-        raise SecretsError(f"{path} (or its directory) is a symlink; refusing to use it")
-    if path.exists():
-        mode = stat.S_IMODE(path.stat().st_mode)
+    """Refuse a symlink anywhere in the path (the file or any ancestor), then check the mode of the file itself."""
+    absolute = Path(os.path.abspath(path))
+    if absolute.resolve(strict=False) != absolute:
+        raise SecretsError(f"{path} contains a symlink somewhere in its path; refusing to use it")
+    if absolute.exists():
+        mode = stat.S_IMODE(absolute.stat().st_mode)
         if mode != 0o600:
             raise SecretsError(f"{path} has mode {mode:o}; it must be 0600 (chmod 600 {path})")
 
@@ -32,9 +34,17 @@ def load_secrets(path: Path | None = None) -> dict[str, str]:
     _check(path)
     if not path.exists():
         return {}
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)  # no symlink swap between the check above and this read
-    with os.fdopen(fd) as f:
-        text = f.read()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)  # the final component cannot be swapped for a symlink after _check
+    try:
+        st = os.fstat(fd)  # re-check the mode on the descriptor we actually read, so a swap after _check is caught
+        if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o600:
+            raise SecretsError(f"{path} changed underneath us (not a regular 0600 file)")
+        with os.fdopen(fd) as f:
+            fd = None
+            text = f.read()
+    finally:
+        if fd is not None:
+            os.close(fd)
     out: dict[str, str] = {}
     for n, line in enumerate(text.splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
