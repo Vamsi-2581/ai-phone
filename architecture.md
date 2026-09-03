@@ -15,7 +15,7 @@ ai-phone is a single daemon that owns one or more SIP lines (each its own regist
 
 Shape in one line: **a telephony layer that knows nothing about models, a model layer that knows nothing about telephony, and an asyncio pipeline between them that owns the conversation.**
 
-Non-goals that shape the architecture (from the PRD): single-call, English-only, no web UI, no cloud fallback, no external model server, no SMS through launch.
+Non-goals that shape the architecture (from the PRD): single-call, English-only, no web UI, no cloud fallback, no external model server required (a user may point the brain at an OpenAI-compatible endpoint, §14a.7), no SMS through launch.
 
 ### 1.1 Context diagram
 
@@ -753,7 +753,7 @@ ai-phone status                                    # per-line registration rows 
 | 2026-09-02 | Python; Go rejected by owner; TS/Swift/Rust evaluated and rejected | [D] |
 | 2026-09-02 | PJSIP via pjsua2, vendored into the platform wheel; AGPLv3 | [D] |
 | 2026-09-02 | Hand-rolled asyncio pipeline for M1; Pipecat only if it deletes more code than it adds | [D] |
-| 2026-09-02 | LLM in the daemon's own worker process; no Ollama or any external model server | [D] |
+| 2026-09-02 | LLM in the daemon's own worker process; no Ollama or any external model server | [D] | Since Milestone 2 the user may configure an OpenAI-compatible endpoint as the brain (§14a.7); nothing external is required.
 | 2026-09-02 | mlx-audio for STT/TTS/VAD on Mac; parakeet-mlx fallback only | [D] |
 | 2026-09-02 | Media port at 16 kHz; VAD in main process; three workers; shared-memory audio, JSON control | [D]/[P] as marked |
 | 2026-09-02 | `lan` mode includes loopback and link-local | [D] |
