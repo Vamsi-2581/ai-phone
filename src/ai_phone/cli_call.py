@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import signal
+import socket
+import threading
 
 from ai_phone import paths
 from ai_phone.control.client import DaemonGone, probe, request
@@ -30,18 +32,38 @@ def cmd_call(a) -> int:
         else:
             print(f"{kind} {e.get('uri', '')}".strip(), flush=True)
 
+    holder: dict = {}
+    interrupted = {"flag": False}
+
     def on_sigint(*_):
+        """Hang up, give the daemon a moment to report `ended`, then stop waiting whatever happens."""
+        interrupted["flag"] = True
         try:
             request(paths.socket_path(), {"cmd": "hangup"}, timeout=2)
         except DaemonGone:
             pass
 
-    signal.signal(signal.SIGINT, on_sigint)
+        def cut():
+            sock = holder.get("socket")
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        threading.Timer(5.0, cut).start()
+
+    previous = signal.signal(signal.SIGINT, on_sigint)
     try:
-        last = request(paths.socket_path(), {"cmd": "call", "to": to, "line": a.line, "persona": a.persona, "timeout_sec": a.timeout_sec}, on_event)
+        last = request(paths.socket_path(), {"cmd": "call", "to": to, "line": a.line, "persona": a.persona, "timeout_sec": a.timeout_sec}, on_event,
+                       socket_holder=holder)
     except DaemonGone as e:
+        if interrupted["flag"]:
+            print("hung up; the daemon did not confirm within 5 s")
+            return EXIT["daemon_gone"]
         print(f"daemon went away: {e}")
         return EXIT["daemon_gone"]
+    finally:
+        signal.signal(signal.SIGINT, previous)
     if last.get("ok") is False:
         print(f"refused: {last.get('error')}")
         return EXIT["line_busy"] if last.get("error") == "busy" else EXIT["rejected"]

@@ -27,7 +27,14 @@ def render_status(state: dict, alive: bool) -> str:
 def render_last_call(turns_path: Path) -> str:
     if not turns_path.exists():
         return "no turns recorded yet"
-    rows = [json.loads(l) for l in turns_path.read_text().splitlines() if l.strip()]
+    rows = []
+    for l in turns_path.read_text().splitlines():
+        if not l.strip():
+            continue
+        try:
+            rows.append(json.loads(l))
+        except ValueError:
+            continue  # a record cut short by an interrupted write must not hide the rest
     if not rows:
         return "no turns recorded yet"
     last_id = rows[-1]["call_id"]

@@ -36,12 +36,19 @@ class ControlServer:
         os.chmod(self.path, 0o600)
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        gone = {"client": False}
+
         async def send(msg: dict) -> None:
+            """Deliver to the client if it is still there. A client that went away (Ctrl-C, crash) is remembered
+            and every later send is a no-op, so the handler — and the call it drives — carries on regardless."""
+            if gone["client"] or writer.is_closing():
+                gone["client"] = True
+                return
             try:
                 writer.write(json.dumps(msg).encode() + b"\n")
                 await writer.drain()
-            except (ConnectionResetError, BrokenPipeError, OSError) as e:
-                raise ConnectionError(str(e)) from None
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                gone["client"] = True
 
         try:
             line = await asyncio.wait_for(reader.readline(), 5)
@@ -60,7 +67,7 @@ class ControlServer:
                     self._call_active = False
             else:
                 await self.handler(msg, send)
-        except (asyncio.TimeoutError, ValueError, ConnectionError):
+        except (asyncio.TimeoutError, ValueError):
             pass
         finally:
             try:

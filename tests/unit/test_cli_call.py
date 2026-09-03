@@ -71,3 +71,32 @@ def test_call_to_diverted_number_needs_yes(sock_dir: Path, monkeypatch, capsys):
         '    user: aimain1234\n    trusted_cidrs: ["192.0.2.0/24"]\n    diverted_from: ["+447700900123"]\n')
     assert main(["call", "+447700900123", "--line", "main"]) == 7
     assert "diverts" in capsys.readouterr().out
+
+
+def test_daemon_vanishing_mid_call_exits_9(sock_dir: Path, monkeypatch, capsys):
+    monkeypatch.setenv("AI_PHONE_HOME", str(sock_dir))
+
+    async def handler(msg, send):
+        await send({"event": "dialling", "uri": "sip:x"})   # and then nothing: the connection closes
+
+    stop, t = _serve(sock_dir / "control.sock", handler)
+    try:
+        assert main(["call", "sip:x@127.0.0.1", "--yes"]) == 9
+    finally:
+        stop.set(); t.join(2)
+
+
+def test_sigint_handler_is_restored(sock_dir: Path, monkeypatch):
+    import signal
+    monkeypatch.setenv("AI_PHONE_HOME", str(sock_dir))
+    before = signal.getsignal(signal.SIGINT)
+
+    async def handler(msg, send):
+        await send({"event": "ended", "reason": "busy", "exit_code": 5})
+
+    stop, t = _serve(sock_dir / "control.sock", handler)
+    try:
+        assert main(["call", "sip:x@127.0.0.1", "--yes"]) == 5
+        assert signal.getsignal(signal.SIGINT) is before
+    finally:
+        stop.set(); t.join(2)

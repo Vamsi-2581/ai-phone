@@ -68,13 +68,11 @@ async def test_client_disconnect_does_not_kill_the_handler(sock_dir: Path):
     sock = sock_dir / "control.sock"
     finished = asyncio.Event()
 
-    async def handler(msg, send):
+    async def handler(msg, send):  # no try/except: the server itself must shield the call from a vanished client
         await send({"event": "dialling"})
         await asyncio.sleep(0.3)
-        try:
-            await send({"event": "answered"})
-        except ConnectionError:
-            pass
+        await send({"event": "answered"})
+        await send({"event": "ended", "reason": "answered", "exit_code": 0})
         finished.set()
 
     srv = ControlServer(sock, handler)
@@ -93,3 +91,20 @@ async def test_client_disconnect_does_not_kill_the_handler(sock_dir: Path):
 def test_daemon_gone(sock_dir: Path):
     with pytest.raises(DaemonGone):
         request(sock_dir / "missing.sock", {"cmd": "status"})
+
+
+@pytest.mark.asyncio
+async def test_eof_before_a_terminal_message_is_daemon_gone(sock_dir: Path):
+    sock = sock_dir / "control.sock"
+
+    async def handler(msg, send):
+        await send({"event": "dialling"})   # then the daemon dies: the connection just closes
+
+    srv = ControlServer(sock, handler)
+    await srv.start()
+    try:
+        loop = asyncio.get_running_loop()
+        with pytest.raises(DaemonGone):
+            await loop.run_in_executor(None, lambda: request(sock, {"cmd": "call", "to": "sip:x"}, lambda e: None))
+    finally:
+        await srv.stop()

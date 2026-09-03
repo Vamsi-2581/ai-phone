@@ -38,3 +38,9 @@ def test_last_call_summary(tmp_path: Path):
     turns.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     out = render_last_call(turns)
     assert "call 7" in out and "2 turns" in out and "p50" in out and "underruns: 1" in out and "brain errors: 1" in out
+
+
+def test_last_call_survives_a_truncated_record(tmp_path: Path):
+    turns = tmp_path / "turns.jsonl"
+    turns.write_text(json.dumps({"call_id": "3", "turn": 0, "first_audible_ms": 700.0, "rx_overruns": 0, "tx_underruns": 0}) + "\n" + '{"call_id": "4", "tu')
+    assert "call 3" in render_last_call(turns)
