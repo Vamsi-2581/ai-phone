@@ -1,0 +1,19 @@
+"""Carrier registry. A third carrier is a new module and one line here; the daemon never imports this package."""
+from __future__ import annotations
+
+import importlib
+
+PROVIDERS = {
+    "fake": "ai_phone.providers.fake:FakeProvider",
+    "telnyx": "ai_phone.providers.telnyx:TelnyxProvider",
+    "twilio": "ai_phone.providers.twilio:TwilioProvider",
+}
+
+
+def load_provider(name: str, key: str, secret: str | None = None, **kw):
+    try:
+        target = PROVIDERS[name]
+    except KeyError:
+        raise ValueError(f"unknown provider {name!r}; known: {', '.join(sorted(PROVIDERS))}") from None
+    mod, _, cls = target.partition(":")
+    return getattr(importlib.import_module(mod), cls)(key=key, secret=secret, **kw)

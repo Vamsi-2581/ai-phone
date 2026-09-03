@@ -1,0 +1,106 @@
+"""Provisioning journal: every carrier step is written `started` (with the names it will use) before the request
+and `done` (with the ids) after, so a crash anywhere is resumable and never duplicates resources."""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+
+def _private_dir(d: Path) -> Path:
+    if d.is_symlink():
+        raise RuntimeError(f"{d} is a symlink; refusing to use it")
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+@contextmanager
+def line_lock(d: Path):
+    d = _private_dir(Path(d))
+    with open(d / ".lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+class Journal:
+    def __init__(self, path: Path, doc: dict):
+        self.path, self.doc = path, doc
+
+    @classmethod
+    def open(cls, d: Path, line_id: str, provider: str | None = None) -> "Journal":
+        d = _private_dir(Path(d))
+        path = d / f"{line_id}.journal.json"
+        if path.is_symlink():
+            raise RuntimeError(f"{path} is a symlink; refusing to use it")
+        if path.exists():
+            doc = json.loads(path.read_text())
+            if provider and doc.get("provider") != provider:
+                raise RuntimeError(f"journal for line {line_id} belongs to provider {doc.get('provider')}, not {provider}")
+        else:
+            doc = {"line_id": line_id, "provider": provider, "state": "pending", "steps": []}
+        j = cls(path, doc)
+        j._save()
+        return j
+
+    @property
+    def state(self) -> str:
+        return self.doc["state"]
+
+    def set_state(self, state: str) -> None:
+        self.doc["state"] = state
+        self._save()
+
+    def _step(self, step: str) -> dict | None:
+        return next((s for s in self.doc["steps"] if s["name"] == step), None)
+
+    def start(self, step: str, **planned) -> tuple[str, dict]:
+        """('done', result) if the step already completed; ('started', planned) if it was begun but never finished
+        (reconcile before creating anything); ('new', planned) after recording it as started."""
+        s = self._step(step)
+        if s is not None and s["status"] == "done":
+            return "done", dict(s["result"])
+        if s is not None:
+            return "started", dict(s["planned"])
+        self.doc["steps"].append({"name": step, "status": "started", "planned": planned, "result": {}, "at": time.time()})
+        self._save()
+        return "new", dict(planned)
+
+    def finish(self, step: str, **result) -> None:
+        s = self._step(step)
+        if s is None:
+            raise RuntimeError(f"finish({step!r}) before start")
+        s.update(status="done", result=result, at=time.time())
+        self._save()
+
+    def steps_done(self) -> list[str]:
+        return [s["name"] for s in self.doc["steps"] if s["status"] == "done"]
+
+    def resources(self) -> dict:
+        out: dict = {}
+        for s in self.doc["steps"]:
+            if s["status"] == "done":
+                out.update(s["result"])
+        return out
+
+    def delete(self) -> None:
+        if self.path.exists():
+            self.path.unlink()
+
+    def _save(self) -> None:
+        fd, tmp = tempfile.mkstemp(prefix=".journal-", dir=self.path.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.doc, f, indent=1)
+            os.replace(tmp, self.path)
+        except BaseException:
+            os.unlink(tmp)
+            raise
