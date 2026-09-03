@@ -32,9 +32,10 @@ def scrubbed_environment():
 
 class WorkerClient:
     def __init__(self, kind, backend_factory, loop, audio_in: FrameRing | None, audio_out: FrameRing | None, warm_args: dict,
-                 factory_args: dict | None = None):
+                 factory_args: dict | None = None, keep_warm_sec: float = 0.0):
         self.kind, self.factory, self.loop, self.warm_args = kind, backend_factory, loop, warm_args
         self.factory_args = factory_args
+        self.keep_warm_sec = keep_warm_sec
         self.audio_in, self.audio_out = audio_in, audio_out
         self.events: asyncio.Queue = asyncio.Queue()
         self._gen = 0
@@ -62,7 +63,7 @@ class WorkerClient:
             target=run_worker, name=f"{self.kind}-worker", daemon=True,
             args=(self.kind, self.factory, self._child,
                   self.audio_in.name if self.audio_in else None,
-                  self.audio_out.name if self.audio_out else None, self.warm_args, self.factory_args))
+                  self.audio_out.name if self.audio_out else None, self.warm_args, self.factory_args, self.keep_warm_sec))
         with scrubbed_environment():  # no carrier key, line password or token reaches a model worker
             self._proc.start()
         self._child.close()  # the child owns its end now

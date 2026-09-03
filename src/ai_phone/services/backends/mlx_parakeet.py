@@ -15,18 +15,25 @@ class ParakeetSTT:
         self._buf: dict[int, list[np.ndarray]] = {}
         self._cancelled: set[int] = set()
 
-    def warmup(self) -> dict:
+    def warmup(self, wire_memory: bool = True) -> dict:
         import mlx.core as mx
         from mlx_audio.stt.utils import load_model
 
+        from ai_phone.services.backends.mlx_memory import begin_wiring, wire_resident
+
         self._mx = mx
         t = time.monotonic_ns()
+        begin_wiring(wire_memory)  # before the load: MLX wires buffers as they are allocated
         self._model = load_model(self.model_id)
         # the checkpoint loads as float32 (2.5 GB); float16 halves it with identical transcripts and speed
         self._model.set_dtype(mx.float16)
         mx.eval(self._model.parameters())
+        wired = wire_resident(self._model, wire_memory)  # idle for an hour must not cost seconds of page-ins
         self._transcribe(np.zeros(16000, dtype=np.float32))
-        return {"warm_ms": (time.monotonic_ns() - t) / 1e6}
+        return {"warm_ms": (time.monotonic_ns() - t) / 1e6, **wired}
+
+    def keep_warm(self) -> None:
+        self._transcribe(np.zeros(8000, dtype=np.float32))  # half a second of silence through the whole encoder
 
     def _transcribe(self, pcm: np.ndarray) -> str:
         out = self._model.generate(self._mx.array(np.asarray(pcm, np.float32)))  # expects an mx.array (numpy input fails)

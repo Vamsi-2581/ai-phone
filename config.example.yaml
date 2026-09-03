@@ -46,6 +46,9 @@ rtp:
   port_max: 10100
 models:
   tier: auto                 # auto | t9 (24 GB+) | t4 (16 GB)
+  wire_memory: true          # ask MLX to keep the model weights resident (macOS 15+)
+  keep_warm_sec: 30          # idle workers run one tiny inference this often, so on a crowded host macOS compresses
+                             # something else first and the first reply after a quiet spell is not seconds late. 0 = off
 
 brain:
   kind: local                # local | openai_compatible (any /v1/chat/completions server: LM Studio, llama.cpp, your own agent)
@@ -54,5 +57,6 @@ brain:
 
 conversation:
   endpoint_silence_ms: 300
+  reply_timeout_sec: 12      # no audible reply this long after the caller stops: apologise and listen again (a stalled model)
 log:
   dir: "~/Library/Logs/ai-phone"

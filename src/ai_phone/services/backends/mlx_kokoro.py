@@ -16,15 +16,23 @@ class KokoroTTS:
         self._cancelled: set[int] = set()
         self.last_timings: dict = {}
 
-    def warmup(self) -> dict:
+    def warmup(self, wire_memory: bool = True) -> dict:
         import mlx.core as mx
         from mlx_audio.tts.utils import load_model
 
+        from ai_phone.services.backends.mlx_memory import begin_wiring, wire_resident
+
         self._mx = mx
         t = time.monotonic_ns()
+        begin_wiring(wire_memory)
         self._model = load_model(self.model_id)
+        wired = wire_resident(self._model, wire_memory)
         list(self.stream(0, 0, "Warm up."))
-        return {"warm_ms": (time.monotonic_ns() - t) / 1e6}
+        return {"warm_ms": (time.monotonic_ns() - t) / 1e6, **wired}
+
+    def keep_warm(self) -> None:
+        for _ in self.stream(-1, 0, "Hi."):  # frames are discarded: the worker only pushes frames for real requests
+            pass
 
     def _to_np(self, x) -> np.ndarray:
         return np.array(self._mx.array(x).astype(self._mx.float32)).reshape(-1)  # bf16-safe conversion

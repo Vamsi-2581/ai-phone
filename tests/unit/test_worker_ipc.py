@@ -154,3 +154,24 @@ async def test_workers_never_see_line_passwords(monkeypatch):
     assert "".join(e["text"] for e in evs if e["ev"] == "token") == "clean"
     assert os.environ.get("TELNYX_API_KEY") == "KEYabc"  # the parent keeps its own environment
     await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_idle_worker_keeps_warm_and_still_serves(tmp_path):
+    loop = asyncio.get_running_loop()
+    probe = tmp_path / "ticks"
+    ring = FrameRing(None, 400, frame_bytes=STT_IN_FRAME)
+    c = WorkerClient("stt", "ai_phone.services.backends.fake:KeepWarmProbeSTT", loop, ring, None, {},
+                     factory_args={"path": str(probe)}, keep_warm_sec=0.2)
+    await c.start()
+    try:
+        await asyncio.sleep(0.9)
+        assert probe.exists() and probe.read_text().count("tick") >= 2, "no keep-warm ticks while idle"
+        gen = c.next_gen()
+        c.send({"op": "stt.finalize", "gen": gen})  # a request after ticks is served normally
+        evs = await _collect(c, "final", gen)
+        assert evs[-1]["ev"] == "final"
+    finally:
+        await c.stop()
+        ring.close()
+        ring.unlink()

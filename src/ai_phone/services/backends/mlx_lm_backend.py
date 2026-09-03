@@ -25,19 +25,24 @@ class MlxLmLLM:
         self._snap = None
         self._cancelled: set[int] = set()
         self.last_timings: dict = {}
+        self._system = "You are a phone assistant."
 
     def _ids(self, messages: list[Message]) -> list[int]:
         out = self._tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False)
         return list(out) if not isinstance(out, str) else self._tok.encode(out)
 
-    def warmup(self, system_prompt: str = "") -> dict:
+    def warmup(self, system_prompt: str = "", wire_memory: bool = True) -> dict:
         import mlx.core as mx
         from mlx_lm import load
         from mlx_lm.models.cache import make_prompt_cache
 
+        from ai_phone.services.backends.mlx_memory import begin_wiring, wire_resident
+
         t = time.monotonic_ns()
+        begin_wiring(wire_memory)  # before the load: MLX wires buffers as they are allocated
         self._model, self._tok = load(self.model_id)
-        system = system_prompt or "You are a phone assistant."
+        wired = wire_resident(self._model, wire_memory)  # the weights stay resident through idle spells
+        system = self._system = system_prompt or "You are a phone assistant."
         a = self._ids([{"role": "system", "content": system}, {"role": "user", "content": "a"}])
         b = self._ids([{"role": "system", "content": system}, {"role": "user", "content": "b"}])
         n = 0
@@ -51,7 +56,7 @@ class MlxLmLLM:
             mx.eval(self._model(mx.array(self._prefix_ids)[None], cache=cache))
         self._snap = cache
         list(self.stream(0, [{"role": "system", "content": system}, {"role": "user", "content": "Hello?"}], 8))
-        return {"warm_ms": (time.monotonic_ns() - t) / 1e6, "prefix_tokens": float(len(self._prefix_ids))}
+        return {"warm_ms": (time.monotonic_ns() - t) / 1e6, "prefix_tokens": float(len(self._prefix_ids)), **wired}
 
     def stream(self, gen_id: int, messages: list[Message], max_tokens: int):
         from mlx_lm import stream_generate
@@ -82,6 +87,12 @@ class MlxLmLLM:
 
     def cancel(self, gen_id: int) -> None:
         self._cancelled.add(gen_id)
+
+    def keep_warm(self) -> None:
+        """One token from the cached prefix: reads every weight once, leaves last_timings alone."""
+        saved = self.last_timings
+        list(self.stream(-1, [{"role": "system", "content": self._system}, {"role": "user", "content": "Hi."}], 1))
+        self.last_timings = saved
 
 
 def make_t9() -> MlxLmLLM:

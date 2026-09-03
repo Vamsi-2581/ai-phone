@@ -136,7 +136,9 @@ class Daemon:
         F = FACTORIES["fake" if self.fake else "real"]
         personas = dict(self.cfg.personas) or {"default": PersonaConfig()}
         default_prompt = self.system_prompt_for(personas["default"])
-        stt = WorkerClient("stt", F["stt"], loop, stt_in, None, {})
+        wa = {} if self.fake else {"wire_memory": self.cfg.models.wire_memory}  # the MLX backends pin their weights
+        kw = self.cfg.models.keep_warm_sec
+        stt = WorkerClient("stt", F["stt"], loop, stt_in, None, dict(wa), keep_warm_sec=kw)
         if self.remote_brain:
             b = self.cfg.brain
             key = self.secrets.get(b.api_key_env) if b.api_key_env else None
@@ -149,8 +151,8 @@ class Daemon:
                                              "first_token_timeout_ms": b.first_token_timeout_ms, "stream_idle_timeout_ms": b.stream_idle_timeout_ms,
                                              "max_response_chars": b.max_response_chars})
         else:
-            llm = WorkerClient("llm", F["llm"][self.tier], loop, None, None, {"system_prompt": default_prompt})
-        tts = WorkerClient("tts", F["tts"], loop, None, tts_out, {})
+            llm = WorkerClient("llm", F["llm"][self.tier], loop, None, None, {"system_prompt": default_prompt, **wa}, keep_warm_sec=kw)
+        tts = WorkerClient("tts", F["tts"], loop, None, tts_out, dict(wa), keep_warm_sec=kw)
         tel: Telephony | None = None
         control: ControlServer | None = None
         started: list[WorkerClient] = []

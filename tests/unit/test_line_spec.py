@@ -100,3 +100,47 @@ def test_claim_is_held_until_the_daemon_releases_it():
 def test_trunk_without_number_or_caller_id_is_refused():
     with pytest.raises(DialError, match="neither"):
         check_caller_id(_trunk(number=None, caller_id=None))
+
+
+# ---- incoming request -> line ---------------------------------------------------------------------------
+from ai_phone.telephony.endpoint import line_for_request, request_target  # noqa: E402
+from ai_phone.telephony.policy import build_peer_set  # noqa: E402
+
+
+def _specs():
+    local = LineSpec.from_config("local", LineConfig(kind="sip", aor="sip:ai@127.0.0.1", accept_invites_from="lan"), None)
+    main = LineSpec.from_config("main", LineConfig(kind="trunk", number="+15555550123", registrar="sip:sip.example.net", user="user1234",
+                                                  password_env="AI_PHONE_LINE_MAIN_PASSWORD", accept_invites_from="registered_trunk",
+                                                  trusted_cidrs=["192.76.120.10/32", "64.16.250.10/32"]), "pw")
+    peers = {"main": build_peer_set(["192.76.120.10/32", "64.16.250.10/32"])[0], "local": build_peer_set([])[0]}
+    return [local, main], peers
+
+
+LAN_INVITE = "INVITE sip:ai@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5062\r\nFrom: <sip:192.168.0.58>;tag=1\r\nTo: <sip:ai@127.0.0.1>\r\n\r\n"
+TRUNK_INVITE = ("INVITE sip:user1234@203.0.113.11:58756;transport=TCP;ob SIP/2.0\r\nv: SIP/2.0/UDP 10.31.35.4:6000\r\n"
+                "f: \"447700900555\"<sip:447700900555@sip.example.net>;tag=x\r\nt: <sip:15555550123@192.0.2.10>\r\n\r\n")
+
+
+def test_request_target_prefers_request_uri_then_to():
+    assert request_target(LAN_INVITE) == ("ai", "127.0.0.1")
+    assert request_target(TRUNK_INVITE) == ("user1234", "203.0.113.11")
+    assert request_target("SIP/2.0 200 OK\r\nTo: \"x\" <sip:bob@[::1]:5060>;tag=1\r\n\r\n") == ("bob", "::1")
+
+
+def test_lan_invite_goes_to_the_sip_line_not_the_trunk():
+    specs, peers = _specs()
+    assert line_for_request(specs, peers, LAN_INVITE, "127.0.0.1") == "local"
+    # any address of this machine in the request URI still reaches the sip line by user
+    assert line_for_request(specs, peers, LAN_INVITE.replace("127.0.0.1", "192.168.0.58"), "192.168.0.7") == "local"
+
+
+def test_trunk_invite_matches_by_registrar_proxy_or_sip_user():
+    specs, peers = _specs()
+    assert line_for_request(specs, peers, TRUNK_INVITE, "64.16.250.10") == "main"   # from a trusted proxy
+    assert line_for_request(specs, peers, TRUNK_INVITE, "203.0.113.9") == "main"    # unknown source, but names our SIP user
+
+
+def test_unknown_request_keeps_pjsips_choice():
+    specs, peers = _specs()
+    assert line_for_request(specs, peers, "INVITE sip:nobody@example.org SIP/2.0\r\nTo: <sip:nobody@example.org>\r\n\r\n", "203.0.113.9") is None
+    assert line_for_request(specs, peers, "garbage", "203.0.113.9") is None

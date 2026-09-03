@@ -95,6 +95,75 @@ def local_uri(spec: LineSpec) -> str:
     return spec.caller_id or spec.aor
 
 
+_URI_RE = re.compile(r"sips?:(?:(?P<user>[^@\s;>]+)@)?(?P<host>\[[^\]]+\]|[^\s;:>]+)", re.I)
+_TO_RE = re.compile(r"^(?:To|t):\s*(?P<v>.*)$", re.M | re.I)
+
+
+def _user_host(fragment: str) -> tuple[str, str] | None:
+    m = _URI_RE.search(fragment)
+    return (m.group("user") or "", m.group("host").strip("[]").lower()) if m else None
+
+
+def request_target(msg: str) -> tuple[str, str] | None:
+    """(user, host) the request is addressed to: the request URI, else the To header."""
+    first = msg.split("\n", 1)[0]
+    target = _user_host(first) if first.upper().startswith(("INVITE", "OPTIONS", "MESSAGE", "SUBSCRIBE", "NOTIFY", "REFER", "INFO", "UPDATE")) else None
+    if target is None:
+        m = _TO_RE.search(msg)
+        target = _user_host(m.group("v")) if m else None
+    return target
+
+
+def line_for_request(specs: list[LineSpec], peers: dict[str, PeerSet], msg: str, source_ip: str) -> str | None:
+    """Which line an incoming request belongs to. PJSIP scores accounts by transport, domain and user, and with a
+    registered trunk next to a sip line a LAN INVITE for `sip:ai@127.0.0.1` can land on the trunk (whose policy then
+    rejects it). We look at what the request asks for and where it comes from:
+      1. a sip line whose AOR user and host match the target;
+      2. a trunk whose registrar/trusted proxies sent it, or whose SIP user the target names;
+      3. a sip line whose AOR user matches (the host may be any address of this machine).
+    None = keep PJSIP's choice."""
+    target = request_target(msg)
+    if target:
+        for s in specs:
+            if s.kind == "sip" and s.aor and (aor_user(s), (s.aor_host or "").lower()) == target:
+                return s.id
+    for s in specs:
+        if s.kind == "trunk":
+            if s.accept_invites_from == "registered_trunk" and s.id in peers and peers[s.id].contains(source_ip):
+                return s.id
+            if target and s.user and target[0] == s.user:
+                return s.id
+    if target:
+        for s in specs:
+            if s.kind == "sip" and s.aor and aor_user(s) == target[0]:
+                return s.id
+    return None
+
+
+def aor_user(spec: LineSpec) -> str:
+    return (spec.aor or "").split(":", 1)[-1].split("@", 1)[0]
+
+
+class AiEndpoint(pj.Endpoint):
+    """pjsua2 endpoint that picks the line for incoming requests with `line_for_request` (see there)."""
+
+    def __init__(self, telephony: "Telephony"):
+        super().__init__()
+        self.telephony = telephony
+
+    def onSelectAccount(self, prm) -> None:  # PJSIP thread, before onIncomingCall
+        try:
+            t = self.telephony
+            src = str(prm.rdata.srcAddress).rsplit(":", 1)[0].strip("[]")
+            line_id = line_for_request(t.lines, {i: a.peers for i, a in t.accounts.items()}, str(prm.rdata.wholeMsg), src)
+            acc = t.accounts.get(line_id) if line_id else None
+            if acc is not None and acc.getId() != prm.accountIndex:
+                log.info("incoming request for line %s (PJSIP had picked account %d)", line_id, prm.accountIndex)
+                prm.accountIndex = acc.getId()
+        except Exception as e:  # never let a parse error take the PJSIP thread down; PJSIP's own choice stands
+            log.warning("account selection failed (%s); keeping PJSIP's choice", e)
+
+
 def srtp_values(spec: LineSpec) -> tuple[int, int]:
     use = {"off": pj.PJMEDIA_SRTP_DISABLED, "optional": pj.PJMEDIA_SRTP_OPTIONAL, "required": pj.PJMEDIA_SRTP_MANDATORY}[spec.srtp]
     return use, (0 if spec.srtp == "off" else 1)
@@ -183,7 +252,7 @@ class Telephony:
 
     # ---- start --------------------------------------------------------------------------------
     def start(self) -> None:
-        ep = pj.Endpoint()
+        ep = AiEndpoint(self)
         ep.libCreate()
         ec = pj.EpConfig()
         ec.uaConfig.threadCnt = 1

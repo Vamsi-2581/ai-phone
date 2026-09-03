@@ -71,6 +71,8 @@ class RtpConfig:
 class ModelsConfig:
     tier: Literal["auto", "t9", "t4"] = "auto"
     home: str = field(default_factory=lambda: str(paths.home() / "models"))
+    wire_memory: bool = True  # keep model weights resident (macOS 15+); off = the pager may evict them while idle
+    keep_warm_sec: int = 30  # idle workers run one tiny inference this often so the pager evicts other things first; 0 = off
 
 
 @dataclass
@@ -142,6 +144,7 @@ class ConversationConfig:
     silence_hangup_sec: int = 8
     max_call_sec: int = 600
     rtp_timeout_sec: int = 10
+    reply_timeout_sec: int = 12  # no audible reply this long after the caller stops = the brain has stalled: apologise
 
 
 @dataclass

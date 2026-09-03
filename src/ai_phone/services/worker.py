@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+import time
 import traceback
 
 import numpy as np
@@ -51,7 +52,42 @@ def _drain_cancel(conn, cancelled: set[int], backend, gen: int, pending: list[di
     return gen in cancelled
 
 
-def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_name, warm_args: dict, factory_args: dict | None = None) -> None:
+def _keep_warm(kind: str, backend) -> float:
+    """One tiny inference on an idle worker. On a host that is short of memory macOS compresses whatever was used least
+    recently; a model that answers a call every few hours is exactly that, and the first turn then waits seconds for
+    page-ins (measured 9-10 s to the first transcript). Touching the weights every keep_warm_sec keeps them recent."""
+    fn = getattr(backend, "keep_warm", None)
+    if fn is None:
+        return 0.0
+    t = time.monotonic_ns()
+    try:
+        fn()
+    except Exception as e:  # a failed keep-warm is not a failed worker
+        print(f"[{kind}-worker] keep_warm failed: {e!r}", file=sys.stderr, flush=True)
+        return 0.0
+    _trim_memory()
+    took = (time.monotonic_ns() - t) / 1e9
+    if took > 1.0 or os.environ.get("AI_PHONE_DEBUG_RX"):
+        print(f"[{kind}-worker] keep_warm {took * 1e3:.0f} ms", file=sys.stderr, flush=True)
+    return took
+
+
+def _trim_memory(first: bool = False) -> None:
+    """Hand MLX's cached scratch buffers back to the OS. After warm-up the STT worker still holds the float32 copy of
+    its checkpoint (2.5 GB) in that cache and the LLM worker its warm-up KV scratch; on a 24 GB host that is the
+    difference between the models staying resident and the pager compressing them between calls. Idle workers must
+    hold the weights and little else, so we cap the cache and clear it after every request."""
+    try:
+        import mlx.core as mx
+    except Exception:  # Linux backends: nothing to trim
+        return
+    if first:
+        mx.set_cache_limit(64 * 1024 * 1024)
+    mx.clear_cache()
+
+
+def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_name, warm_args: dict, factory_args: dict | None = None,
+               keep_warm_sec: float = 0.0) -> None:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -62,12 +98,22 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
     aout = FrameRing.attach(audio_out_name, frame_bytes=TTS_OUT_FRAME if kind == "tts" else 640) if audio_out_name else None
     cancelled: set[int] = set()
     pending: list[dict] = []  # messages read during a mid-stream cancel check, processed next
+    interval = float(keep_warm_sec)  # current keep-warm cadence (backs off while ticks are slow)
     try:
         backend = _load(backend_factory, factory_args)
         timings = backend.warmup(**warm_args) if warm_args else backend.warmup()
+        _trim_memory(first=True)
         ipc.send(conn, {"ev": "ready", "timings": timings})
         while True:
-            msg = pending.pop(0) if pending else ipc.recv(conn)
+            if pending:
+                msg = pending.pop(0)
+            else:
+                while keep_warm_sec > 0 and not conn.poll(interval):
+                    took = _keep_warm(kind, backend)  # idle: touch the model so the pager evicts something else first
+                    # a tick that took seconds means the host is thrashing; a request arriving mid-tick waits for it,
+                    # so back off (up to 10 min) and return to the configured cadence once ticks are quick again
+                    interval = min(interval * 2, 600.0) if took > 1.0 else keep_warm_sec
+                msg = ipc.recv(conn)
             op = msg.get("op")
             if op == "shutdown":
                 break
@@ -96,6 +142,7 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                     backend.push(gen, np.frombuffer(tail, dtype="<i2").astype(np.float32) / 32768.0)
                 text, t = backend.finalize(gen)
                 ipc.send(conn, {"ev": "final", "gen": gen, "text": text, "timings": t})
+                _trim_memory()
             elif op == "llm.generate":
                 try:
                     for tok in backend.stream(gen, msg["messages"], msg["max_tokens"]):
@@ -106,6 +153,7 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                     ipc.send(conn, {"ev": "brain_error", "gen": gen, "kind": e.kind})
                     continue
                 ipc.send(conn, {"ev": "done", "gen": gen, "timings": getattr(backend, "last_timings", {})})
+                _trim_memory()
             elif op == "tts.synth":
                 n = 0
                 for frame in backend.stream(gen, msg["seq"], msg["text"]):
@@ -118,6 +166,7 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 if n % 5:
                     ipc.send(conn, {"ev": "chunk", "gen": gen, "seq": msg["seq"], "nframes": n % 5})
                 ipc.send(conn, {"ev": "done", "gen": gen, "seq": msg["seq"], "timings": getattr(backend, "last_timings", {})})
+                _trim_memory()
     except Exception as e:  # report, then exit non-zero so the supervisor restarts us
         ipc.send(conn, {"ev": "error", "message": f"{e}\n{traceback.format_exc()}"})
         raise

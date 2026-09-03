@@ -68,6 +68,34 @@ class FlakyLLM(FakeLLM):
         yield from super().stream(gen_id, messages, max_tokens)
 
 
+class StallLLM(FakeLLM):
+    """Says nothing for `stall_s` seconds (a paged-out or hung model), then replies normally unless cancelled."""
+
+    def __init__(self, stall_s: str = "3"):
+        super().__init__()
+        self._stall = float(stall_s)
+
+    def stream(self, gen_id, messages, max_tokens):
+        end = time.monotonic() + self._stall
+        while time.monotonic() < end:
+            if gen_id in self._cancelled:
+                return
+            time.sleep(0.05)
+        yield from super().stream(gen_id, messages, max_tokens)
+
+
+class KeepWarmProbeSTT(FakeSTT):
+    """Counts keep_warm ticks into a file the test can read (the worker runs in another process)."""
+
+    def __init__(self, path: str = ""):
+        super().__init__()
+        self._path = path
+
+    def keep_warm(self):
+        with open(self._path, "a") as f:
+            f.write("tick\n")
+
+
 class FakeTTS:
     def __init__(self):
         self._cancelled: set[int] = set()

@@ -130,6 +130,13 @@ class TurnController:
             self.last_activity_ns = now
         elif self.state == "LISTENING" and self._prompted and idle_s >= self.cfg.silence_hangup_sec:
             self.request_end("silence")
+        t = self.timer
+        if self.state == "THINKING" and t is not None and t.t0_end is not None \
+                and (now - t.t0_end) / 1e9 >= self.cfg.reply_timeout_sec:
+            # STT, the model or TTS has gone quiet for longer than any caller waits: same recovery as a brain error
+            _log.warning("no reply %ss after the caller finished (stt=%s llm=%s); treating the brain as stalled",
+                         self.cfg.reply_timeout_sec, t.t1 is not None, t.t2 is not None)
+            self._brain_error(now, "timeout")
         elapsed_s = (now - self._start_ns) / 1e9
         warn_at = self.cfg.max_call_sec - (30 if self.cfg.max_call_sec > 30 else 0.5)
         if not self._warned and elapsed_s >= warn_at:
