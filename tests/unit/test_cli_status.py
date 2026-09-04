@@ -16,6 +16,13 @@ def test_render_status_rows():
     assert "main" in out and "registered" in out and "+442079460000" in out and "agents" in out and "brain: local" in out
 
 
+def test_render_status_tolerates_a_partial_state_file():
+    """A state file written by an older version (or hand-edited) prints placeholders; status never aborts."""
+    partial = {"written_at": 1.0, "lines": {"main": {"id": "main"}}, "active_call": {"call_id": "9"}}
+    out = render_status(partial, alive=True)
+    assert "main" in out and "active call: ? on ? with ?" in out
+
+
 def test_status_command_reads_state_file(tmp_path: Path, monkeypatch, capsys):
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
     (tmp_path / "state.json").write_text(json.dumps(STATE))

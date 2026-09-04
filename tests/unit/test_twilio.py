@@ -207,6 +207,25 @@ def test_domain_name_collision_gets_one_fresh_suffix(tmp_path: Path):
     assert next(s["planned"]["domain_name"] for s in j.doc["steps"] if s["name"] == "domain") == seen[1] == r.line["registrar"][4:]
 
 
+def test_server_error_mentioning_already_is_not_a_name_collision(tmp_path: Path):
+    """Only a 4xx saying the name is taken earns the fresh suffix. A 5xx (or a transport error) is retryable in
+    place; renaming after one would orphan the domain the failed request may have created."""
+    c = Carrier()
+    seen = []
+
+    def handler(req):
+        if req.method == "POST" and req.url.path.endswith("/SIP/Domains.json"):
+            seen.append(dict(urllib.parse.parse_qsl(req.content.decode()))["DomainName"])
+            return httpx.Response(503, json={"message": "that domain is already being provisioned; try again"})
+        return c(req)
+
+    p = TwilioProvider(key=SID, secret="tok", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    j = Journal.open(tmp_path, "main", "twilio")
+    with pytest.raises(ProviderError) as ei:
+        p.provision(j, p.search_numbers("GB", None, 1)[0], "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
+    assert ei.value.status == 503 and ei.value.retryable and len(seen) == 1  # not renamed, not re-POSTed
+
+
 def test_trial_account_gets_an_inbound_only_line_and_resume_adds_outbound_after_upgrade(tmp_path: Path):
     carrier = Carrier(trial=True)
     p = _provider(carrier)

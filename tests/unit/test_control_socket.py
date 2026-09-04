@@ -131,5 +131,8 @@ async def test_non_object_and_malformed_call_payloads_get_an_error_reply(sock_di
         assert "to" in (await _raw(sock, b'{"cmd": "call"}\n'))["error"]
         assert "timeout_sec" in (await _raw(sock, b'{"cmd": "call", "to": "+15550000000", "timeout_sec": "soon"}\n'))["error"]
         assert (await _raw(sock, b'{"cmd": "call", "to": "", "timeout_sec": 5}\n'))["ok"] is False
+        # 'line' and 'persona' reach a dict lookup in the daemon: an unhashable value must not escape as a task exception
+        assert "line" in (await _raw(sock, b'{"cmd": "call", "to": "+15550000000", "line": ["a"]}\n'))["error"]
+        assert "persona" in (await _raw(sock, b'{"cmd": "call", "to": "+15550000000", "persona": {"a": 1}}\n'))["error"]
     finally:
         await srv.stop()

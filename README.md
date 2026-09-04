@@ -57,7 +57,8 @@ ai-phone lines forward telnyx --when no-answer --from +447700900123
 ai-phone lines add sip --id agents --user agents --host home.example.org --trusted 203.0.113.7
 ai-phone call sip:agents@friend.example.org --line agents
 
-# Outbound from the agent's number (or from your verified mobile number)
+# Outbound from the agent's number (or from your verified mobile number). With no --line, a number goes out on the
+# first registered trunk and a sip: address on the first sip line; with two trunks configured, name the one you mean.
 ai-phone call +447700900123
 ai-phone status
 
@@ -65,7 +66,7 @@ ai-phone status
 #   brain: {kind: openai_compatible, base_url: "http://127.0.0.1:1234/v1", model: "…"}
 ```
 
-During a call the daemon opens no network connection except SIP/RTP to the peer and, only if you configured one, HTTP(S) to that brain endpoint. Buying a number talks to the carrier once, from the `lines` command, and the daemon never loads the carrier code. Provisioning is journaled: `ai-phone lines resume` picks up where a crash left off, `ai-phone lines remove` deletes what the carrier created and, if a deletion fails, lists exactly what is left for you to remove in the portal. Configuration applies at restart. The NAT and transport checks run before calling it done are in [docs/nat-checklist.md](docs/nat-checklist.md); the 24 h registration soak is `scripts/soak.sh`.
+During a call the daemon opens no network connection except SIP/RTP to the peer and, only if you configured one, HTTP(S) to that brain endpoint. Buying a number talks to the carrier once, from the `lines` command, and the daemon never loads the carrier code. Provisioning is journaled: `ai-phone lines resume` picks up where a crash left off, `ai-phone lines remove` deletes what the carrier created and lists exactly what is left for you to remove in the portal if a deletion fails — or, if the journal recording what was created has gone missing, refuses rather than delete the local record of a number that is still billing. Configuration applies at restart. The NAT and transport checks run before calling it done are in [docs/nat-checklist.md](docs/nat-checklist.md); the 24 h registration soak is `scripts/soak.sh`.
 
 ## License
 

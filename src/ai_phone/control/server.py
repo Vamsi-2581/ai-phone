@@ -72,6 +72,9 @@ class ControlServer:
                         or not isinstance(timeout, (int, float)) or not 0 < timeout <= 3600:
                     await send({"ok": False, "error": "call needs a non-empty 'to' and a 'timeout_sec' between 0 and 3600"})
                     return
+                if any(msg.get(k) is not None and not isinstance(msg.get(k), str) for k in ("line", "persona")):
+                    await send({"ok": False, "error": "'line' and 'persona' must be strings"})
+                    return  # the daemon looks both up in a dict; an unhashable value would escape as an unhandled task exception
                 self._call_active = True
                 try:
                     await self.handler(msg, send)

@@ -105,7 +105,10 @@ class TwilioProvider:
                     rec = self._call("POST", self._acct("/SIP/Domains.json"),
                                      data={"DomainName": domain_name, "FriendlyName": name, "SipRegistration": "true", "VoiceMethod": "POST"})
                 except ProviderError as err:
-                    if attempt == 1 or "already" not in str(err).lower():
+                    # A name collision is a 4xx that says so. A 5xx or a transport error is not one (`retryable` is
+                    # exactly those): it is retryable under the *same* name, and renaming after one would orphan the
+                    # domain the failed request may still have created, since the journal only records the second.
+                    if attempt == 1 or err.retryable or "already" not in str(err).lower():
                         raise
                     domain_name = f"ai-phone-{line_id}-{secrets.token_hex(3)}.sip.twilio.com"  # someone else has that name: one fresh suffix
                     journal.doc["steps"][-1]["planned"]["domain_name"] = domain_name  # the journal always names what will be created

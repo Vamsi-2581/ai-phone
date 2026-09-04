@@ -5,7 +5,7 @@ Run on the user's own network, with the daemon registered to a real carrier line
 | Check | How to run | Expected | Result (date) |
 |---|---|---|---|
 | UDP registration held 1 h | line `transport: udp`, `scripts/soak.sh 1` | `SOAK PASS`, 0 unexpected drops | |
-| TCP registration held 1 h | line `transport: tcp`, restart, `scripts/soak.sh 1` | `SOAK PASS`; CRLF keepalives every `sip.tcp_keepalive_sec` (30 s) in a `tcpdump -i en0 port 5060` | |
+| TCP registration held 1 h | line `transport: tcp`, restart, `scripts/soak.sh 1` | `SOAK PASS`; CRLF keepalives every `sip.tcp_keepalive_sec` (30 s) in a `tcpdump -i <iface> port 5060` (pick the interface carrying the registration: `tcpdump -D` lists them; `en0` on a typical Mac, often `eth0`/`wlan0` on Linux) | |
 | TLS registration held 1 h | line `transport: tls` (registrar `sip:…;transport=tls`, port 5061), restart, `scripts/soak.sh 1` | `SOAK PASS`; certificate verified against the certifi bundle (no `verifyServer` warnings in the log) | |
 | SIP ALG on the home router | register over UDP; inspect the daemon log for a Contact rewritten by the router (`contactRewriteUse` events) or one-way audio | if the router rewrites SIP, switch the line to `transport: tcp` or `tls` and re-check | |
 | IP change (Wi-Fi → Ethernet, router reboot) | switch networks while registered | the line shows `degraded`; a restart re-registers (automatic handling is Milestone 4) | |

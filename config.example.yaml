@@ -1,5 +1,9 @@
 # ai-phone configuration (copy to ~/.ai-phone/config.yaml, chmod 600). Full schema: architecture.md §8 and §14a.
-# Lines are usually added for you by `ai-phone lines add …`; the entries below show every field.
+# Lines are usually added for you by `ai-phone lines add …`. This is an excerpt, not the whole schema: it shows the
+# fields you normally set, and omits the ones that have a working default. Notably absent from the line entries below:
+# transport, register_via_proxy, outbound_proxy, register_expiry_sec, srtp, diverted_from, verified_caller_ids and the
+# provider block `lines add` writes; also models.home, the brain timeouts, and most of conversation: and log:.
+# §14a.1 lists every line field with its default.
 sip:
   bind: {address: 0.0.0.0, udp_port: 5060, tcp_port: 5060, tls_port: 5061}
   tls: {cert_file: null, key_file: null, ca_file: null}   # ca_file null = the certifi bundle

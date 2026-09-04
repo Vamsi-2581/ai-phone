@@ -54,6 +54,58 @@ def test_remove_releases_and_deletes_secret(home: Path):
     assert not (home / "lines" / "main.journal.json").exists()
 
 
+def test_remove_refuses_to_release_without_the_journal(home: Path, capsys):
+    """A lost journal releases nothing at the carrier, so removing the line would delete the only local record
+    of resources that are still billing. Refuse, name the ids from the config, and keep everything local."""
+    main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"])
+    (home / "lines" / "main.journal.json").unlink()
+    assert main(["lines", "remove", "main", "--key-env", "FAKE_KEY", "--yes"]) == 3
+    out = capsys.readouterr().out
+    assert "journal" in out and "number_id=number-1" in out and "--local-only" in out
+    assert "main" in load_config(home / "config.yaml").lines
+    assert "AI_PHONE_LINE_MAIN_PASSWORD" in load_secrets(home / "secrets.env")
+    assert json.loads((home / "fake-carrier.json").read_text())["carrier"]["number"]["name"] == "+442079460000"
+    assert main(["lines", "remove", "main", "--local-only", "--yes"]) == 0  # the way out, with the ids to release by hand
+    assert "number_id=number-1" in capsys.readouterr().out
+
+
+def test_remove_refuses_when_the_journal_lost_its_steps(home: Path, capsys):
+    """Same defect from the other direction: a journal that no longer accounts for the ids the config recorded."""
+    main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"])
+    j = home / "lines" / "main.journal.json"
+    j.write_text(json.dumps({**json.loads(j.read_text()), "steps": []}))
+    assert main(["lines", "remove", "main", "--key-env", "FAKE_KEY", "--yes"]) == 3
+    assert "number_id=number-1" in capsys.readouterr().out
+    assert "main" in load_config(home / "config.yaml").lines
+
+
+def test_remove_refuses_after_a_failed_resume_recreated_the_journal(home: Path, capsys):
+    """`Journal.open` writes the file it invents, so a failed `lines resume` leaves an empty journal behind:
+    the file existing must not be read as 'a release here would delete something'."""
+    main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"])
+    (home / "lines" / "main.journal.json").unlink()
+    assert main(["lines", "resume", "main", "--key-env", "FAKE_KEY"]) == 3
+    assert (home / "lines" / "main.journal.json").exists()  # invented by the failed resume, no steps in it
+    assert main(["lines", "remove", "main", "--key-env", "FAKE_KEY", "--yes"]) == 3
+    assert "records no carrier steps" in capsys.readouterr().out
+    assert "main" in load_config(home / "config.yaml").lines
+
+
+def test_remove_refuses_when_neither_journal_nor_config_kept_the_ids(home: Path, capsys):
+    """The narrow case where nothing local knows the ids: still refuse, because the carrier may hold them."""
+    from ai_phone.lines.config_writer import read_raw, write_raw
+    main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"])
+    raw = read_raw(home / "config.yaml")
+    raw["lines"]["main"]["provider"]["resources"] = {}  # a hand-edited config, or `_commit`'s failed-state fallback
+    write_raw(home / "config.yaml", raw)
+    j = home / "lines" / "main.journal.json"
+    j.write_text(json.dumps({**json.loads(j.read_text()), "steps": []}))
+    assert main(["lines", "remove", "main", "--key-env", "FAKE_KEY", "--yes"]) == 3
+    assert "find them by +442079460000" in capsys.readouterr().out
+    assert "main" in load_config(home / "config.yaml").lines
+    assert json.loads((home / "fake-carrier.json").read_text())["carrier"]["number"]["name"] == "+442079460000"
+
+
 def test_remove_without_key_needs_local_only(home: Path, capsys):
     main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"])
     assert main(["lines", "remove", "main", "--yes"]) == 3

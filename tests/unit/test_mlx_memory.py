@@ -30,6 +30,6 @@ def test_wires_model_plus_headroom_capped_by_device():
     tree = {"a": mx.zeros((1024,), dtype=mx.float32)}
     out = mlx_memory.wire_resident(tree, enabled=True)
     assert out["model_bytes"] == 4096
-    cap = int(mx.device_info().get("max_recommended_working_set_size", 0))
+    cap = mlx_memory._device_cap()  # same namespace probe as the code under test: mx.device_info moved to mx.metal once
     expected = 4096 + mlx_memory.HEADROOM_BYTES
     assert out["wired_limit_bytes"] in (expected, min(expected, cap), 0)  # 0 only where wiring is unsupported

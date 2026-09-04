@@ -314,8 +314,8 @@ class Daemon:
 
     @staticmethod
     def _default_line_for(target: str, specs: dict, tel) -> str | None:
-        """No --line given: a sip: address goes out on the first sip line (falling back to any line);
-        a phone number goes out on the first registered trunk line."""
+        """No --line given: a sip: address goes out on the first sip line, or nowhere;
+        a phone number goes out on the first registered trunk line that has a dial domain."""
         if target.startswith("sip:"):
             sip_lines = [lid for lid, s in specs.items() if s.kind == "sip"]
             return sip_lines[0] if sip_lines else None  # never a trunk by accident: say --line if that is really wanted

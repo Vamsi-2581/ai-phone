@@ -119,9 +119,11 @@ async def test_stalled_brain_gets_the_apology_not_silence():
         await _cleanup(stop, runner, (rx, tx, stt_in, tts_out), (stt, llm, tts))
 
 
+@pytest.mark.parametrize("kind", ["stt", "llm", "tts"])
 @pytest.mark.asyncio
-async def test_worker_death_mid_call_plays_the_goodbye_then_hangs_up():
-    """A crashed model worker must not leave the caller in silence: the cached goodbye plays, then the BYE."""
+async def test_worker_death_mid_call_plays_the_goodbye_then_hangs_up(kind):
+    """A crashed model worker must not leave the caller in silence: the cached goodbye plays, then the BYE.
+    The goodbye is cached audio pushed straight to the tx ring, so it plays whichever worker died - the TTS one too."""
     loop = asyncio.get_running_loop()
     cfg = ConversationConfig(silence_prompt_sec=100, silence_hangup_sec=100)
     rx, tx = FrameRing(None, 100), FrameRing(None, 400)
@@ -138,9 +140,10 @@ async def test_worker_death_mid_call_plays_the_goodbye_then_hangs_up():
     try:
         await asyncio.sleep(0.1)
         assert tc.state == "LISTENING"
-        llm.events.put_nowait({"ev": "error", "kind": "llm", "message": "boom"})  # what the client emits on pipe EOF
+        dead = {"stt": stt, "llm": llm, "tts": tts}[kind]
+        dead.events.put_nowait({"ev": "error", "kind": kind, "message": "boom"})  # what the client emits on pipe EOF
         await asyncio.sleep(0.1)
-        assert tc.state == "ENDING_DRAIN" and tc.end_reason == "worker error: llm"
+        assert tc.state == "ENDING_DRAIN" and tc.end_reason == f"worker error: {kind}"
         assert tx.available() == len(goodbye), "the goodbye was not queued"
         while tx.pop():  # PJSIP drains the ring
             pass

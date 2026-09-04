@@ -261,19 +261,41 @@ def cmd_resume(a) -> int:
     return _commit(journal, _config_path(a), a.line_id, result, ln.get("persona") or _planned(journal, "target", "persona") or "default", env_name)
 
 
+def _recorded_resources(ln: dict) -> dict:
+    """The carrier ids `_commit` copied into the config; the journal is authoritative, this is what outlives losing it."""
+    return dict((ln.get("provider") or {}).get("resources") or {})
+
+
+def _ids(res: dict, ln: dict, line_id: str) -> str:
+    return ", ".join(f"{k}={v}" for k, v in res.items()) or f"no ids were kept here; find them by {ln.get('number') or line_id}"
+
+
 def cmd_remove(a) -> int:
     config_path = _config_path(a)
     pname, ln = _journal_for(a.line_id, a)
     if not ln and not pname:
         _fail(f"no line {a.line_id}")
+    jpath = paths.lines_dir() / f"{a.line_id}.journal.json"
     if pname and not a.local_only:
+        # A release with no resource ids reports success without deleting anything, which would drop the local record
+        # while the carrier keeps billing. An empty journal is as good as none: Journal.open() writes the one it
+        # invents, so a failed `lines resume` leaves a stepless file behind, and provisioning's first act is a step.
+        journal = Journal.open(paths.lines_dir(), a.line_id, pname) if jpath.exists() else None
+        journalled = journal.resources() if journal and journal.doc["steps"] else None
+        stranded = {k: v for k, v in _recorded_resources(ln).items() if k not in (journalled or {})}
+        if journalled is None or stranded:
+            why = "is missing" if journal is None else "records no carrier steps" if journalled is None else "is incomplete"
+            _say(f"error: the provisioning journal for {a.line_id} {why} ({jpath}), "
+                 f"so releasing here would leave carrier resources live.\n"
+                 f"Release them on your {pname} account first ({_ids(stranded, ln, a.line_id)}), "
+                 f"then run `ai-phone lines remove {a.line_id} --local-only`.")
+            return EXIT_ERROR
         if not a.key_env:
             _say(f"line {a.line_id} was provisioned on {pname}. Pass --key-env (and --secret-env for twilio) to release its carrier resources, "
                  f"or --local-only to remove it from this machine and keep them.")
             return EXIT_ERROR
         a.provider = pname
         provider = _provider(a)
-        journal = Journal.open(paths.lines_dir(), a.line_id, pname)
         number = ln.get("number", a.line_id)
         if not _ask(f"Release {number} from your {pname} account? This cannot be undone.", a.yes):
             return EXIT_ERROR
@@ -284,9 +306,9 @@ def cmd_remove(a) -> int:
             return EXIT_ERROR
         journal.delete()
     elif pname and a.local_only:
-        res = Journal.open(paths.lines_dir(), a.line_id, pname).resources()
-        _say("Kept in your carrier account (release them in the portal): " + ", ".join(f"{k}={v}" for k, v in res.items()))
-        (paths.lines_dir() / f"{a.line_id}.journal.json").unlink(missing_ok=True)
+        res = (Journal.open(paths.lines_dir(), a.line_id, pname).resources() if jpath.exists() else {}) or _recorded_resources(ln)
+        _say("Kept in your carrier account (release them in the portal): " + _ids(res, ln, a.line_id))
+        jpath.unlink(missing_ok=True)
     remove_line(config_path, a.line_id)
     env_name = ln.get("password_env") or line_password_env(a.line_id)
     if env_name.startswith("AI_PHONE_LINE_"):
