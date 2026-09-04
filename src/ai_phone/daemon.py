@@ -19,7 +19,7 @@ from ai_phone.pipeline.timing import TurnLog
 from ai_phone.pipeline.turn import TurnController
 from ai_phone.pipeline.vad import Endpointer, EnergyVad, SileroVad
 from ai_phone.secrets import load_secrets, redact
-from ai_phone.services.client import WorkerClient
+from ai_phone.services.client import WorkerClient, is_secret_env
 from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, untag_frame
 from ai_phone.telephony import events as ev
 from ai_phone.telephony.endpoint import BusyError, DialError, LineSpec, Telephony
@@ -47,6 +47,7 @@ class Daemon:
         self.secrets = load_secrets(paths.secrets_path())
         self.remote_brain = cfg.brain.kind == "openai_compatible"
         self._take_secrets_from_environment()
+        self._drop_secret_environment()
         self.line_status: dict[str, LineStatus] = {}
         self.state_file = StateFile(paths.state_path())
         self.active_call: dict | None = None
@@ -67,6 +68,14 @@ class Daemon:
             value = os.environ.pop(name, None)
             if value and name not in self.secrets:
                 self.secrets[name] = value
+
+    def _drop_secret_environment(self) -> None:
+        """Every other secret-looking variable the shell exported (unrelated API keys, tokens) leaves the daemon's
+        environment for good. The daemon needs none of them, and every child it will ever spawn inherits what is
+        left: the model workers, and the multiprocessing resource tracker that appears with the first shared ring,
+        before any worker's own scrub runs (seen on the gate: the tracker held a shell's ELEVENLABS_API_KEY)."""
+        for name in [n for n in os.environ if is_secret_env(n)]:
+            del os.environ[name]
 
     # ---- personas and cached phrases ------------------------------------------------------------
     def system_prompt_for(self, persona: PersonaConfig) -> str:
