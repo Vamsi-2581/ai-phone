@@ -7,9 +7,11 @@ def test_keepalive_setter_round_trips():
     from ai_phone.telephony.pj import pj
     before = pj.ai_phone_get_keepalive()  # process-wide: another test's endpoint may already have changed it
     assert all(isinstance(v, int) for v in before)
-    pj.ai_phone_set_keepalive(45, 46)
-    assert pj.ai_phone_get_keepalive() == (45, 46)
-    pj.ai_phone_set_keepalive(*before)
+    try:
+        pj.ai_phone_set_keepalive(45, 46)
+        assert pj.ai_phone_get_keepalive() == (45, 46)
+    finally:
+        pj.ai_phone_set_keepalive(*before)  # process-wide: never leave a failed assertion's values behind
     assert pj.ai_phone_get_keepalive() == before
 
 

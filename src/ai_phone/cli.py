@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import asyncio
 import logging
 from pathlib import Path
@@ -34,5 +35,8 @@ def main(argv=None) -> int:
         return 0
     try:
         return int(a.func(a))
-    except SystemExit as e:  # subcommands use SystemExit(<code>) for fatal user errors
-        return int(e.code or 0)
+    except SystemExit as e:  # subcommands use SystemExit(<code>) for fatal user errors and SystemExit("message") for a bare one
+        if e.code is None or isinstance(e.code, int):
+            return e.code or 0
+        print(str(e.code), file=sys.stderr)
+        return 2

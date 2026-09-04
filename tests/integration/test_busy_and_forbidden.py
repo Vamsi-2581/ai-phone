@@ -53,7 +53,7 @@ def test_second_call_gets_486_and_public_source_gets_403():
         peers.append(p1)
         first = loop.run_until_complete(_next(events, ev.IncomingCall))
         assert first.source_ip == "127.0.0.1"
-        p2 = _peer(5064)
+        p2 = _peer(PEER_PORT + 2)
         peers.append(p2)
         rej = loop.run_until_complete(_next(events, ev.CallRejected))
         assert rej.code == 486, f"second caller should get 486, got {rej.code}"
@@ -66,7 +66,7 @@ def test_second_call_gets_486_and_public_source_gets_403():
         acc.spec.accept_invites_from = "trusted"
         acc.spec.trusted_peers = ["203.0.113.9"]
         acc.peers = build_peer_set(acc.spec.trusted_peers)[0]
-        p3 = _peer(5066)
+        p3 = _peer(PEER_PORT + 4)
         peers.append(p3)
         rej = loop.run_until_complete(_next(events, ev.CallRejected))
         assert rej.code == 403 and rej.line_id == "main", f"disallowed source should get 403 on line main, got {rej}"

@@ -63,6 +63,10 @@ def _kill_group(d):
         os.killpg(os.getpgid(d.pid), signal.SIGKILL)
     except ProcessLookupError:
         pass
+    try:
+        d.wait(timeout=5)  # reap; a killed group still needs its parent to collect it
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _stop_daemon(d):
@@ -97,6 +101,10 @@ def _call_and_wait(d, lines: queue.Queue, home: Path, turns: int = 1):
             peer.wait(timeout=10)
         except Exception:
             peer.terminate()
+            try:
+                peer.wait(timeout=5)
+            except Exception:
+                peer.kill()
     time.sleep(1.0)
     recs = [json.loads(l) for l in turns_path.read_text().splitlines() if l.strip()] if turns_path.exists() else []
     complete = [r for r in recs if not r.get("incomplete")]

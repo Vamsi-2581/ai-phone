@@ -18,7 +18,7 @@ def render_status(state: dict, alive: bool) -> str:
     rows.append(f"{'line':12s} {'kind':5s} {'state':12s} {'address':28s} registrar / error")
     for lid, l in (state.get("lines") or {}).items():
         extra = l.get("last_error") or (l.get("registrar") or "")
-        rows.append(f"{lid:12s} {l['kind']:5s} {l['state']:12s} {l['address']:28s} {extra}")
+        rows.append(f"{lid:12s} {l.get('kind', '?'):5s} {l.get('state', '?'):12s} {l.get('address', ''):28s} {extra}")
     ac = state.get("active_call")
     rows.append(f"active call: {ac['direction']} on {ac['line_id']} with {ac['remote']}" if ac else "active call: none")
     return "\n".join(rows)

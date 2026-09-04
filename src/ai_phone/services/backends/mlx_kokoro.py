@@ -31,8 +31,10 @@ class KokoroTTS:
         return {"warm_ms": (time.monotonic_ns() - t) / 1e6, **wired}
 
     def keep_warm(self) -> None:
+        saved = self.last_timings
         for _ in self.stream(-1, 0, "Hi."):  # frames are discarded: the worker only pushes frames for real requests
             pass
+        self.last_timings = saved
 
     def _to_np(self, x) -> np.ndarray:
         return np.array(self._mx.array(x).astype(self._mx.float32)).reshape(-1)  # bf16-safe conversion

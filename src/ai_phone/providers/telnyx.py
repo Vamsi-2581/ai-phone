@@ -203,7 +203,7 @@ class TelnyxProvider:
         try:
             self._call("POST", f"/verified_numbers/{step.handle['e164']}/actions/verify", json={"verification_code": code or ""})
         except ProviderError as e:
-            if "400" in str(e):
+            if e.status == 400:
                 return False
             raise
         return True

@@ -412,7 +412,13 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
 
 def load_config(path: Path, env: Mapping[str, str] | None = None) -> Config:
     """`env` is where line passwords are looked up for the warnings (the daemon passes os.environ merged with secrets.env)."""
-    raw = yaml.safe_load(Path(path).expanduser().read_text()) or {}
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise ConfigError(f"config: {p} does not exist")
+    try:
+        raw = yaml.safe_load(p.read_text()) or {}
+    except yaml.YAMLError as e:
+        raise ConfigError(f"config: {p} is not valid YAML: {e}") from None
     if not isinstance(raw, dict):
         raise ConfigError("config: expected a mapping at the top level")
     raw, warnings = _migrate_legacy(raw)

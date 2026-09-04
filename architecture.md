@@ -66,8 +66,8 @@ PJSIP → Python callbacks are SWIG *director* calls; the extension **must be bu
 
 ### 2.3 Startup sequence **[D]**
 
-1. Parse and validate config (§8). Refuse to start on any error; print the field and the fix.
-2. Verify model weights and the spaCy G2P model are present on disk (registry manifest, §7.5). Refuse to start if anything is missing; `doctor` explains how to fetch. No network here or later, other than SIP/RTP to the peer and, if configured, the brain endpoint (§14a).
+1. Parse and validate config (§8). Refuse to start on any error; print the field and the fix. A trunk whose password variable is not set is not a config error but a secrets one: that line is skipped with an error in the log and in `status`, and the other lines start.
+2. Verify model weights and the spaCy G2P model are present on disk (registry manifest, §7.5). Refuse to start if anything is missing; `doctor` explains how to fetch. No network here or later, other than SIP/RTP to the peer and, if configured, the brain endpoint (§14a) — plus, at start only, the STUN query and the DNS lookups for registrars and trusted peers (§14a.5), which a firewall rule set must allow.
 3. Set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` in the environment of every process.
 4. Spawn the three workers. Each loads its model and replies `ready` with warm-up timings. Warm-up = one real inference each (a 1 s silent-plus-tone buffer for STT, a 16-token generation for the LLM with the system prompt as prefix so the prompt cache is primed, one short sentence for TTS).
 5. Create the PJSIP endpoint: `libCreate` → `libInit(EpConfig)` → transports → `audDevManager().setNullDev()` → codec priorities → `libStart`.

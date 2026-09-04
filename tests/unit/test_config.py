@@ -200,3 +200,14 @@ def test_bad_provider_field_names_the_field(tmp_path: Path):
     bad = V2.replace('    caller_id: "+442079460000"\n', '    caller_id: "+442079460000"\n    provider: {name: telnyx, state: nope, resources: {}}\n', 1)
     with pytest.raises(ConfigError, match="provider.state"):
         _load(tmp_path, bad)
+
+
+def test_bad_yaml_and_missing_file_are_config_errors(tmp_path):
+    import pytest
+    from ai_phone.config import ConfigError, load_config
+    bad = tmp_path / "config.yaml"
+    bad.write_text("lines: [unclosed\n")
+    with pytest.raises(ConfigError, match="not valid YAML"):
+        load_config(bad)
+    with pytest.raises(ConfigError, match="does not exist"):
+        load_config(tmp_path / "nope.yaml")

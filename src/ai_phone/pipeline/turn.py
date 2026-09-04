@@ -338,7 +338,7 @@ class TurnController:
         self.tts_out.flush()
         self._new_gen()
         self.end_reason = f"worker error: {kind}"
-        if self.goodbye_frames and kind != "tts":  # the goodbye is cached audio: it needs no worker, only the tx ring
+        if self.goodbye_frames:  # the goodbye is cached audio: it needs no worker, only the tx ring
             self._queue_cached(self.goodbye_frames)
             self.state = "ENDING_DRAIN"
             self._drain_deadline_ns = now + int(3e9)

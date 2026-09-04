@@ -181,3 +181,18 @@ def test_pick_number_stops_cleanly_on_a_non_numeric_answer(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         cli_lines._pick_number(Provider(), args)
     assert "from 1 to 1" in capsys.readouterr().out
+
+
+def test_bare_system_exit_message_is_printed_not_raised(home: Path, capsys, monkeypatch):
+    """`--key-env` names a variable that is not set: one line on stderr and exit 2, never a traceback."""
+    monkeypatch.delenv("NOPE_KEY", raising=False)
+    rc = main(["lines", "--config", str(home / "config.yaml"), "add", "telnyx", "--key-env", "NOPE_KEY", "--yes"])
+    assert rc == 2
+    assert "NOPE_KEY" in capsys.readouterr().err
+
+
+def test_missing_config_is_one_line(home: Path, capsys):
+    rc = main(["lines", "--config", str(home / "absent.yaml"), "list"])
+    assert rc != 0
+    out = capsys.readouterr()
+    assert "does not exist" in out.out + out.err

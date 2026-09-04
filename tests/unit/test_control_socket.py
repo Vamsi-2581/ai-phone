@@ -108,3 +108,28 @@ async def test_eof_before_a_terminal_message_is_daemon_gone(sock_dir: Path):
             await loop.run_in_executor(None, lambda: request(sock, {"cmd": "call", "to": "sip:x"}, lambda e: None))
     finally:
         await srv.stop()
+
+
+async def _raw(sock: Path, payload: bytes) -> dict:
+    import json
+    reader, writer = await asyncio.open_unix_connection(str(sock))
+    writer.write(payload)
+    await writer.drain()
+    line = await asyncio.wait_for(reader.readline(), 5)
+    writer.close()
+    return json.loads(line)
+
+
+@pytest.mark.asyncio
+async def test_non_object_and_malformed_call_payloads_get_an_error_reply(sock_dir: Path):
+    sock = sock_dir / "control.sock"
+    srv = ControlServer(sock, _handler)
+    await srv.start()
+    try:
+        assert (await _raw(sock, b"1\n"))["error"] == "expected a JSON object"
+        assert (await _raw(sock, b'"x"\n'))["ok"] is False
+        assert "to" in (await _raw(sock, b'{"cmd": "call"}\n'))["error"]
+        assert "timeout_sec" in (await _raw(sock, b'{"cmd": "call", "to": "+15550000000", "timeout_sec": "soon"}\n'))["error"]
+        assert (await _raw(sock, b'{"cmd": "call", "to": "", "timeout_sec": 5}\n'))["ok"] is False
+    finally:
+        await srv.stop()

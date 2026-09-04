@@ -52,6 +52,7 @@ class Daemon:
         self.active_call: dict | None = None
         self._call_waiters: list[asyncio.Queue] = []
         self._outbound: dict | None = None   # {"call_id", "persona", "send"} while a control-socket call is in flight
+        self._bg_tasks: set[asyncio.Task] = set()  # fire-and-forget tasks the loop only holds weakly
 
     def _secret_env_names(self) -> list[str]:
         names = [lc.password_env or line_password_env(lid) for lid, lc in self.cfg.lines.items() if lc.kind == "trunk"]
@@ -348,7 +349,9 @@ class Daemon:
             n[0] += 1
             log.info("turn %s line=%s first_audible=%s bargein=%s brain_error=%s", n[0], line_id, t.first_audible_ms(), t.bargein, t.brain_error)
             if on_turn_event is not None:
-                asyncio.get_running_loop().create_task(on_turn_event(rec))
+                task = asyncio.get_running_loop().create_task(on_turn_event(rec))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
 
         tc = TurnController(self.cfg.conversation, tel.port, stt, llm, tts, rx, tx, stt_in, tts_out,
                             Endpointer(vad, self.cfg.conversation.endpoint_silence_ms), ctx["greetings"][persona_name],

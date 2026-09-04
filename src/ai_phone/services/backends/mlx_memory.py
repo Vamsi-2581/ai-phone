@@ -21,6 +21,13 @@ def _enabled(enabled: bool) -> bool:
     return enabled and os.environ.get("AI_PHONE_WIRE_MEMORY", "1") != "0"
 
 
+def _device_cap() -> int:
+    import mlx.core as mx
+
+    info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+    return int(info.get("max_recommended_working_set_size", 0))
+
+
 def _set_limit(limit: int) -> int:
     global _limit
     import mlx.core as mx
@@ -40,7 +47,7 @@ def begin_wiring(enabled: bool = True) -> int:
     try:
         import mlx.core as mx
 
-        cap = int(mx.device_info().get("max_recommended_working_set_size", 0))
+        cap = _device_cap()
         return _set_limit(cap) if cap else 0
     except Exception as e:
         log.warning("could not open the wired-memory limit (%s); replies after an idle spell may be slow", e)
@@ -71,7 +78,7 @@ def wire_resident(model, enabled: bool = True) -> dict:
     try:
         import mlx.core as mx
 
-        cap = int(mx.device_info().get("max_recommended_working_set_size", 0))
+        cap = _device_cap()
         limit = nbytes + HEADROOM_BYTES
         if cap:
             limit = min(limit, cap)

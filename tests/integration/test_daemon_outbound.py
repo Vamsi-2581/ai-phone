@@ -46,6 +46,10 @@ def test_outbound_call_through_control_socket(tmp_path: Path, monkeypatch):
             peer.stdin.write(b"q\n"); peer.stdin.flush(); peer.wait(timeout=10)
         except Exception:
             peer.terminate()
+            try:
+                peer.wait(timeout=5)
+            except Exception:
+                peer.kill()
         _stop_daemon(d)
 
 
@@ -62,6 +66,10 @@ def test_outbound_busy_exit_code(tmp_path: Path, monkeypatch):
             peer.stdin.write(b"q\n"); peer.stdin.flush(); peer.wait(timeout=10)
         except Exception:
             peer.terminate()
+            try:
+                peer.wait(timeout=5)
+            except Exception:
+                peer.kill()
         _stop_daemon(d)
 
 
@@ -80,4 +88,8 @@ def test_busy_leaves_no_active_call_in_state(tmp_path: Path, monkeypatch):
             peer.stdin.write(b"q\n"); peer.stdin.flush(); peer.wait(timeout=10)
         except Exception:
             peer.terminate()
+            try:
+                peer.wait(timeout=5)
+            except Exception:
+                peer.kill()
         _stop_daemon(d)

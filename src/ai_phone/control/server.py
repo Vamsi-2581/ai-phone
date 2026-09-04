@@ -57,12 +57,20 @@ class ControlServer:
         try:
             line = await asyncio.wait_for(reader.readline(), 5)
             msg = json.loads(line.decode() or "{}")
+            if not isinstance(msg, dict):
+                await send({"ok": False, "error": "expected a JSON object"})
+                return
             if msg.get("cmd") not in COMMANDS:
                 await send({"ok": False, "error": f"unknown command {msg.get('cmd')!r}"})
                 return
             if msg["cmd"] == "call":
                 if self._call_active:
                     await send({"ok": False, "error": "busy"})
+                    return
+                to, timeout = msg.get("to"), msg.get("timeout_sec", 30)
+                if not isinstance(to, str) or not to.strip() or isinstance(timeout, bool) \
+                        or not isinstance(timeout, (int, float)) or not 0 < timeout <= 3600:
+                    await send({"ok": False, "error": "call needs a non-empty 'to' and a 'timeout_sec' between 0 and 3600"})
                     return
                 self._call_active = True
                 try:

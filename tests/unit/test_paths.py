@@ -31,5 +31,9 @@ def test_socket_path_falls_back_to_a_short_tmp_path(monkeypatch, tmp_path: Path)
     assert len(str(sock).encode()) <= 100 and sock.suffix == ".sock" and sock.parent.name == f"ai-phone-{os.getuid()}"
     assert stat.S_IMODE(sock.parent.stat().st_mode) == 0o700 and sock.parent.stat().st_uid == os.getuid()
     assert paths.socket_path() == sock  # deterministic for the same home
-    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path / "short"))
-    assert paths.socket_path() == tmp_path / "short" / "control.sock" or len(str(tmp_path / "short")) > 87
+    short = tmp_path / "short"
+    monkeypatch.setenv("AI_PHONE_HOME", str(short))
+    if len(str(short / "control.sock").encode()) <= 100:
+        assert paths.socket_path() == short / "control.sock"
+    else:  # macOS tmp paths are long: the private fallback applies, with the shape checked above
+        assert paths.socket_path().suffix == ".sock" and paths.socket_path().parent.name == f"ai-phone-{os.getuid()}"
