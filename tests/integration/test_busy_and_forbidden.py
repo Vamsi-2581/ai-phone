@@ -9,11 +9,13 @@ from ai_phone.telephony import events as ev
 from ai_phone.telephony.endpoint import LineSpec, Telephony
 from ai_phone.telephony.policy import build_peer_set
 from ai_phone.telephony.rings import FrameRing
+from tests.integration.ports import PEER_PORT, SIP_PORT  # noqa: E402
+from tests.integration import ports  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
 
-def _peer(port: int, target="sip:ai@127.0.0.1:5060", dur=8):
+def _peer(port: int, target=f"sip:ai@127.0.0.1:{SIP_PORT}", dur=8):
     """A pjsua caller that stays up until we send it 'q' (pjsua quits on stdin EOF)."""
     return subprocess.Popen(["pjsua", "--local-port", str(port), "--no-tcp", "--null-audio", "--duration", str(dur),
                              "--log-level", "2", "--app-log-level", "2", target],
@@ -43,11 +45,11 @@ def test_second_call_gets_486_and_public_source_gets_403():
     loop = asyncio.new_event_loop()
     events: asyncio.Queue = asyncio.Queue()
     rx, tx = FrameRing(None, 100), FrameRing(None, 100)
-    tel = Telephony(Config(), [spec], loop, events, rx, tx, echo_mode=True)
+    tel = Telephony(ports.config(), [spec], loop, events, rx, tx, echo_mode=True)
     tel.start()
     peers = []
     try:
-        p1 = _peer(5062)
+        p1 = _peer(PEER_PORT)
         peers.append(p1)
         first = loop.run_until_complete(_next(events, ev.IncomingCall))
         assert first.source_ip == "127.0.0.1"

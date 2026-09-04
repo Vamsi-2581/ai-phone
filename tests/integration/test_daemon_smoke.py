@@ -14,6 +14,7 @@ import wave
 from pathlib import Path
 
 import pytest
+from tests.integration.ports import SIP_CONFIG, SIP_PORT  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
@@ -31,7 +32,7 @@ def _tone(path: Path, seconds=1.2, rate=8000, tail_silence=3.0, turns=1):
 
 def _start_daemon(home: Path, cfg_text: str, extra_args=()):
     cfg = home / "config.yaml"
-    cfg.write_text(cfg_text)
+    cfg.write_text(SIP_CONFIG + cfg_text)  # the suite's ports, so it can run beside a live daemon (AI_PHONE_TEST_SIP_PORT)
     # start_new_session: `uv run` is a parent of the real daemon; killing only uv would leave the daemon (and port 5060) behind
     d = subprocess.Popen(["uv", "run", "ai-phone", "run", "--config", str(cfg), "--lan", "--fake", *extra_args],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env={**os.environ, "AI_PHONE_HOME": str(home)},

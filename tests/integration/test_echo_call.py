@@ -12,6 +12,7 @@ from ai_phone.config import Config, LineConfig
 from ai_phone.telephony import events as ev
 from ai_phone.telephony.endpoint import LineSpec, Telephony
 from ai_phone.telephony.rings import FrameRing
+from tests.integration import ports  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
@@ -40,7 +41,7 @@ def test_echo_call_round_trips_audio(tmp_path: Path):
     loop = asyncio.new_event_loop()
     events: asyncio.Queue = asyncio.Queue()
     rx, tx = FrameRing(None, 100), FrameRing(None, 100)
-    tel = Telephony(Config(), [spec], loop, events, rx, tx, echo_mode=True)
+    tel = Telephony(ports.config(), [spec], loop, events, rx, tx, echo_mode=True)
     seen = []
     stats = {}
 

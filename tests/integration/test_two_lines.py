@@ -8,6 +8,8 @@ from ai_phone.config import Config, LineConfig
 from ai_phone.telephony import events as ev
 from ai_phone.telephony.endpoint import LineSpec, Telephony
 from ai_phone.telephony.rings import FrameRing
+from tests.integration.ports import PEER_PORT, SIP_PORT  # noqa: E402
+from tests.integration import ports  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
@@ -31,12 +33,12 @@ def _drive(lines, target_user, tmp_path):
     loop = asyncio.new_event_loop()
     events: asyncio.Queue = asyncio.Queue()
     rx, tx = FrameRing(None, 100), FrameRing(None, 100)
-    tel = Telephony(Config(), lines, loop, events, rx, tx, echo_mode=True)
+    tel = Telephony(ports.config(), lines, loop, events, rx, tx, echo_mode=True)
     seen = []
 
     async def go():
         tel.start()
-        peer = subprocess.Popen(["bash", "scripts/pjsua_peer.sh", str(play), str(rec), "3", f"sip:{target_user}@127.0.0.1:5060"],
+        peer = subprocess.Popen(["bash", "scripts/pjsua_peer.sh", str(play), str(rec), "3", f"sip:{target_user}@127.0.0.1:{SIP_PORT}"],
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             while True:

@@ -280,7 +280,7 @@ class TurnController:
     def _on_event(self, m: dict) -> None:
         ev, now = m["ev"], time.monotonic_ns()
         if ev == "error":
-            self.request_end(f"worker error: {m['message'][:200]}")
+            self._worker_died(now, m.get("kind", "?"), str(m.get("message", ""))[:200])
             return
         if self.timer is None or m.get("gen") != self.timer.gen:
             return
@@ -319,6 +319,32 @@ class TurnController:
             self.state = "SPEAKING"
         elif ev == "done" and m["kind"] == "tts":
             self._tts_done_seq = max(self._tts_done_seq, m["seq"])
+
+    def _worker_died(self, now: int, kind: str, message: str) -> None:
+        """A model worker is gone mid-call (crash, kill). The supervisor will restart it for the next call; this call
+        cannot continue, but the caller gets the goodbye line, not a silent drop."""
+        _log.error("%s worker died mid-call: %s", kind, message)
+        t = self.timer
+        if t is not None:  # record the turn that was in flight, marked
+            t.brain_error = f"worker_{kind}"
+            t.reply_text = "".join(self._reply_parts).strip()
+            t.rx_overruns, t.tx_underruns = self.rx.overruns, self.tx.underruns
+            self.on_turn(t)
+            self.timer = None
+        for c in (self.stt, self.llm, self.tts):
+            if c.kind != kind:
+                c.cancel(c.current_gen)
+        self._flush_tx()
+        self.tts_out.flush()
+        self._new_gen()
+        self.end_reason = f"worker error: {kind}"
+        if self.goodbye_frames and kind != "tts":  # the goodbye is cached audio: it needs no worker, only the tx ring
+            self._queue_cached(self.goodbye_frames)
+            self.state = "ENDING_DRAIN"
+            self._drain_deadline_ns = now + int(3e9)
+        else:
+            self.state = "ENDING"
+            self.hangup_requested.set()
 
     def _brain_error(self, now: int, kind: str) -> None:
         """The brain failed mid-turn. Cancel exactly like a barge-in (nothing half-generated may be spoken),

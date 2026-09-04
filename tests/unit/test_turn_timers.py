@@ -117,3 +117,34 @@ async def test_stalled_brain_gets_the_apology_not_silence():
         assert tc.state == "LISTENING"
     finally:
         await _cleanup(stop, runner, (rx, tx, stt_in, tts_out), (stt, llm, tts))
+
+
+@pytest.mark.asyncio
+async def test_worker_death_mid_call_plays_the_goodbye_then_hangs_up():
+    """A crashed model worker must not leave the caller in silence: the cached goodbye plays, then the BYE."""
+    loop = asyncio.get_running_loop()
+    cfg = ConversationConfig(silence_prompt_sec=100, silence_hangup_sec=100)
+    rx, tx = FrameRing(None, 100), FrameRing(None, 400)
+    stt_in, tts_out = FrameRing(None, 400, frame_bytes=STT_IN_FRAME), FrameRing(None, 400, frame_bytes=TTS_OUT_FRAME)
+    stt = WorkerClient("stt", "ai_phone.services.backends.fake:FakeSTT", loop, stt_in, None, {})
+    llm = WorkerClient("llm", "ai_phone.services.backends.fake:FakeLLM", loop, None, None, {"system_prompt": "s"})
+    tts = WorkerClient("tts", "ai_phone.services.backends.fake:FakeTTS", loop, None, tts_out, {})
+    await asyncio.gather(stt.start(), llm.start(), tts.start())
+    goodbye = [b"\x09\x00" * 320] * 6
+    tc = TurnController(cfg, StubPort(), stt, llm, tts, rx, tx, stt_in, tts_out, Endpointer(EnergyVad()), [], "s", lambda t: None,
+                        goodbye_frames=goodbye, rtp_last_rx_ns=lambda: time.monotonic_ns())
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await asyncio.sleep(0.1)
+        assert tc.state == "LISTENING"
+        llm.events.put_nowait({"ev": "error", "kind": "llm", "message": "boom"})  # what the client emits on pipe EOF
+        await asyncio.sleep(0.1)
+        assert tc.state == "ENDING_DRAIN" and tc.end_reason == "worker error: llm"
+        assert tx.available() == len(goodbye), "the goodbye was not queued"
+        while tx.pop():  # PJSIP drains the ring
+            pass
+        await asyncio.wait_for(tc.hangup_requested.wait(), 2.0)
+        assert tc.state == "ENDING"
+    finally:
+        await _cleanup(stop, runner, (rx, tx, stt_in, tts_out), (stt, llm, tts))
