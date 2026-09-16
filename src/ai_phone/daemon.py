@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from ai_phone import paths
-from ai_phone.config import Config, LineConfig, PersonaConfig, line_password_env
+from ai_phone.config import Config, LineConfig, line_password_env
 from ai_phone.control.protocol import EXIT
 from ai_phone.control.server import ControlServer
 from ai_phone.pipeline.timing import TurnLog
@@ -77,11 +77,10 @@ class Daemon:
         for name in [n for n in os.environ if is_secret_env(n)]:
             del os.environ[name]
 
-    # ---- personas and cached phrases ------------------------------------------------------------
-    def system_prompt_for(self, persona: PersonaConfig) -> str:
-        if self.remote_brain:
-            return persona.system_prompt  # no host metadata leaves the machine
-        return f"{persona.system_prompt} You are running on {socket.gethostname()} ({platform.machine()})."
+    # ---- system prompt and cached phrases -------------------------------------------------------
+    def system_prompt_for(self, text: str) -> str:
+        # a remote brain gets no host metadata: nothing about this machine leaves it
+        return text if self.remote_brain else f"{text} You are running on {socket.gethostname()} ({platform.machine()})."
 
     async def _cache_phrase(self, tts: WorkerClient, ring: FrameRing, text: str) -> list[bytes]:
         gen = tts.next_gen()
@@ -144,8 +143,7 @@ class Daemon:
         rx, tx = FrameRing(None, 100), FrameRing(None, 400)
         stt_in, tts_out = FrameRing(None, 400, frame_bytes=STT_IN_FRAME), FrameRing(None, 400, frame_bytes=TTS_OUT_FRAME)
         F = FACTORIES["fake" if self.fake else "real"]
-        personas = dict(self.cfg.personas) or {"default": PersonaConfig()}
-        default_prompt = self.system_prompt_for(personas["default"])
+        default_prompt = self.system_prompt_for(self.cfg.inbound.instructions)
         wa = {} if self.fake else {"wire_memory": self.cfg.models.wire_memory}  # the MLX backends pin their weights
         kw = self.cfg.models.keep_warm_sec
         stt = WorkerClient("stt", F["stt"], loop, stt_in, None, dict(wa), keep_warm_sec=kw)
@@ -179,8 +177,8 @@ class Daemon:
                       "warning": await self._cache_phrase(tts, tts_out, "This call will end in thirty seconds."),
                       "apology": await self._cache_phrase(tts, tts_out, APOLOGY),
                       "goodbye": await self._cache_phrase(tts, tts_out, GOODBYE)}
-            greetings = {name: await self._cache_phrase(tts, tts_out, p.greeting) for name, p in personas.items()}
-            openings = {name: await self._cache_phrase(tts, tts_out, p.outbound_opening) for name, p in personas.items()}
+            greetings = {"default": await self._cache_phrase(tts, tts_out, self.cfg.inbound.greeting)}
+            openings = {"default": await self._cache_phrase(tts, tts_out, "Hi, this is an AI assistant calling.")}
             specs = self._line_specs()
             tel = Telephony(self.cfg, specs, loop, events, rx, tx)
             tel.start()
@@ -192,7 +190,7 @@ class Daemon:
             for s in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(s, stop.set)
             ctx = dict(tel=tel, stt=stt, llm=llm, tts=tts, rx=rx, tx=tx, stt_in=stt_in, tts_out=tts_out, cached=cached,
-                       greetings=greetings, openings=openings, personas=personas, turn_log=turn_log, events=events, stop=stop, specs={s.id: s for s in specs})
+                       greetings=greetings, openings=openings, turn_log=turn_log, events=events, stop=stop, specs={s.id: s for s in specs})
             control = ControlServer(paths.socket_path(), lambda msg, send: self._control(msg, send, ctx))
             await control.start()
             log.info("ready lines=%s brain=%s tier=%s warm=%s", [s.id for s in specs], self.cfg.brain.kind, self.tier, warm)
@@ -266,10 +264,7 @@ class Daemon:
         if line_id not in ctx["specs"]:
             await send({"ok": False, "error": f"no such line {line_id!r}" if msg.get("line") else "no line can dial that target (no registered trunk for a phone number, or no sip line for a sip: address)"})
             return
-        persona = msg.get("persona") or ctx["specs"][line_id].persona
-        if persona not in ctx["personas"]:
-            await send({"ok": False, "error": f"no such persona {persona!r}"})
-            return
+        persona = "default"
         q: asyncio.Queue = asyncio.Queue()
         self._call_waiters.append(q)
         cid: int | None = None   # set once PJSIP has a call; cleanup below must not assume it
@@ -344,9 +339,7 @@ class Daemon:
     async def _run_call(self, call_id, line_id, direction, persona_name, ctx, on_turn_event=None):
         tel, stt, llm, tts = ctx["tel"], ctx["stt"], ctx["llm"], ctx["tts"]
         rx, tx, stt_in, tts_out, cached = ctx["rx"], ctx["tx"], ctx["stt_in"], ctx["tts_out"], ctx["cached"]
-        spec = ctx["specs"][line_id]
-        persona_name = persona_name or spec.persona
-        persona = ctx["personas"][persona_name]
+        persona_name = "default"
         vad = EnergyVad() if self.fake else SileroVad()
         n = [0]
         turn_log, events, stop = ctx["turn_log"], ctx["events"], ctx["stop"]
@@ -364,7 +357,7 @@ class Daemon:
 
         tc = TurnController(self.cfg.conversation, tel.port, stt, llm, tts, rx, tx, stt_in, tts_out,
                             Endpointer(vad, self.cfg.conversation.endpoint_silence_ms), ctx["greetings"][persona_name],
-                            self.system_prompt_for(persona), on_turn, prompt_frames=cached["prompt"], warning_frames=cached["warning"],
+                            self.system_prompt_for(self.cfg.inbound.instructions), on_turn, prompt_frames=cached["prompt"], warning_frames=cached["warning"],
                             rtp_last_rx_ns=lambda: tel.port.last_rx_ns, apology_frames=cached["apology"], goodbye_frames=cached["goodbye"],
                             opening_frames=ctx["openings"][persona_name] if direction == "out" else None, direction=direction)
         call_stop = asyncio.Event()

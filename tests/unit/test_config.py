@@ -26,11 +26,9 @@ lines:
     accept_invites_from: trusted
     trusted_peers: ["203.0.113.7"]
     caller_id: "sip:agents@home.example.org"
-personas:
-  default:
-    greeting: "Hi."
-    system_prompt: "s"
-    outbound_opening: "Hi, this is an AI assistant."
+inbound:
+  greeting: "Hi."
+  instructions: "Take a message."
 """
 
 LEGACY = """
@@ -59,17 +57,18 @@ def test_v2_config_loads(tmp_path: Path, monkeypatch):
     assert set(cfg.lines) == {"main", "agents"}
     assert cfg.lines["main"].kind == "trunk" and cfg.lines["main"].register_via_proxy is True
     assert cfg.lines["agents"].kind == "sip" and cfg.lines["agents"].trusted_peers == ["203.0.113.7"]
-    assert cfg.personas["default"].outbound_opening.startswith("Hi, this is an AI")
+    assert cfg.inbound.greeting == "Hi." and cfg.inbound.instructions == "Take a message."
+    assert cfg.calls.daily_limit == 0 and cfg.calls.relay_filler_after_ms == 1500
     assert cfg.brain.kind == "local"
     assert cfg.sip.bind.tls_port == 5061 and cfg.sip.tcp_keepalive_sec == 30
     assert cfg.conversation.endpoint_silence_ms == 300
     assert cfg.warnings == []
 
 
-def test_empty_config_has_no_lines_and_a_default_persona(tmp_path: Path):
+def test_empty_config_has_no_lines_and_a_default_greeting(tmp_path: Path):
     cfg = _load(tmp_path, "")
     assert cfg.lines == {}
-    assert "default" in cfg.personas
+    assert cfg.inbound.greeting.strip()
 
 
 def test_legacy_m1_config_is_migrated_with_a_warning(tmp_path: Path):
@@ -79,7 +78,7 @@ def test_legacy_m1_config_is_migrated_with_a_warning(tmp_path: Path):
     assert main.kind == "trunk" and main.registrar == "sip:sip.example.com" and main.dial_domain == "sip.example.com"
     assert main.user == "aiuser" and main.password_env == "SIP_PW"
     assert cfg.sip.bind.udp_port == 5070 and cfg.sip.bind.tcp_port == 5070
-    assert cfg.personas["default"].greeting == "Hello there."
+    assert cfg.inbound.greeting == "Hello there." and cfg.inbound.instructions == "You are ai-phone."
     assert cfg.conversation.endpoint_silence_ms == 250
 
 
@@ -115,18 +114,64 @@ def test_trusted_mode_requires_peers(tmp_path: Path):
         _load(tmp_path, bad)
 
 
-def test_persona_reference_must_exist(tmp_path: Path):
-    bad = V2.replace('    caller_id: "sip:agents@home.example.org"\n', '    caller_id: "sip:agents@home.example.org"\n    persona: nope\n')
-    with pytest.raises(ConfigError, match="persona"):
-        _load(tmp_path, bad)
-
-
 def test_sip_users_must_be_unique_across_trunk_lines(tmp_path: Path):
     second = ("  second:\n    kind: trunk\n    number: \"+442079460001\"\n    registrar: \"sip:sip.telnyx.com\"\n    dial_domain: \"sip.telnyx.com\"\n"
               "    user: \"aimain7f3a\"\n    password_env: AI_PHONE_LINE_SECOND_PASSWORD\n    trusted_cidrs: [\"192.76.120.0/24\"]\n    caller_id: \"+442079460001\"\n")
-    bad = V2.replace("personas:\n", second + "personas:\n")
+    bad = V2.replace("inbound:\n", second + "inbound:\n")
     with pytest.raises(ConfigError, match="unique"):
         _load(tmp_path, bad)
+
+
+PERSONAS = """
+lines:
+  agents:
+    kind: sip
+    user: "agents"
+    aor: "sip:agents@home.example.org"
+    accept_invites_from: lan
+    persona: helper
+personas:
+  default:
+    greeting: "Default hi."
+    system_prompt: "Default prompt."
+  helper:
+    greeting: "Helper hi."
+    system_prompt: "Helper prompt."
+    outbound_opening: "Hello from helper."
+"""
+
+
+def test_personas_are_converted_to_inbound_with_one_warning(tmp_path: Path):
+    cfg = _load(tmp_path, PERSONAS)
+    assert cfg.inbound.greeting == "Helper hi." and cfg.inbound.instructions == "Helper prompt."
+    w = [x for x in cfg.warnings if "personas" in x]
+    assert len(w) == 1 and "default" in w[0] and "outbound_opening" in w[0]
+    assert not hasattr(cfg.lines["agents"], "persona")
+
+
+def test_explicit_inbound_wins_over_personas(tmp_path: Path):
+    cfg = _load(tmp_path, PERSONAS + 'inbound:\n  greeting: "Mine."\n')
+    assert cfg.inbound.greeting == "Mine." and cfg.inbound.instructions == "Helper prompt."
+
+
+def test_personas_must_be_a_mapping(tmp_path: Path):
+    with pytest.raises(ConfigError, match="personas"):
+        _load(tmp_path, "personas: [1, 2]\n")
+    with pytest.raises(ConfigError, match="personas"):
+        _load(tmp_path, "personas:\n  default: 5\n")
+    assert _load(tmp_path, "personas:\n  default:\n").inbound.greeting  # an emptied persona loaded before and still does
+
+
+@pytest.mark.parametrize("calls, match", [
+    ("calls:\n  daily_limit: -1\n", "daily_limit"),
+    ("calls:\n  relay_filler_after_ms: 0\n", "relay_filler_after_ms"),
+    ("calls:\n  relay_filler_after_ms: 12000\n  relay_second_filler_sec: 10\n", "relay_second_filler_sec"),
+    ("calls:\n  relay_second_filler_sec: 30\n  relay_reply_timeout_sec: 25\n", "relay_reply_timeout_sec"),
+    ('inbound:\n  greeting: ""\n', "inbound.greeting"),
+])
+def test_calls_and_inbound_are_validated(tmp_path: Path, calls, match):
+    with pytest.raises(ConfigError, match=match):
+        _load(tmp_path, calls)
 
 
 def test_tcp_and_tls_ports_must_differ(tmp_path: Path):
@@ -184,6 +229,11 @@ def test_malformed_legacy_sections_are_config_errors(tmp_path: Path):
         _load(tmp_path, "sip: 5\n")
     with pytest.raises(ConfigError, match="bind.port"):
         _load(tmp_path, 'sip:\n  user: "ai"\n  bind: {port: "five"}\n')
+    with pytest.raises(ConfigError, match="config.inbound"):
+        _load(tmp_path, 'inbound: 5\nconversation:\n  greeting: "Hi."\n')
+    with pytest.raises(ConfigError, match="config.inbound"):
+        _load(tmp_path, "inbound: [1]\npersonas: {}\n")
+    assert _load(tmp_path, PERSONAS.replace("persona: helper", "persona: [helper]")).inbound.greeting == "Default hi."
 
 
 def test_models_home_follows_ai_phone_home(tmp_path: Path, monkeypatch):

@@ -86,8 +86,8 @@ def _fail(msg: str):
     raise SystemExit(EXIT_ERROR)
 
 
-def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, number, persona: str) -> int:
-    journal.start("target", phone_number=number.e164, persona=persona)  # first thing in the journal, so resume always knows the number
+def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, number) -> int:
+    journal.start("target", phone_number=number.e164)  # first thing in the journal, so resume always knows the number
     journal.finish("target")
     env_name = line_password_env(line_id)
     pw_step, planned = journal.start("credentials", user=generate_sip_user(line_id), password_env=env_name)
@@ -102,10 +102,10 @@ def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, 
     except ProviderError as e:
         _say(f"error: {e}\nThe journal is kept at {journal.path}; run `ai-phone lines resume {line_id}` to continue or `ai-phone lines remove {line_id}` to clean up.")
         return EXIT_ERROR
-    return _commit(journal, config_path, line_id, result, persona, env_name)
+    return _commit(journal, config_path, line_id, result, env_name)
 
 
-def _commit(journal: Journal, config_path: Path, line_id: str, result, persona: str, env_name: str) -> int:
+def _commit(journal: Journal, config_path: Path, line_id: str, result, env_name: str) -> int:
     if result.state == "failed":
         raw = read_raw(config_path)
         existing = (raw.get("lines") or {}).get(line_id)
@@ -122,7 +122,7 @@ def _commit(journal: Journal, config_path: Path, line_id: str, result, persona: 
         journal.start("carrier_ready")
         journal.finish("carrier_ready")
     line = dict(result.line)
-    line.update({"password_env": env_name, "persona": persona, "accept_invites_from": "registered_trunk"})
+    line.update({"password_env": env_name, "accept_invites_from": "registered_trunk"})
     line["provider"] = dict(line.get("provider") or {"name": journal.doc["provider"], "resources": {}})
     line["provider"]["state"] = result.state
     raw = read_raw(config_path)
@@ -169,17 +169,15 @@ def cmd_add(a) -> int:
     if line_id in (raw.get("lines") or {}):
         _say(f"error: line {line_id!r} already exists (use --id to pick another name)")
         return EXIT_ERROR
-    # everything the finished line will need is checked now, before a single carrier request spends money
-    current = load_config(config_path) if config_path.exists() else None
-    known_personas = set((current.personas if current else {}) | {"default": None})
-    if a.persona not in known_personas:
-        _fail(f"--persona {a.persona!r} is not defined in {config_path} (personas: {', '.join(sorted(known_personas))})")
+    # the config the finished line is written into must load now, before a single carrier request spends money
+    if config_path.exists():
+        load_config(config_path)
     number = _pick_number(provider, a)
     cost = f"{number.monthly_cost:.2f} {number.currency}/month" if number.monthly_cost is not None else "the carrier's monthly price"
     if not _ask(f"Buy {number.e164} for {cost} on your {provider.name} account?", a.yes):
         return EXIT_ERROR
     journal = Journal.open(paths.lines_dir(), line_id, provider.name)
-    return provision_flow(provider, journal, config_path, line_id, number, a.persona)
+    return provision_flow(provider, journal, config_path, line_id, number)
 
 
 def _add_manual(a, config_path: Path) -> int:
@@ -196,13 +194,12 @@ def _add_manual(a, config_path: Path) -> int:
         from ai_phone.config import host_of
         line = {"kind": "trunk", "number": a.number, "caller_id": a.caller_id or a.number, "registrar": a.registrar,
                 "dial_domain": a.dial_domain or host_of(a.registrar), "user": a.user, "password_env": a.password_env,
-                "transport": a.transport, "accept_invites_from": "registered_trunk", "trusted_cidrs": list(a.trusted_cidr or []),
-                "persona": a.persona}
+                "transport": a.transport, "accept_invites_from": "registered_trunk", "trusted_cidrs": list(a.trusted_cidr or [])}
         if a.outbound_proxy:
             line["outbound_proxy"] = a.outbound_proxy
     else:
         line = {"kind": "sip", "user": a.user, "aor": f"sip:{a.user}@{a.host}", "caller_id": f"sip:{a.user}@{a.host}",
-                "display_name": a.user, "transport": a.transport, "persona": a.persona,
+                "display_name": a.user, "transport": a.transport,
                 "accept_invites_from": "trusted" if a.trusted else "lan", "trusted_peers": list(a.trusted or [])}
     added = False
     try:
@@ -258,7 +255,7 @@ def cmd_resume(a) -> int:
     except ProviderError as e:
         _say(f"error: {e}")
         return EXIT_ERROR
-    return _commit(journal, _config_path(a), a.line_id, result, ln.get("persona") or _planned(journal, "target", "persona") or "default", env_name)
+    return _commit(journal, _config_path(a), a.line_id, result, env_name)
 
 
 def _recorded_resources(ln: dict) -> dict:
@@ -325,7 +322,7 @@ def cmd_list(a) -> int:
     for lid, ln in cfg.lines.items():
         where = ln.number or ln.aor
         prov = f" ({ln.provider.name}: {ln.provider.state})" if ln.provider else ""
-        _say(f"{lid:12s} {ln.kind:5s} {where}{prov}  persona={ln.persona}")
+        _say(f"{lid:12s} {ln.kind:5s} {where}{prov}")
     return EXIT_OK
 
 
@@ -408,7 +405,6 @@ def register(sub) -> None:
     add = s.add_parser("add", help="add a line: telnyx | twilio | trunk | sip")
     add.add_argument("provider", choices=sorted(set(PROVIDER_CHOICES) | {"trunk", "sip"}))
     add.add_argument("--id")
-    add.add_argument("--persona", default="default")
     add.add_argument("--yes", action="store_true")
     add.add_argument("--key-env"); add.add_argument("--secret-env")
     add.add_argument("--country", default="GB"); add.add_argument("--area"); add.add_argument("--number")

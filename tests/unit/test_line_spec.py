@@ -42,6 +42,11 @@ def test_from_config_refuses_unvalidated_parts():
         LineSpec.from_config("s", LineConfig(kind="sip", user="ok", aor="sip:ok@host;evil", display_name="ok"), None)
 
 
+def test_line_spec_has_no_persona():
+    spec = LineSpec.from_config("agents", LineConfig(kind="sip", user="agents", aor="sip:agents@127.0.0.1", accept_invites_from="lan"), None)
+    assert not hasattr(spec, "persona")
+
+
 def test_srtp_mapping():
     from ai_phone.telephony.pj import pj
     assert srtp_values(_trunk()) == (pj.PJMEDIA_SRTP_DISABLED, 0)

@@ -14,7 +14,7 @@ def home(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
     monkeypatch.setenv("FAKE_KEY", "k")
     monkeypatch.setattr("builtins.input", lambda *a: "y")
-    (tmp_path / "config.yaml").write_text("personas:\n  default:\n    greeting: Hi\n")
+    (tmp_path / "config.yaml").write_text("inbound:\n  greeting: Hi\n")
     return tmp_path
 
 
@@ -138,10 +138,16 @@ def test_verify_caller_id_records_it(home: Path, monkeypatch):
     assert v and v[0].number == "+447700900123" and v[0].provider == "fake"
 
 
-def test_unknown_persona_is_refused_before_any_carrier_call(home: Path, capsys):
-    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--persona", "typo", "--yes"]) == 3
-    assert "--persona" in capsys.readouterr().out
-    assert not (home / "fake-carrier.json").exists() and not (home / "lines" / "main.journal.json").exists()
+def test_persona_option_is_gone(home: Path):
+    with pytest.raises(SystemExit) as e:
+        main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--persona", "x", "--yes"])
+    assert e.value.code == 2
+
+
+def test_added_lines_carry_no_persona(home: Path):
+    from ai_phone.lines.config_writer import read_raw
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 0
+    assert "persona" not in read_raw(home / "config.yaml")["lines"]["main"]
 
 
 def test_unloadable_result_restores_the_config(home: Path, monkeypatch):
@@ -152,7 +158,7 @@ def test_unloadable_result_restores_the_config(home: Path, monkeypatch):
     before = read_raw(home / "config.yaml")
     assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 3
     after = read_raw(home / "config.yaml")
-    assert (after.get("lines") or {}) == {} and after["personas"] == before["personas"]  # restored (an empty lines: {} is equivalent)
+    assert (after.get("lines") or {}) == {} and after["inbound"] == before["inbound"]  # restored (an empty lines: {} is equivalent)
     assert (home / "lines" / "main.journal.json").exists()  # the carrier side is kept for resume/remove
 
 

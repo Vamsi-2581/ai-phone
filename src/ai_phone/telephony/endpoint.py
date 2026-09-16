@@ -40,7 +40,6 @@ class LineSpec:
     trusted_peers: list[str] = field(default_factory=list)
     caller_id: str | None = None
     verified_caller_ids: list[str] = field(default_factory=list)
-    persona: str = "default"
 
     @property
     def registrar_host(self) -> str | None:
@@ -60,7 +59,7 @@ class LineSpec:
                    register_via_proxy=c.register_via_proxy, transport=c.transport, register_expiry_sec=c.register_expiry_sec,
                    srtp=c.srtp, accept_invites_from=c.accept_invites_from, trusted_cidrs=list(c.trusted_cidrs),
                    trusted_peers=list(c.trusted_peers), caller_id=c.caller_id,
-                   verified_caller_ids=[v.number for v in c.verified_caller_ids], persona=c.persona)
+                   verified_caller_ids=[v.number for v in c.verified_caller_ids])
 
 
 def _grammar(c: LineConfig) -> None:

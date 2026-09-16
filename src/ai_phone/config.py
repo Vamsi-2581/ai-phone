@@ -2,7 +2,8 @@
 
 sip:        transports and NAT for the whole daemon
 lines:      one entry per line (trunk or sip); each is a pjsua2 Account
-personas:   greeting, system prompt, outbound opening line
+inbound:    what the agent says and does when someone calls and no AI is listening
+calls:      outbound limits and relay-mode timing
 brain:      local model or an OpenAI-compatible endpoint
 """
 from __future__ import annotations
@@ -110,15 +111,22 @@ class LineConfig:
     caller_id: str | None = None
     diverted_from: list[str] = field(default_factory=list)
     verified_caller_ids: list[VerifiedCallerId] = field(default_factory=list)
-    persona: str = "default"
     provider: ProviderRef | None = None
 
 
 @dataclass
-class PersonaConfig:
-    greeting: str = "Hi, this is the house. What can I do for you?"
-    system_prompt: str = "You are ai-phone, a local phone assistant. Answer in one short sentence."
-    outbound_opening: str = "Hi, this is an AI assistant calling on behalf of the owner of this number. Is now a good time?"
+class InboundConfig:
+    greeting: str = "Hi, you've reached an AI assistant. How can I help?"
+    instructions: str = ("Someone has called this number. Find out who they are and what they need, and offer to take "
+                         "a message: their name, their number and what it is about.")
+
+
+@dataclass
+class CallsConfig:
+    daily_limit: int = 0                 # outbound calls per local day; 0 = no limit
+    relay_filler_after_ms: int = 1500
+    relay_second_filler_sec: int = 10
+    relay_reply_timeout_sec: int = 25
 
 
 @dataclass
@@ -161,7 +169,8 @@ class Config:
     codecs: list[str] = field(default_factory=lambda: ["PCMU", "PCMA"])
     models: ModelsConfig = field(default_factory=ModelsConfig)
     lines: dict[str, LineConfig] = field(default_factory=dict)
-    personas: dict[str, PersonaConfig] = field(default_factory=dict)
+    inbound: InboundConfig = field(default_factory=InboundConfig)
+    calls: CallsConfig = field(default_factory=CallsConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
     conversation: ConversationConfig = field(default_factory=ConversationConfig)
     log: LogConfig = field(default_factory=LogConfig)
@@ -294,19 +303,53 @@ def _migrate_legacy(raw: dict) -> tuple[dict, list[str]]:
         raise ConfigError("config.conversation: expected a mapping")
     conv = dict(conv)
     if "greeting" in conv or "system_prompt" in conv:
-        personas = raw.get("personas") or {}
-        if not isinstance(personas, dict) or not isinstance(personas.get("default") or {}, dict):
-            raise ConfigError("config.personas: expected a mapping of persona names to mappings")
-        personas = dict(personas)
-        default = dict(personas.get("default") or {})
+        inbound = _inbound_of(raw)
         if "greeting" in conv:
-            default["greeting"] = conv.pop("greeting")
+            inbound.setdefault("greeting", conv.pop("greeting"))
         if "system_prompt" in conv:
-            default["system_prompt"] = conv.pop("system_prompt")
-        personas["default"] = default
-        raw["personas"], raw["conversation"] = personas, conv
-        warnings.append("config.conversation: greeting/system_prompt moved to personas.default")
-    return raw, warnings
+            inbound.setdefault("instructions", conv.pop("system_prompt"))
+        raw["inbound"], raw["conversation"] = inbound, conv
+        warnings.append("config.conversation: greeting/system_prompt moved to inbound")
+    raw, more = _migrate_personas(raw)
+    return raw, warnings + more
+
+
+def _inbound_of(raw: dict) -> dict:
+    inbound = raw.get("inbound") or {}
+    if not isinstance(inbound, dict):
+        raise ConfigError("config.inbound: expected a mapping")
+    return dict(inbound)
+
+
+def _migrate_personas(raw: dict) -> tuple[dict, list[str]]:
+    """Personas were replaced by one `inbound:` section (outbound calls carry their own prompt)."""
+    lines = raw.get("lines") if isinstance(raw.get("lines"), dict) else {}   # a malformed `lines` fails later, in _build
+    line_personas = [ln.get("persona") for ln in lines.values() if isinstance(ln, dict) and ln.get("persona")]
+    if "personas" not in raw and not line_personas:
+        return raw, []
+    raw = dict(raw)
+    personas = raw.pop("personas", None) or {}
+    if not isinstance(personas, dict) or not all(v is None or isinstance(v, dict) for v in personas.values()):
+        raise ConfigError("config.personas: expected a mapping of persona names to mappings")
+    first = next(iter(lines.values()), None)
+    name = first.get("persona", "default") if isinstance(first, dict) else "default"   # the first line's persona
+    name = name if isinstance(name, str) and name in personas else "default"
+    chosen = personas.get(name) or personas.get("default") or {}
+    inbound = _inbound_of(raw)
+    if "greeting" in chosen:
+        inbound.setdefault("greeting", chosen["greeting"])
+    if "system_prompt" in chosen:
+        inbound.setdefault("instructions", chosen["system_prompt"])
+    raw["inbound"] = inbound
+    if lines:
+        raw["lines"] = {lid: ({k: v for k, v in ln.items() if k != "persona"} if isinstance(ln, dict) else ln)
+                        for lid, ln in lines.items()}
+    dropped = sorted(n for n in personas if n != name)
+    if "outbound_opening" in chosen:
+        dropped.append(f"{name}.outbound_opening")
+    note = f"; dropped: {', '.join(dropped)}" if dropped else ""
+    return raw, [f"config.personas: replaced by inbound (greeting and instructions taken from persona {name!r}){note}; "
+                 f"line persona settings are ignored and outbound calls carry their own --prompt"]
 
 
 # ---- semantic validation --------------------------------------------------------------------
@@ -341,7 +384,15 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
         _require(bool(HOST_RE.fullmatch(ns)), f"config.sip.nameservers: {ns!r} is not host[:port]")
     if cfg.sip.stun_server is not None:
         _require(bool(HOST_RE.fullmatch(cfg.sip.stun_server)), "config.sip.stun_server: expected host[:port]")
-    cfg.personas.setdefault("default", PersonaConfig())
+    c = cfg.calls
+    _require(c.daily_limit >= 0, "config.calls.daily_limit: must be 0 (no limit) or more")
+    _require(c.relay_filler_after_ms > 0, "config.calls.relay_filler_after_ms: must be more than 0")
+    _require(c.relay_second_filler_sec * 1000 > c.relay_filler_after_ms,
+             "config.calls.relay_second_filler_sec: must come after relay_filler_after_ms")
+    _require(c.relay_reply_timeout_sec > c.relay_second_filler_sec,
+             "config.calls.relay_reply_timeout_sec: must be longer than relay_second_filler_sec")
+    _require(0 < len(cfg.inbound.greeting.strip()) <= 500, "config.inbound.greeting: 1 to 500 characters")
+    _require(len(cfg.inbound.instructions) <= 4000, "config.inbound.instructions: at most 4000 characters")
     users_seen: dict[str, str] = {}
     uses_tls = False
     for lid, ln in cfg.lines.items():
@@ -352,7 +403,6 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
         else:
             _require(bool(SIP_USER_RE.fullmatch(ln.user)), f"{p}.user: must match {SIP_USER_RE.pattern}")
         _require(bool(DISPLAY_RE.fullmatch(ln.display_name)), f"{p}.display_name: printable ASCII, 1 to 64 characters, no quotes or backslashes")
-        _require(ln.persona in cfg.personas, f"{p}.persona: no persona named {ln.persona!r}")
         _require(ln.srtp == "off" or ln.transport == "tls", f"{p}.srtp: SRTP needs transport: tls")
         if ln.password_env is not None:
             _require(bool(ENV_RE.fullmatch(ln.password_env)), f"{p}.password_env: must match {ENV_RE.pattern}")
