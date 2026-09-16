@@ -81,6 +81,17 @@ class CallRecord:
             except asyncio.TimeoutError:
                 return None
 
+    def put_back(self, event: dict) -> None:
+        """A listen cancelled before its reply went out returns the event, so the next listen gets it."""
+        if event.get("kind") == "heard":
+            if self._unread and self._unread[0]["kind"] == "heard":
+                self._unread[0]["text"] = event["text"] + " " + self._unread[0]["text"]
+            else:
+                self._unread.insert(0, dict(event))
+            self._changed.set()
+        elif event.get("kind") == "ended":
+            self.end_reported = False
+
     # ---- lifecycle ----------------------------------------------------------------------------------
     def mark_connected(self) -> None:
         self._connected.set()

@@ -20,7 +20,7 @@ class StubTel:
 def _ctx(tel):
     spec = LineSpec.from_config("agents", LineConfig(kind="sip", user="agents", aor="sip:agents@127.0.0.1", display_name="agents",
                                                      accept_invites_from="lan", caller_id="sip:agents@127.0.0.1"), None)
-    return {"tel": tel, "specs": {"agents": spec}, "personas": {"default": object()}, "events": asyncio.Queue()}
+    return {"tel": tel, "specs": {"agents": spec}, "events": asyncio.Queue()}
 
 
 @pytest.mark.asyncio
@@ -34,8 +34,9 @@ async def test_busy_while_an_inbound_call_is_active_replies_busy_and_keeps_the_c
         sent.append(m)
 
     await d._control({"cmd": "call", "to": "sip:x@127.0.0.1", "line": "agents"}, send, _ctx(StubTel(BusyError("a call is already active"))))
-    assert sent == [{"ok": False, "error": "busy"}]
+    assert sent == [{"ok": False, "error": "busy", "code": 5}]
     assert d.active_call["call_id"] == 3 and d._call_waiters == [] and d._outbound is None
+    assert d.calls.current is None
 
 
 def test_default_line_selection(tmp_path, monkeypatch):
@@ -69,4 +70,6 @@ async def test_dial_error_ends_with_rejected_and_touches_no_state(tmp_path, monk
 
     await d._control({"cmd": "call", "to": "+441", "line": "agents"}, send, _ctx(StubTel(DialError("bad target"))))
     assert sent[-1]["event"] == "ended" and sent[-1]["reason"] == "rejected" and sent[-1]["exit_code"] == 7
+    assert sent[-1]["result"] is None
     assert d.active_call is None and not (tmp_path / "state.json").exists()
+    assert not (tmp_path / "calls-today.json").exists()  # a refused dial is not counted

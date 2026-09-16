@@ -20,7 +20,13 @@ def render_status(state: dict, alive: bool) -> str:
         extra = l.get("last_error") or (l.get("registrar") or "")
         rows.append(f"{lid:12s} {l.get('kind', '?'):5s} {l.get('state', '?'):12s} {l.get('address', ''):28s} {extra}")
     ac = state.get("active_call")
-    rows.append(f"active call: {ac.get('direction', '?')} on {ac.get('line_id', '?')} with {ac.get('remote', '?')}" if ac else "active call: none")
+    if not ac:
+        rows.append("active call: none")
+    elif ac.get("call") and ac.get("mode"):
+        rows.append(f"active call: {ac.get('direction', '?')} {ac['mode']} call {ac['call']} on {ac.get('line_id', '?')} "
+                    f"with {ac.get('remote', '?')}")
+    else:
+        rows.append(f"active call: {ac.get('direction', '?')} on {ac.get('line_id', '?')} with {ac.get('remote', '?')}")
     return "\n".join(rows)
 
 

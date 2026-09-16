@@ -8,13 +8,18 @@ import os
 import platform
 import signal
 import socket
+import sys
 import time
 from pathlib import Path
 
 from ai_phone import paths
+from ai_phone.call_guard import DailyCounter, is_emergency
+from ai_phone.calls import CallRecord, CallRegistry, ListenerBusy
 from ai_phone.config import Config, LineConfig, line_password_env
 from ai_phone.control.protocol import EXIT
 from ai_phone.control.server import ControlServer
+from ai_phone.pipeline import prompts
+from ai_phone.pipeline.replies import ModelReplies, Phrase, RelayPhrases, RelayReplies
 from ai_phone.pipeline.timing import TurnLog
 from ai_phone.pipeline.turn import TurnController
 from ai_phone.pipeline.vad import Endpointer, EnergyVad, SileroVad
@@ -37,6 +42,9 @@ FACTORIES = {
 }
 APOLOGY = "Sorry, I lost my train of thought. Could you say that again?"
 GOODBYE = "I'm having trouble thinking right now. Please call back later. Goodbye."
+HANGUP_FIRST_WAIT_SEC = 30.0   # `hangup`: how long the call (and a `--say` goodbye) may take to end before hanging up again
+HANGUP_SECOND_WAIT_SEC = 10.0  # then how long PJSIP may take to report the end before the command gives up
+_RECORD_ENDED = object()       # `_next_or_connected`: the record ended with no event on the queue
 
 
 class Daemon:
@@ -52,8 +60,11 @@ class Daemon:
         self.state_file = StateFile(paths.state_path())
         self.active_call: dict | None = None
         self._call_waiters: list[asyncio.Queue] = []
-        self._outbound: dict | None = None   # {"call_id", "persona", "send"} while a control-socket call is in flight
+        self._outbound: dict | None = None   # {"call_id", "record", "send"} while a control-socket call is in flight
         self._bg_tasks: set[asyncio.Task] = set()  # fire-and-forget tasks the loop only holds weakly
+        self.calls = CallRegistry()
+        self.counter = DailyCounter(paths.call_counter_path(), cfg.calls.daily_limit)
+        self._controllers: dict[str, TurnController] = {}  # call ID -> the controller running it
 
     def _secret_env_names(self) -> list[str]:
         names = [lc.password_env or line_password_env(lid) for lid, lc in self.cfg.lines.items() if lc.kind == "trunk"]
@@ -78,9 +89,10 @@ class Daemon:
             del os.environ[name]
 
     # ---- system prompt and cached phrases -------------------------------------------------------
-    def system_prompt_for(self, text: str) -> str:
-        # a remote brain gets no host metadata: nothing about this machine leaves it
-        return text if self.remote_brain else f"{text} You are running on {socket.gethostname()} ({platform.machine()})."
+    def fixed_prompt(self) -> str:
+        """The cached part of every call's instructions. The host line is for a local brain only."""
+        host = None if self.remote_brain else f"You are running on {socket.gethostname()} ({platform.machine()})."
+        return prompts.fixed_instructions(host)
 
     async def _cache_phrase(self, tts: WorkerClient, ring: FrameRing, text: str) -> list[bytes]:
         gen = tts.next_gen()
@@ -143,7 +155,7 @@ class Daemon:
         rx, tx = FrameRing(None, 100), FrameRing(None, 400)
         stt_in, tts_out = FrameRing(None, 400, frame_bytes=STT_IN_FRAME), FrameRing(None, 400, frame_bytes=TTS_OUT_FRAME)
         F = FACTORIES["fake" if self.fake else "real"]
-        default_prompt = self.system_prompt_for(self.cfg.inbound.instructions)
+        default_prompt = self.fixed_prompt()
         wa = {} if self.fake else {"wire_memory": self.cfg.models.wire_memory}  # the MLX backends pin their weights
         kw = self.cfg.models.keep_warm_sec
         stt = WorkerClient("stt", F["stt"], loop, stt_in, None, dict(wa), keep_warm_sec=kw)
@@ -177,8 +189,12 @@ class Daemon:
                       "warning": await self._cache_phrase(tts, tts_out, "This call will end in thirty seconds."),
                       "apology": await self._cache_phrase(tts, tts_out, APOLOGY),
                       "goodbye": await self._cache_phrase(tts, tts_out, GOODBYE)}
-            greetings = {"default": await self._cache_phrase(tts, tts_out, self.cfg.inbound.greeting)}
-            openings = {"default": await self._cache_phrase(tts, tts_out, "Hi, this is an AI assistant calling.")}
+            disclosure = await self._cache_phrase(tts, tts_out, prompts.DISCLOSURE)
+            greeting = await self._cache_phrase(tts, tts_out, self.cfg.inbound.greeting)
+            relay_phrases = RelayPhrases(
+                Phrase(prompts.FILLER, tuple(await self._cache_phrase(tts, tts_out, prompts.FILLER))),
+                Phrase(prompts.STILL_HERE, tuple(await self._cache_phrase(tts, tts_out, prompts.STILL_HERE))),
+                Phrase(prompts.RELAY_GOODBYE, tuple(await self._cache_phrase(tts, tts_out, prompts.RELAY_GOODBYE))))
             specs = self._line_specs()
             tel = Telephony(self.cfg, specs, loop, events, rx, tx)
             tel.start()
@@ -190,7 +206,8 @@ class Daemon:
             for s in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(s, stop.set)
             ctx = dict(tel=tel, stt=stt, llm=llm, tts=tts, rx=rx, tx=tx, stt_in=stt_in, tts_out=tts_out, cached=cached,
-                       greetings=greetings, openings=openings, turn_log=turn_log, events=events, stop=stop, specs={s.id: s for s in specs})
+                       disclosure=disclosure, greeting=greeting, relay_phrases=relay_phrases, fixed=default_prompt,
+                       turn_log=turn_log, events=events, stop=stop, specs={s.id: s for s in specs})
             control = ControlServer(paths.socket_path(), lambda msg, send: self._control(msg, send, ctx))
             await control.start()
             log.info("ready lines=%s brain=%s tier=%s warm=%s", [s.id for s in specs], self.cfg.brain.kind, self.tier, warm)
@@ -201,24 +218,11 @@ class Daemon:
                 except asyncio.TimeoutError:
                     continue
                 if isinstance(e, ev.IncomingCall):
-                    log.info("incoming on %s from %s (%s)", e.line_id, e.from_uri, e.source_ip)
-                    tel.answer(e.call_id)
-                    self.active_call = {"call_id": e.call_id, "line_id": e.line_id, "remote": e.from_uri, "started_at": time.time(), "direction": "in"}
-                    self._write_state()
+                    self._on_incoming(e, tel)
                 elif isinstance(e, ev.CallRejected):
                     log.info("rejected on %s: %s with %s", e.line_id, e.source_ip, e.code)
                 elif isinstance(e, ev.MediaActive):
-                    lid = e.line_id  # the event is authoritative; current_call is mutable state
-                    ob = self._outbound if self._outbound and self._outbound["call_id"] == e.call_id else None
-                    if ob is None:
-                        await self._run_call(e.call_id, lid, "in", None, ctx)
-                    else:  # the control handler is waiting on its queue; the main loop is the only consumer of `events`
-                        send = ob["send"]
-                        await self._run_call(e.call_id, lid, "out", ob["persona"], ctx,
-                                             on_turn_event=lambda rec: self._send_quiet(send, {"event": "turn", **{k: rec[k] for k in ("turn", "first_audible_ms", "bargein")}}))
-                        for q in self._call_waiters:
-                            q.put_nowait(("call_done", e.call_id))
-                        self._outbound = None
+                    await self._on_media_active(e, ctx)
                 elif isinstance(e, ev.RegState):
                     self._on_reg(e)
                 elif isinstance(e, ev.OutboundProgress):
@@ -226,16 +230,7 @@ class Daemon:
                     for q in self._call_waiters:
                         q.put_nowait(e)
                 elif isinstance(e, ev.CallStateChanged) and e.state == "ended":
-                    if self.active_call is not None and self.active_call.get("call_id") == e.call_id:
-                        # the active call ended before media became active (caller hung up while ringing, busy, rejected…);
-                        # a rejected second caller's own "ended" carries a different id and must not touch it
-                        self.active_call = None
-                        self._write_state()
-                    # an `ended` seen here was not consumed by a controller (the controller runs inside this loop and eats its own),
-                    # so nothing else will release the claim; release_call is a no-op for any id that is not the claimed call
-                    tel.release_call(e.call_id)
-                    for q in self._call_waiters:
-                        q.put_nowait(e)
+                    self._on_call_ended(e, tel)
         finally:
             if control is not None:
                 await control.stop()
@@ -247,74 +242,291 @@ class Daemon:
                 r.close()
                 r.unlink()
 
+    # ---- call events (main loop) ------------------------------------------------------------------------
+    def _on_incoming(self, e: ev.IncomingCall, tel) -> CallRecord:
+        """Relay mode when an AI is waiting in `listen` and no call is in progress; phone agent mode otherwise."""
+        log.info("incoming on %s from %s (%s)", e.line_id, e.from_uri, e.source_ip)
+        mode = "relay" if self.calls.listening and self.calls.current is None else "agent"
+        rec = self.calls.new(mode, "in", e.line_id, e.from_uri)
+        rec.pj_call_id = e.call_id
+        tel.answer(e.call_id)
+        if mode == "relay":
+            self.calls.deliver_incoming(rec)
+        self.active_call = {"call_id": e.call_id, "call": rec.id, "mode": mode, "line_id": e.line_id,
+                            "remote": e.from_uri, "started_at": time.time(), "direction": "in"}
+        self._write_state()
+        return rec
+
+    async def _on_media_active(self, e: ev.MediaActive, ctx: dict) -> None:
+        """The call's audio is up: run the conversation. The control handler (if any) waits on its queue; the main
+        loop is the only consumer of `events`."""
+        ob = self._outbound if self._outbound and self._outbound["call_id"] == e.call_id else None
+        rec = self.calls.by_pj(e.call_id) or (ob["record"] if ob else None)
+        if rec is None or rec.is_ended:  # cannot happen (every answered call has a live record); never run a call without one
+            log.error("media on call %s without a live call record; hanging up", e.call_id)
+            ctx["tel"].hangup(e.call_id)
+            return
+        on_turn = None
+        if ob is not None and rec.mode == "agent":
+            send = ob["send"]
+            on_turn = lambda r: self._send_quiet(
+                send, {"event": "turn", **{k: r[k] for k in ("turn", "first_audible_ms", "bargein")}})
+        await self._run_call(rec, ctx, on_turn_event=on_turn)
+        for q in self._call_waiters:
+            q.put_nowait(("call_done", e.call_id))
+        if ob is not None and self._outbound is ob:
+            self._outbound = None
+
+    def _on_call_ended(self, e: ev.CallStateChanged, tel) -> None:
+        """An `ended` no controller consumed (the controller runs inside the main loop and eats its own): the call
+        ended before its conversation started. Outbound records are finished by their `call` handler."""
+        rec = self.calls.by_pj(e.call_id)
+        if rec is not None and rec.direction == "in":  # an inbound call that ended before its audio started
+            rec.finish("completed", ended_by="them", detail="ended before the conversation started")
+            self.calls.end_current(rec)
+        if self.active_call is not None and self.active_call.get("call_id") == e.call_id:
+            # the active call ended before media became active (caller hung up while ringing, busy, rejected…);
+            # a rejected second caller's own "ended" carries a different id and must not touch it
+            self.active_call = None
+            self._write_state()
+        # nothing else will release the claim; release_call is a no-op for any id that is not the claimed call
+        tel.release_call(e.call_id)
+        for q in self._call_waiters:
+            q.put_nowait(e)
+
     # ---- control socket -------------------------------------------------------------------------------
     async def _control(self, msg: dict, send, ctx: dict) -> None:
-        tel = ctx["tel"]
-        if msg["cmd"] == "status":
-            await send({"ok": True, "lines": {k: v.__dict__ for k, v in self.line_status.items()}, "active_call": self.active_call})
-            return
-        if msg["cmd"] == "hangup":
-            cid = tel.current_call_id
-            if cid is not None:
-                tel.hangup(cid)
-            await send({"ok": True, "hung_up": cid is not None})
-            return
-        # call
-        line_id = msg.get("line") or self._default_line_for(msg.get("to", ""), ctx["specs"], tel)
+        cmd = msg["cmd"]
+        if cmd == "status":
+            cur = self.calls.current
+            await self._send_quiet(send, {"ok": True, "lines": {k: v.__dict__ for k, v in self.line_status.items()},
+                                          "active_call": self.active_call, "call": cur.summary() if cur else None,
+                                          "relay_listener": self.calls.listening})
+        elif cmd == "listen":
+            await self._cmd_listen(msg, send)
+        elif cmd == "say":
+            await self._cmd_say(msg, send)
+        elif cmd == "hangup":
+            await self._cmd_hangup(msg, send, ctx)
+        elif cmd == "call":
+            await self._cmd_call(msg, send, ctx)
+        else:  # never let an unrouted command reach the dial path
+            await self._err(send, "usage", f"unknown command {cmd!r}")
+
+    async def _err(self, send, code: str, text: str) -> None:
+        await self._send_quiet(send, {"ok": False, "error": text, "code": EXIT[code]})
+
+    def _resolve(self, call_id: str | None) -> tuple[CallRecord | None, str | None]:
+        if call_id:
+            rec = self.calls.get(call_id)
+            return rec, (None if rec else f"no call {call_id} (only the last {self.calls.retain} calls are kept)")
+        if self.calls.current is not None:
+            return self.calls.current, None
+        last = self.calls.unread_ended()
+        hint = f" (call {last.id} has ended; `ai-phone listen` returns its result)" if last else ""
+        return None, "no call in progress" + hint
+
+    async def _reply_event(self, send, rec: CallRecord, event: dict | None) -> None:
+        """Hand one of a call's events to `listen`. A listen cancelled before its reply went out (its client left)
+        puts the event back, so the next listen gets it."""
+        try:
+            await self._send_quiet(send, {"ok": True, **event} if event else {"ok": True, "kind": "timeout"})
+        except asyncio.CancelledError:
+            if event:
+                rec.put_back(event)
+            raise
+
+    async def _cmd_listen(self, msg: dict, send) -> None:
+        call_id, timeout = msg.get("call_id"), float(msg.get("timeout_sec", 60))
+        if call_id is None and self.calls.current is None:
+            ended = self.calls.unread_ended()
+            if ended is not None:  # a relay call ended since anyone last listened: report that first
+                return await self._reply_event(send, ended, await ended.next_event(0))
+            try:
+                fut = self.calls.start_listening()
+            except ListenerBusy as e:
+                return await self._err(send, "listener_busy", str(e))
+            rec = None
+            try:
+                rec = await asyncio.wait_for(asyncio.shield(fut), timeout)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                self.calls.stop_listening(fut)  # also runs when the server cancels a listen whose client left
+            if rec is None and fut.done() and not fut.cancelled():
+                rec = fut.result()  # a call arrived as the wait timed out: it is relay mode now, so report it
+            if rec is None:
+                return await self._send_quiet(send, {"ok": True, "kind": "timeout"})
+            # a reply cancelled from here on cannot be undone: that call runs with nobody listening and ends
+            # politely at the relay timeout
+            return await self._send_quiet(send, {"ok": True, "kind": "incoming", "call_id": rec.id,
+                                                 "line": rec.line_id, "remote": rec.remote})
+        rec, err = self._resolve(call_id)
+        if err:
+            return await self._err(send, "no_call", err)
+        if rec.mode != "relay" and not rec.is_ended:
+            return await self._err(send, "no_call", f"call {rec.id} is in phone agent mode; listen follows relay calls, "
+                                                    "or waits for incoming calls when no call is in progress")
+        await self._reply_event(send, rec, await rec.next_event(timeout))
+
+    async def _cmd_say(self, msg: dict, send) -> None:
+        rec, err = self._resolve(msg.get("call_id"))
+        if err:
+            return await self._err(send, "no_call", err)
+        if rec.is_ended:
+            return await self._err(send, "no_call", f"call {rec.id} has ended; `ai-phone listen --call {rec.id}` returns its result")
+        if rec.mode != "relay":
+            return await self._err(send, "no_call", f"call {rec.id} is in phone agent mode; say works on relay calls")
+        if not await rec.wait_connected(10) or rec.id not in self._controllers:
+            if rec.is_ended:
+                return await self._err(send, "no_call", f"call {rec.id} has ended; `ai-phone listen --call {rec.id}` returns its result")
+            return await self._err(send, "no_call", f"call {rec.id} is not connected")
+        result = await self._controllers[rec.id].say(msg["text"])
+        if result == "ended":
+            return await self._err(send, "no_call", f"call {rec.id} ended before the text was spoken")
+        await self._send_quiet(send, {"ok": True, "result": result, "call_id": rec.id})
+
+    async def _cmd_hangup(self, msg: dict, send, ctx: dict) -> None:
+        rec, err = self._resolve(msg.get("call_id"))
+        if err:
+            return await self._err(send, "no_call", err)
+        if not rec.is_ended:
+            rec.ended_by = rec.ended_by or "hangup_command"
+            tc = self._controllers.get(rec.id)
+            if msg.get("say") and tc is not None:
+                tc.say(msg["say"], end_reason="hangup_command")
+            elif rec.pj_call_id is not None:
+                ctx["tel"].hangup(rec.pj_call_id)
+            if not await rec.wait_ended(HANGUP_FIRST_WAIT_SEC) and rec.pj_call_id is not None:
+                ctx["tel"].hangup(rec.pj_call_id)  # the goodbye never got its turn: hang up anyway
+                await rec.wait_ended(HANGUP_SECOND_WAIT_SEC)
+            if not rec.is_ended:
+                return await self._err(send, "daemon_gone", f"call {rec.id} did not end after the hangup")
+        rec.end_reported = True
+        await self._send_quiet(send, {"ok": True, "result": rec.result()})
+
+    async def _cmd_call(self, msg: dict, send, ctx: dict) -> None:
+        tel, to = ctx["tel"], msg["to"]
+        relay, prompt = bool(msg.get("relay")), msg.get("prompt")
+        if is_emergency(to):
+            return await self._err(send, "blocked", f"{to} matches an emergency number; ai-phone never dials those")
+        line_id = msg.get("line") or self._default_line_for(to, ctx["specs"], tel)
         if line_id not in ctx["specs"]:
-            await send({"ok": False, "error": f"no such line {line_id!r}" if msg.get("line") else "no line can dial that target (no registered trunk for a phone number, or no sip line for a sip: address)"})
-            return
-        persona = "default"
+            return await self._err(send, "rejected", f"no such line {line_id!r}" if msg.get("line") else
+                                   "no line can dial that target (no registered trunk for a phone number, or no sip line for a sip: address)")
+        if not self.counter.allowed():
+            return await self._err(send, "daily_limit", f"the daily limit of {self.counter.limit} outbound calls is reached")
         q: asyncio.Queue = asyncio.Queue()
         self._call_waiters.append(q)
-        cid: int | None = None   # set once PJSIP has a call; cleanup below must not assume it
-        outcome = "rejected"
-        detail = ""
+        cid: int | None = None     # set once PJSIP has a call; cleanup below must not assume it
+        rec: CallRecord | None = None
+        mine: dict | None = None   # our entry in self._outbound
+        handed_over = False        # a relay call that carries on after this command returns
+        outcome, detail = "rejected", ""
         try:
             try:
-                cid = tel.make_call(line_id, msg["to"], float(msg.get("timeout_sec", 30)))
+                cid = tel.make_call(line_id, to, float(msg.get("timeout_sec", 30)))
             except BusyError:
-                await send({"ok": False, "error": "busy"})
-                return
+                return await self._err(send, "busy", "busy")
             except DialError as e:
-                await send({"event": "ended", "reason": "rejected", "detail": str(e), "exit_code": EXIT["rejected"]})
-                return  # nothing was claimed (make_call cleared it) and no state was written
-            log.info("control: call on line %s to %s -> call_id %s", line_id, msg["to"], cid)
-            self._outbound = {"call_id": cid, "persona": persona, "send": send}
-            self.active_call = {"call_id": cid, "line_id": line_id, "remote": msg["to"], "started_at": time.time(), "direction": "out"}
+                return await self._send_quiet(send, {"event": "ended", "reason": "rejected", "detail": str(e),
+                                                     "exit_code": EXIT["rejected"], "call_id": None, "result": None})
+            self.counter.record()  # every accepted dial attempt counts: busy and unanswered calls can cost too
+            rec = self.calls.new("relay" if relay else "agent", "out", line_id, to, prompt)
+            rec.pj_call_id = cid
+            log.info("control: %s call %s on line %s to %s -> pjsip call %s", rec.mode, rec.id, line_id, to, cid)
+            mine = self._outbound = {"call_id": cid, "record": rec, "send": send}
+            self.active_call = {"call_id": cid, "call": rec.id, "mode": rec.mode, "line_id": line_id, "remote": to,
+                                "started_at": time.time(), "direction": "out"}
             self._write_state()
+            await self._send_quiet(send, {"event": "created", "call_id": rec.id})
             while True:  # progress arrives via the main loop, which is the only consumer of the telephony queue
-                e = await q.get()
-                if isinstance(e, ev.OutboundProgress) and (e.call_id == cid or (e.call_id == -1 and e.line_id == line_id)):  # -1: "dialling", before PJSIP assigns the id
-                    await self._send_quiet(send, {"event": e.state, "code": e.code, "uri": e.reason if e.state == "dialling" else "",
-                                                  "reason": "" if e.state == "dialling" else e.reason})
-                    if e.state in ("busy", "no_answer", "rejected", "redirected"):
-                        outcome = e.state
-                        detail = f"{e.code} {e.reason}".strip()
+                if relay and outcome == "answered":
+                    # answered: wait for the audio, but an `ended` that comes first must end the record at once
+                    e = await self._next_or_connected(q, rec)
+                    if e is None:
+                        handed_over = True  # the conversation runs; _run_call finishes the record
+                        await self._send_quiet(send, {"ok": True, "event": "answered", "call_id": rec.id, "mode": "relay"})
+                        return  # the call carries on; listen/say/hangup take over
+                else:
+                    e = await q.get()
+                if isinstance(e, ev.OutboundProgress) and (e.call_id == cid or (e.call_id == -1 and e.line_id == line_id)):
+                    # -1: "dialling", before PJSIP assigns the id
+                    state = e.state
+                    terminal = state in ("busy", "no_answer", "rejected", "redirected")
+                    if terminal:  # PJSIP posts this before `ended`; a `hangup` before the answer shows up here (487)
+                        state = "cancelled" if rec.ended_by == "hangup_command" else state
+                        outcome, detail = state, f"{e.code} {e.reason}".strip()
+                    await self._send_quiet(send, {"event": state, "code": e.code, "uri": e.reason if state == "dialling" else "",
+                                                  "reason": "" if state == "dialling" else e.reason})
+                    if terminal:
                         break
-                    if e.state == "answered":
+                    if state == "answered":
                         outcome = "answered"
-                        continue  # keep waiting: the main loop runs the conversation and posts call_done
+                        rec.answered = rec.answered or time.time()
                 elif isinstance(e, tuple) and e[0] == "call_done" and e[1] == cid:
                     outcome = "answered"  # the conversation ran, whatever order PJSIP delivered media and CONFIRMED in
                     break
-                elif isinstance(e, ev.CallStateChanged) and e.call_id == cid and e.state == "ended" and self._outbound is not None:
+                elif e is _RECORD_ENDED:
+                    break
+                elif isinstance(e, ev.CallStateChanged) and e.call_id == cid and e.state == "ended" and not rec.is_ended:
+                    if rec.ended_by == "hangup_command" and outcome != "answered":
+                        outcome = "cancelled"
                     break  # ended before media became active
             if outcome == "rejected" and detail and detail.split(" ", 1)[0] in ("403", "603"):
                 if not any(w in detail.lower() for w in ("whitelist", "account level", "verified")):  # the carrier said why already
                     detail += (" (the carrier refused the call: either the caller ID is not one of the line's numbers or a verified one,"
                                " or the destination is not allowed for this account or its outbound voice profile)")
-            await self._send_quiet(send, {"event": "ended", "reason": outcome, "detail": detail, "exit_code": EXIT.get(outcome, EXIT["rejected"])})
+            if rec.is_ended:  # the conversation ran and _run_call finished the record
+                code = EXIT["completed"]
+            elif outcome == "answered":  # answered, then gone before any audio
+                rec.finish("completed", ended_by="them", detail="ended before the conversation started")
+                self.calls.end_current(rec)
+                code = EXIT["completed"]
+            else:
+                rec.finish(outcome, detail=detail)
+                self.calls.end_current(rec)
+                code = EXIT.get(outcome, EXIT["rejected"])
+            rec.end_reported = True  # the result goes to this command: `listen` need not report the end again
+            await self._send_quiet(send, {"event": "ended", "reason": rec.outcome, "detail": rec.detail, "exit_code": code,
+                                          "call_id": rec.id, "result": rec.result()})
         finally:
-            self._outbound = None
+            if mine is not None and self._outbound is mine:
+                self._outbound = None  # only our own: a `call` refused as busy must not touch the call in progress
             self._call_waiters.remove(q)
+            if rec is not None and not rec.is_ended and not handed_over and rec.id not in self._controllers:
+                # left early, with no conversation running that would finish the record: cancelled when the daemon
+                # stops (ControlServer.stop), or a failure in this handler
+                failure = sys.exception()
+                stopped = isinstance(failure, asyncio.CancelledError)
+                rec.finish("completed" if outcome == "answered" else ("cancelled" if stopped else "rejected"), ended_by="error",
+                           detail="ai-phone stopped" if stopped else f"the call command failed ({type(failure).__name__})")
+                self.calls.end_current(rec)
             if cid is not None and outcome != "answered":
-                if self.active_call is not None and self.active_call.get("call_id") == cid:
+                if rec is not None and self.active_call is not None and self.active_call.get("call") == rec.id:
                     self.active_call = None  # never reached media, so _run_call never cleared it
                     self._write_state()
                 # the main loop releases on `ended` too; both are idempotent, so the claim can never be left behind
                 if getattr(tel, "current_call", None) is not None and tel.current_call.getId() == cid and tel.current_call.ended:
                     tel.release_call(cid)
+
+    @staticmethod
+    async def _next_or_connected(q: asyncio.Queue, rec: CallRecord):
+        """An answered relay call waiting for its audio: None once the audio is up, otherwise the next event on `q`
+        (so an `ended` that comes before any audio is handled at once instead of after a timeout)."""
+        getter = asyncio.ensure_future(q.get())
+        connected = asyncio.ensure_future(rec.wait_connected(None))
+        try:
+            await asyncio.wait((getter, connected), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (getter, connected):
+                t.cancel()
+            await asyncio.gather(getter, connected, return_exceptions=True)
+        if connected.done() and not connected.cancelled() and connected.result():
+            return None  # an event that arrived at the same moment is not needed: _run_call owns the call now
+        if getter.done() and not getter.cancelled():
+            return getter.result()
+        return _RECORD_ENDED  # the record was finished elsewhere and no event is waiting
 
     @staticmethod
     def _default_line_for(target: str, specs: dict, tel) -> str | None:
@@ -336,67 +548,96 @@ class Daemon:
             pass  # the CLI went away; the call continues
 
     # ---- one call --------------------------------------------------------------------------------------
-    async def _run_call(self, call_id, line_id, direction, persona_name, ctx, on_turn_event=None):
+    @staticmethod
+    def _ended_by(end_reason: str | None, remote_ended: bool) -> str:
+        if remote_ended:
+            return "them"
+        return {"agent": "agent", "relay_timeout": "timeout", "silence": "silence", "max_duration": "max_duration",
+                "hangup_command": "hangup_command"}.get(end_reason or "", "error")
+
+    async def _run_call(self, rec: CallRecord, ctx: dict, on_turn_event=None) -> None:
         tel, stt, llm, tts = ctx["tel"], ctx["stt"], ctx["llm"], ctx["tts"]
         rx, tx, stt_in, tts_out, cached = ctx["rx"], ctx["tx"], ctx["stt_in"], ctx["tts_out"], ctx["cached"]
-        persona_name = "default"
+        call_id, line_id, out = rec.pj_call_id, rec.line_id, rec.direction == "out"
+        rec.answered = rec.answered or time.time()
         vad = EnergyVad() if self.fake else SileroVad()
         n = [0]
         turn_log, events, stop = ctx["turn_log"], ctx["events"], ctx["stop"]
 
         def on_turn(t):
-            rec = t.to_record(str(call_id), n[0])
-            rec["line_id"], rec["persona"] = line_id, persona_name
-            turn_log.write(rec)
+            r = t.to_record(str(call_id), n[0])
+            r.update(line_id=line_id, call=rec.id, mode=rec.mode)
+            turn_log.write(r)
             n[0] += 1
-            log.info("turn %s line=%s first_audible=%s bargein=%s brain_error=%s", n[0], line_id, t.first_audible_ms(), t.bargein, t.brain_error)
+            log.info("turn %s call=%s line=%s first_audible=%s bargein=%s brain_error=%s", n[0], rec.id, line_id,
+                     t.first_audible_ms(), t.bargein, t.brain_error)
             if on_turn_event is not None:
-                task = asyncio.get_running_loop().create_task(on_turn_event(rec))
+                task = asyncio.get_running_loop().create_task(on_turn_event(r))
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
 
+        section = rec.prompt if out else self.cfg.inbound.instructions
         tc = TurnController(self.cfg.conversation, tel.port, stt, llm, tts, rx, tx, stt_in, tts_out,
-                            Endpointer(vad, self.cfg.conversation.endpoint_silence_ms), ctx["greetings"][persona_name],
-                            self.system_prompt_for(self.cfg.inbound.instructions), on_turn, prompt_frames=cached["prompt"], warning_frames=cached["warning"],
-                            rtp_last_rx_ns=lambda: tel.port.last_rx_ns, apology_frames=cached["apology"], goodbye_frames=cached["goodbye"],
-                            opening_frames=ctx["openings"][persona_name] if direction == "out" else None, direction=direction)
+                            Endpointer(vad, self.cfg.conversation.endpoint_silence_ms), ctx["greeting"],
+                            prompts.system_prompt(ctx["fixed"], section), on_turn,
+                            prompt_frames=cached["prompt"], warning_frames=cached["warning"],
+                            rtp_last_rx_ns=lambda: tel.port.last_rx_ns, apology_frames=cached["apology"],
+                            goodbye_frames=cached["goodbye"], opening_frames=ctx["disclosure"] if out else None,
+                            direction=rec.direction,
+                            replies=RelayReplies(rec.heard) if rec.mode == "relay" else ModelReplies(),
+                            calls=self.cfg.calls, relay_phrases=ctx["relay_phrases"], on_line=rec.add_line,
+                            opening_text=prompts.DISCLOSURE if out else self.cfg.inbound.greeting,
+                            generate_opening=out and rec.mode == "agent")
+        self._controllers[rec.id] = tc
+        rec.mark_connected()
+        remote_ended = False
         call_stop = asyncio.Event()
         runner = asyncio.create_task(tc.run(call_stop))
-        while not call_stop.is_set() and not stop.is_set():
-            if tc.hangup_requested.is_set():
-                log.info("hangup: %s", tc.end_reason)
-                tel.hangup(call_id)
-                break
-            try:
-                e = await asyncio.wait_for(events.get(), 0.1)
-            except asyncio.TimeoutError:
-                continue
-            if isinstance(e, ev.CallStateChanged) and e.state == "ended":
-                if e.call_id == call_id:
+        try:
+            while not call_stop.is_set() and not stop.is_set():
+                if tc.hangup_requested.is_set():
+                    log.info("hangup: call %s %s", rec.id, tc.end_reason)
+                    tel.hangup(call_id)
                     break
-                log.info("ignoring end of unrelated call %s while call %s is active", e.call_id, call_id)
-            elif isinstance(e, ev.CallRejected):
-                log.info("rejected on %s: %s with %s", e.line_id, e.source_ip, e.code)
-            elif isinstance(e, ev.OutboundProgress):
-                # PJSIP can report media active before CONFIRMED, so "answered" may arrive while the call already runs
-                log.info("outbound line=%s call=%s state=%s code=%s %s", e.line_id, e.call_id, e.state, e.code, e.reason)
-                for q in self._call_waiters:
-                    q.put_nowait(e)
-            elif isinstance(e, ev.RegState):
-                self._on_reg(e)   # registration changes keep flowing during a call
-        call_stop.set()
-        await runner
-        for c in (stt, llm, tts):
-            c.cancel(c.current_gen)
-        if tc.timer is not None and tc.timer.t0 is not None:
-            rec = tc.timer.to_record(str(call_id), n[0])
-            rec.update(incomplete=True, state_at_end=tc.state, line_id=line_id, persona=persona_name)
-            turn_log.write(rec)
-        port = tel.port
-        if port is not None and hasattr(port, "cancel_flush"):
-            port.cancel_flush()  # a flush the PJSIP thread never performed must not hit the next call's greeting
-        for r in (rx, tx, tts_out):
-            r.flush()
-        self.active_call = None
-        self._write_state()
-        tel.release_call(call_id)  # only now may the next call be claimed
+                try:
+                    e = await asyncio.wait_for(events.get(), 0.1)
+                except asyncio.TimeoutError:
+                    continue
+                if isinstance(e, ev.CallStateChanged) and e.state == "ended":
+                    if e.call_id == call_id:
+                        remote_ended = True
+                        break
+                    log.info("ignoring end of unrelated call %s while call %s is active", e.call_id, call_id)
+                elif isinstance(e, ev.CallRejected):
+                    log.info("rejected on %s: %s with %s", e.line_id, e.source_ip, e.code)
+                elif isinstance(e, ev.OutboundProgress):
+                    # PJSIP can report media active before CONFIRMED, so "answered" may arrive while the call already runs
+                    log.info("outbound line=%s call=%s state=%s code=%s %s", e.line_id, e.call_id, e.state, e.code, e.reason)
+                    for q in self._call_waiters:
+                        q.put_nowait(e)
+                elif isinstance(e, ev.RegState):
+                    self._on_reg(e)   # registration changes keep flowing during a call
+        finally:
+            call_stop.set()
+            try:
+                await runner
+            finally:  # the teardown runs even if the controller failed: the record ends and the claim is released
+                for c in (stt, llm, tts):
+                    c.cancel(c.current_gen)
+                if tc.timer is not None and tc.timer.t0 is not None:
+                    r = tc.timer.to_record(str(call_id), n[0])
+                    r.update(incomplete=True, state_at_end=tc.state, line_id=line_id, call=rec.id, mode=rec.mode)
+                    turn_log.write(r)
+                ended_by = self._ended_by(tc.end_reason, remote_ended)
+                detail = "" if ended_by != "error" else (tc.end_reason or ("ai-phone stopped" if stop.is_set() else "unknown"))
+                rec.finish("completed", ended_by=ended_by, detail=detail)
+                self._controllers.pop(rec.id, None)
+                port = tel.port
+                if port is not None and hasattr(port, "cancel_flush"):
+                    port.cancel_flush()  # a flush the PJSIP thread never performed must not hit the next call's greeting
+                for r_ in (rx, tx, tts_out):
+                    r_.flush()
+                self.active_call = None
+                self._write_state()
+                tel.release_call(call_id)  # only now may the next call be claimed
+                self.calls.end_current(rec)

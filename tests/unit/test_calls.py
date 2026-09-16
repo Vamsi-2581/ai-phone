@@ -217,3 +217,39 @@ def test_by_pj_matches_only_the_live_current_call():
     assert reg.by_pj(4) is rec and reg.by_pj(5) is None
     rec.finish("completed")
     assert reg.by_pj(4) is None
+
+
+@pytest.mark.asyncio
+async def test_put_back_heard_goes_before_newer_speech():
+    reg = CallRegistry()
+    rec = reg.new("relay", "out", "main", "x")
+    rec.heard("Hello?")
+    event = await rec.next_event(0)
+    rec.heard("Are you there?")                # they went on talking while the reply was lost
+    rec.put_back(event)
+    assert await rec.next_event(0) == {"kind": "heard", "text": "Hello? Are you there?"}
+    assert await rec.next_event(0) is None
+
+
+@pytest.mark.asyncio
+async def test_put_back_heard_alone_is_returned_again_and_wakes_a_waiting_listen():
+    reg = CallRegistry()
+    rec = reg.new("relay", "out", "main", "x")
+    rec.heard("Hello?")
+    event = await rec.next_event(0)
+    waiting = asyncio.create_task(rec.next_event(2))
+    await asyncio.sleep(0.01)
+    rec.put_back(event)
+    assert await asyncio.wait_for(waiting, 1) == {"kind": "heard", "text": "Hello?"}
+
+
+@pytest.mark.asyncio
+async def test_put_back_ended_makes_the_end_unreported_again():
+    reg = CallRegistry()
+    rec = reg.new("relay", "out", "main", "x")
+    rec.finish("completed")
+    reg.end_current(rec)
+    event = await rec.next_event(0)
+    assert event["kind"] == "ended" and rec.end_reported and reg.unread_ended() is None
+    rec.put_back(event)
+    assert not rec.end_reported and reg.unread_ended() is rec

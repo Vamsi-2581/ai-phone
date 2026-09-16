@@ -23,6 +23,12 @@ def test_render_status_tolerates_a_partial_state_file():
     assert "main" in out and "active call: ? on ? with ?" in out
 
 
+def test_render_status_shows_the_call_id_and_mode():
+    state = dict(STATE, active_call={"call_id": 4, "call": "c7f3a2", "mode": "relay", "direction": "out",
+                                     "line_id": "main", "remote": "+15550000000"})
+    assert "active call: out relay call c7f3a2 on main with +15550000000" in render_status(state, alive=True)
+
+
 def test_status_command_reads_state_file(tmp_path: Path, monkeypatch, capsys):
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
     (tmp_path / "state.json").write_text(json.dumps(STATE))
