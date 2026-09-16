@@ -14,15 +14,16 @@ import wave
 from pathlib import Path
 
 import pytest
-from tests.integration.ports import SIP_CONFIG, SIP_PORT  # noqa: E402
+from tests.integration.ports import SIP_PORT, sip_config  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
 
-def _tone(path: Path, seconds=1.2, rate=8000, tail_silence=3.0, turns=1):
-    """`turns` tones, each followed by silence: the endpointer needs silence after speech to close a turn."""
-    one = b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * 300 * i / rate))) for i in range(int(seconds * rate)))
-    one += bytes(2 * int(tail_silence * rate))
+def _tone(path: Path, seconds=1.2, rate=8000, tail_silence=3.0, turns=1, lead_silence=0.0):
+    """`turns` utterances, each `lead_silence` of silence, a tone, then `tail_silence` of silence: the endpointer needs
+    silence after speech to close a turn, and a lead lets the other side finish its greeting first."""
+    tone = b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * 300 * i / rate))) for i in range(int(seconds * rate)))
+    one = bytes(2 * int(lead_silence * rate)) + tone + bytes(2 * int(tail_silence * rate))
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -30,9 +31,9 @@ def _tone(path: Path, seconds=1.2, rate=8000, tail_silence=3.0, turns=1):
         w.writeframes(one * turns)
 
 
-def _start_daemon(home: Path, cfg_text: str, extra_args=()):
+def _start_daemon(home: Path, cfg_text: str, extra_args=(), port=SIP_PORT):
     cfg = home / "config.yaml"
-    cfg.write_text(SIP_CONFIG + cfg_text)  # the suite's ports, so it can run beside a live daemon (AI_PHONE_TEST_SIP_PORT)
+    cfg.write_text(sip_config(port) + cfg_text)  # the suite's ports, so it can run beside a live daemon (AI_PHONE_TEST_SIP_PORT)
     # start_new_session: `uv run` is a parent of the real daemon; killing only uv would leave the daemon (and port 5060) behind
     d = subprocess.Popen(["uv", "run", "ai-phone", "run", "--config", str(cfg), "--lan", "--fake", *extra_args],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env={**os.environ, "AI_PHONE_HOME": str(home)},
@@ -117,7 +118,7 @@ def _call_and_wait(d, lines: queue.Queue, home: Path, turns: int = 1):
     return recs
 
 
-CFG = ('personas:\n  default:\n    greeting: "Hi."\n    system_prompt: "s"\n'
+CFG = ('inbound:\n  greeting: "Hi."\n  instructions: "s"\n'
        'conversation:\n  endpoint_silence_ms: 300\nlog:\n  dir: "%s"\n')
 
 

@@ -37,7 +37,7 @@ def test_brain_failover(tmp_path: Path, monkeypatch):
     port = srv.server_address[1]
     cfg = tmp_path / "config.yaml"
     cfg.write_text(f'brain:\n  kind: openai_compatible\n  base_url: "http://127.0.0.1:{port}/v1"\n  model: test\n'
-                   f'personas:\n  default:\n    greeting: "Hi."\n    system_prompt: "s"\nlog:\n  dir: "{tmp_path}"\n')
+                   f'inbound:\n  greeting: "Hi."\n  instructions: "s"\nlog:\n  dir: "{tmp_path}"\n')
     # --fake keeps STT/TTS fake; the brain comes from the config (the daemon honours brain.kind even with --fake)
     from tests.integration.test_daemon_smoke import _call_and_wait, _start_daemon, _stop_daemon  # shared helpers
     d, lines = _start_daemon(tmp_path, cfg.read_text())

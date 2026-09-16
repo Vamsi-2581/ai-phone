@@ -19,7 +19,7 @@ from tests.integration.ports import PEER_PORT, SIP_PORT  # noqa: E402
 
 CFG = ('lines:\n  agents:\n    kind: sip\n    user: agents\n    aor: "sip:agents@127.0.0.1"\n    display_name: agents\n'
        '    accept_invites_from: lan\n    caller_id: "sip:agents@127.0.0.1"\n'
-       'personas:\n  default:\n    greeting: "Hi."\n    system_prompt: "s"\n    outbound_opening: "Hello, AI here."\n'
+       'inbound:\n  greeting: "Hi."\n  instructions: "s"\n'
        'log:\n  dir: "%s"\n')
 
 
