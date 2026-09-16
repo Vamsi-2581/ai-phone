@@ -84,6 +84,33 @@ class StallLLM(FakeLLM):
         yield from super().stream(gen_id, messages, max_tokens)
 
 
+class EndingLLM(FakeLLM):
+    """Says goodbye and asks to end the call, with the marker split over tokens as a real model may do."""
+    TOKENS = ["Goodbye", ",", " thanks", ".", " [", "END", "]"]
+
+
+class PartialFailLLM(FakeLLM):
+    """Streams the start of a reply (with a stray end marker), then fails with a recoverable BrainError."""
+    TOKENS = ["Sure", ",", " one", " moment", ".", " [end]"]
+
+    def stream(self, gen_id, messages, max_tokens):
+        from ai_phone.services.errors import BrainError
+        yield from super().stream(gen_id, messages, max_tokens)
+        raise BrainError("http_503")
+
+
+class SlowSTT(FakeSTT):
+    """Takes `delay_s` to finalise (a slow or swapping host), so speech can arrive while a transcript is pending."""
+
+    def __init__(self, delay_s: str = "2"):
+        super().__init__()
+        self._delay = float(delay_s)
+
+    def finalize(self, gen_id):
+        time.sleep(self._delay)
+        return super().finalize(gen_id)
+
+
 class KeepWarmProbeSTT(FakeSTT):
     """Counts keep_warm ticks into a file the test can read (the worker runs in another process)."""
 
