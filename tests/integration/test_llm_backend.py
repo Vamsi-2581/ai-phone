@@ -33,11 +33,13 @@ def test_cancel_stops_stream_early():
 
 
 def test_prompt_cache_reuses_the_system_prefix():
+    from ai_phone.pipeline.prompts import system_prompt as compose
     from ai_phone.services.backends.mlx_lm_backend import make_t4
 
     llm = make_t4()
     llm.warmup(SYS)
-    hist = [{"role": "system", "content": SYS}, {"role": "user", "content": "What time is it right now?"}]
+    hist = [{"role": "system", "content": compose(SYS, "Ask what time it is where they are.")},
+            {"role": "user", "content": "What time is it right now?"}]
     reply = "".join(llm.stream(5, hist, 40))
     t1 = dict(llm.last_timings)
     hist += [{"role": "assistant", "content": reply}, {"role": "user", "content": "And what day is it?"}]

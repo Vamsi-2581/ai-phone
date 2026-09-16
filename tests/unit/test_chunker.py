@@ -1,3 +1,5 @@
+import pytest
+
 from ai_phone.pipeline.chunker import ClauseChunker
 
 
@@ -36,3 +38,59 @@ def test_flush_returns_remainder_and_empties():
 
 def test_whitespace_only_is_dropped():
     assert run([" ", "\n"]) == []
+
+
+def test_end_marker_split_over_tokens_is_removed_and_flagged():
+    c = ClauseChunker()
+    out = []
+    for t in ["Goodbye", ",", " thanks", ".", " [", "END", "]"]:
+        out += c.feed(t)
+    out += c.flush()
+    assert out == ["Goodbye, thanks."] and c.ended
+
+
+def test_end_marker_glued_to_the_sentence():
+    c = ClauseChunker()
+    out = c.feed("Bye now.[END]") + c.flush()
+    assert out == ["Bye now."] and c.ended
+
+
+def test_partial_marker_is_held_back_until_complete():
+    c = ClauseChunker(max_tokens=2, first_max_tokens=2)
+    assert c.feed("Okay") == []
+    assert c.feed(" [EN") == []          # would hit max_tokens, but the buffer ends with a partial marker
+    assert c.feed("D]") == ["Okay"]      # complete marker: emitted without it
+    assert c.ended
+
+
+def test_no_marker_means_not_ended():
+    c = ClauseChunker()
+    assert c.feed("Hello.") == ["Hello."] and not c.ended and c.flush() == []
+
+
+def test_marker_alone_emits_nothing():
+    c = ClauseChunker()
+    assert c.feed("[END]") == [] and c.flush() == [] and c.ended
+
+
+@pytest.mark.parametrize("tail", [" [", " [E", " [EN", " [END", " [en"])
+def test_reply_cut_inside_a_marker_speaks_the_words_before_it_and_does_not_end(tail):
+    c = ClauseChunker()
+    out = []
+    for t in ["I", " can", " help", tail]:
+        out += c.feed(t)
+    out += c.flush()
+    assert out == ["I can help"] and not c.ended
+
+
+def test_lowercase_marker_is_removed_and_flagged():
+    c = ClauseChunker()
+    out = c.feed("Bye.[end]") + c.flush()
+    assert out == ["Bye."] and c.ended
+
+
+def test_mixed_case_partial_marker_is_held_then_removed():
+    c = ClauseChunker(max_tokens=1, first_max_tokens=1)
+    assert c.feed("Bye [En") == []       # would hit max_tokens, but the buffer ends with a partial marker
+    assert c.feed("d]") == ["Bye"]
+    assert c.ended

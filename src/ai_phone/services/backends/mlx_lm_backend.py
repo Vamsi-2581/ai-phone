@@ -1,16 +1,18 @@
 """Qwen3.5 via mlx-lm, in the worker's own process. Thinking disabled through the chat template.
 
 Prompt-cache reuse: Qwen3.5's cache is a hybrid (linear-attention state plus KV) and cannot be trimmed,
-so the reusable part is the stable system prefix. It is evaluated once at warm-up into a snapshot;
-each turn starts from a copy of that snapshot (0.2 ms) and evaluates only the history and the new
-user turn. The prefix is found as the common token prefix of two probe prompts, so template quirks
-(thinking blocks, generation markers) cannot desynchronise it.
+so the reusable part is the prefix every call shares: the fixed phone instructions plus the call-section
+header. It is evaluated once at warm-up into a snapshot; each turn starts from a copy of that snapshot
+(0.2 ms) and evaluates only the call section, the history and the new user turn. The prefix is found as
+the common token prefix of two probe prompts whose call sections differ from their first character, so
+template quirks (thinking blocks, generation markers) cannot desynchronise it.
 """
 from __future__ import annotations
 
 import copy
 import time
 
+from ai_phone.pipeline.prompts import cache_probe_sections, system_prompt as compose_prompt
 from ai_phone.services.base import Message
 
 T9 = "mlx-community/Qwen3.5-9B-MLX-4bit"
@@ -42,20 +44,21 @@ class MlxLmLLM:
         begin_wiring(wire_memory)  # before the load: MLX wires buffers as they are allocated
         self._model, self._tok = load(self.model_id)
         wired = wire_resident(self._model, wire_memory)  # the weights stay resident through idle spells
-        system = self._system = system_prompt or "You are a phone assistant."
-        a = self._ids([{"role": "system", "content": system}, {"role": "user", "content": "a"}])
-        b = self._ids([{"role": "system", "content": system}, {"role": "user", "content": "b"}])
+        fixed = self._system = system_prompt or "You are a phone assistant."  # the part every call shares
+        pa, pb = cache_probe_sections()
+        a = self._ids([{"role": "system", "content": compose_prompt(fixed, pa)}, {"role": "user", "content": "Hello?"}])
+        b = self._ids([{"role": "system", "content": compose_prompt(fixed, pb)}, {"role": "user", "content": "Hello?"}])
         n = 0
         for x, y in zip(a, b):
             if x != y:
                 break
             n += 1
-        self._prefix_ids = a[:n]
+        self._prefix_ids = a[:n]  # the fixed instructions and the call-section header: every call's prompt starts so
         cache = make_prompt_cache(self._model)
         if self._prefix_ids:
             mx.eval(self._model(mx.array(self._prefix_ids)[None], cache=cache))
         self._snap = cache
-        list(self.stream(0, [{"role": "system", "content": system}, {"role": "user", "content": "Hello?"}], 8))
+        list(self.stream(0, [{"role": "system", "content": compose_prompt(fixed, None)}, {"role": "user", "content": "Hello?"}], 8))
         return {"warm_ms": (time.monotonic_ns() - t) / 1e6, "prefix_tokens": float(len(self._prefix_ids)), **wired}
 
     def stream(self, gen_id: int, messages: list[Message], max_tokens: int):
@@ -91,7 +94,7 @@ class MlxLmLLM:
     def keep_warm(self) -> None:
         """One token from the cached prefix: reads every weight once, leaves last_timings alone."""
         saved = self.last_timings
-        list(self.stream(-1, [{"role": "system", "content": self._system}, {"role": "user", "content": "Hi."}], 1))
+        list(self.stream(-1, [{"role": "system", "content": compose_prompt(self._system, None)}, {"role": "user", "content": "Hi."}], 1))
         self.last_timings = saved
 
 
