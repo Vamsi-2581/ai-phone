@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | v1.0 baseline, 2026-09-02. Companion to `PRD.md` and `architecture-essentials.md`. |
+| **Status** | v1.0 baseline, 2026-09-02; Milestone 2 as built in §14a (2026-09-03), Milestone 3 as built in §14b (2026-09-16). Companion to `PRD.md` and `architecture-essentials.md`. |
 | **Reading order** | `architecture-essentials.md` first. Come here when it does not answer the question. |
 | **Precedence** | Owner's decisions → this doc → PRD. Where this doc and the PRD disagree on an architectural detail, this doc wins; where they disagree on a *decision*, the decision log in §15 wins. |
 | **Notation** | **[D]** decided; do not change without the owner. **[P]** proposed default; change if Milestone 1 measurement says so, and record the change in §15. **[V]** verified against library source, PyPI, Hugging Face, or Homebrew on 2026-09-02 by an independent reviewer. |
@@ -33,7 +33,7 @@ Non-goals that shape the architecture (from the PRD): single-call, English-only,
  │        (PJSIP)         (asyncio, main)     (3 child processes)            │
  │                              │                                            │
  │                       Layer 4 Control plane                               │
- │              CLI · YAML config · doctor · HTTP API (M4) · TUI (M4)        │
+ │              CLI · YAML config · doctor · HTTP API (M5) · TUI (M5)        │
  └──────────────────────────────────────────────────────────────────────────┘
                               ▲
                               │  localhost only
@@ -72,7 +72,7 @@ PJSIP → Python callbacks are SWIG *director* calls; the extension **must be bu
 4. Spawn the three workers. Each loads its model and replies `ready` with warm-up timings. Warm-up = one real inference each (a 1 s silent-plus-tone buffer for STT, a 16-token generation for the LLM with the system prompt as prefix so the prompt cache is primed, one short sentence for TTS).
 5. Create the PJSIP endpoint: `libCreate` → `libInit(EpConfig)` → transports → `audDevManager().setNullDev()` → codec priorities → `libStart`.
 6. Create one account per configured line and register the trunk lines (sip lines run registrar-less; with no lines configured an implicit `local` sip line is created, §14a.2).
-7. Start the control plane (CLI is already running; HTTP API in M4 binds `127.0.0.1` only by default).
+7. Start the control plane (the control socket, §7.2; the HTTP API in M5 binds `127.0.0.1` only by default).
 8. Log `ready` with: SIP registration state, resident memory per process, warm-up latencies, invite-acceptance mode.
 
 Total cold start target: under 15 s on the 9B tier on an M5 Pro **[P]**.
@@ -139,7 +139,7 @@ acc_cfg.mediaConfig.srtpSecureSignaling = 0
        └────────── backoff ◀────┴────────────────────────────────── DEGRADED ──retry──▶ REGISTERING
 ```
 
-Backoff on non-fatal failure: 5 s, 10 s, 20 s, 40 s, 60 s, then every 60 s, with ±20 % jitter **[P]**. The `onRegState` callback posts `RegEvent(state, code, reason)` to the asyncio queue; the pipeline never reads PJSIP state directly. `doctor` and the M4 API surface the current state. Success criterion: registered 24 h unattended, which this machine satisfies by construction if refresh runs at `expiry/2`.
+Backoff on non-fatal failure: 5 s, 10 s, 20 s, 40 s, 60 s, then every 60 s, with ±20 % jitter **[P]**. The `onRegState` callback posts `RegEvent(state, code, reason)` to the asyncio queue; the pipeline never reads PJSIP state directly. `ai-phone status` shows the current state; `doctor` (M4) and the M5 API will too. Success criterion: registered 24 h unattended, which this machine satisfies by construction if refresh runs at `expiry/2`.
 
 ### 3.4 Call handling
 
@@ -153,14 +153,14 @@ Backoff on non-fatal failure: 5 s, 10 s, 20 s, 40 s, 60 s, then every 60 s, with
    - `lan`: accept if source IP ∈ RFC 1918 ∪ `127.0.0.0/8` ∪ `::1` ∪ `fe80::/10` **[D]** (loopback is included so the `pjsua` test peer and CI work). Otherwise 403.
    - `any`: accept from anywhere (documented as unsafe; `doctor` warns).
 3. If a call is already active or ending: reply **486 Busy Here**.
-4. Optional caller allowlist (M4): if configured and the From user is not listed, 403.
+4. Optional caller allowlist (M5): if configured and the From user is not listed, 403.
 5. Otherwise: create the `Call` object, answer **180 Ringing** immediately, then post `IncomingCall(call_id, from, source)` to the asyncio queue. The pipeline answers **200 OK** when it is ready to speak the greeting (normally within one loop iteration; the 180 covers the gap).
 
 Per-IP auth-failure lockout (M2): count 401/403 responses per source IP over a sliding 10 min window; after 5, drop SIP messages from that IP for 15 min **[P]**. Implemented in the same callback using a small in-memory table; persisted nowhere.
 
 #### 3.4.2 Outbound
 
-`Call.makeCall(uri, CallOpParam)` from the asyncio thread (the main thread is registered). Triggered by the M2 CLI (`ai-phone call <number>`, which talks to the daemon over the control socket, §8.4) and by the M4 HTTP API. Dial string → `sip:<number>@<domain>`; E.164 normalisation is the caller's job, ai-phone only strips whitespace. Outbound calls use the same pipeline; the greeting is replaced by `outbound.opening_line` from config or the API request.
+`Call.makeCall(uri, CallOpParam)` from the asyncio thread (the main thread is registered). Triggered by the CLI (`ai-phone call <number>`, which talks to the daemon over the control socket, §7.2) and by the M5 HTTP API. Dial string → `sip:<number>@<domain>`; E.164 normalisation is the caller's job, ai-phone only strips whitespace. Outbound calls use the same pipeline; the greeting is replaced by the fixed disclosure "Hi, this is an AI assistant calling." (§14b.5).
 
 #### 3.4.3 Call state machine **[D]**
 
@@ -266,7 +266,7 @@ One `TurnController` per call. Every generation carries a monotonically increasi
 
 ### 4.5 LLM and clause chunking
 
-- Messages: `[system, ...history(≤ 6 turns), user(final_text)]` **[D]**. System prompt ≤ 60 tokens, fixed at start, includes hostname and chip (so "which machine are you running on" is answerable), and is a **stable prefix** so the worker's prompt cache hits every turn.
+- Messages: `[system, ...history(≤ 6 turns), user(final_text)]` **[D]**. The system prompt includes hostname and chip (so "which machine are you running on" is answerable) and starts with a **stable prefix** so the worker's prompt cache hits every turn. Since Milestone 3 it is the fixed phone instructions (about 80 words, plus the host line) followed by a section for each call (a `--prompt` of up to 4000 characters, or `inbound.instructions`); the cached prefix is the fixed part, and the call's section is evaluated with the history (§14b.4). The 2026-09-02 budget of 60 tokens for the whole system prompt no longer applies.
 - Worker streams tokens. The clause chunker emits a TTS unit at the first of: sentence punctuation (`. ! ?`), clause punctuation (`, ; :`) once ≥ 6 tokens are pending, or 12 tokens with no punctuation **[D]**. Subsequent units are sentence-sized. Each unit is sent to TTS immediately; the LLM keeps streaming.
 - Caps: `max_tokens` 120 per turn **[P]** (phone answers are short); stop sequences from the chat template.
 - Thinking is disabled through the chat template: `tokenizer.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False)` **[V]**.
@@ -285,13 +285,14 @@ While `SPEAKING`, the drain task keeps running VAD on caller audio. Trigger = **
 
 | Event | Behaviour |
 |---|---|
-| Greeting | Fixed sentence from config, pre-synthesised at startup and cached as 16 kHz frames; plays within one loop iteration of `ACTIVE` |
+| Greeting | `inbound.greeting` on an incoming call, the fixed disclosure on an outbound one (§14b.5), pre-synthesised at startup and cached as 16 kHz frames; plays within one loop iteration of `ACTIVE` |
 | Silence ≥ 8 s after our turn | Say the cached "Still there?" once; silence ≥ 8 s more → BYE |
 | Max duration | Cached warning at 9:30; BYE at 10:00 |
 | RTP timeout | No `onFrameReceived` for 10 s → BYE |
 | BYE mid-turn | Cancel all, flush, log turn as partial |
 | Empty STT final | Ignore, stay LISTENING |
 | Worker crash mid-turn | Cached apology sentence, restart worker, continue |
+| Relay mode: no `say` from the calling AI | "One moment.", "Still with you, one moment.", then "Sorry, I have to go. Goodbye." and BYE (§14b.6); the silence prompt is suppressed while waiting |
 
 All cached sentences are synthesised at startup by the TTS worker so these paths never wait on a model.
 
@@ -348,13 +349,13 @@ Workers check for `cancel` between chunks/tokens; a cancelled `gen_id` is rememb
 | TTS | `mlx-audio[tts]` Kokoro | `mlx-community/Kokoro-82M-bf16`, voice `af_heart`, 24 kHz | Needs `misaki[en]` (G2P), which pulls spaCy and PyTorch (~80 packages) and **downloads `en_core_web_sm` from GitHub at first use if absent**. `doctor` pre-installs and asserts it. |
 | VAD | `mlx-audio` Silero (or `silero-vad`) | — | 16 kHz, 512-sample chunks |
 
-LLM worker specifics: `mlx_lm.load(model_id)`; `make_prompt_cache(model)` primed with the system prompt at warm-up; `stream_generate(model, tokenizer, prompt, max_tokens=..., prompt_cache=cache)`. Because history is a suffix of a stable prefix, the cache is reused every turn; the worker reports `prompt_eval_ms` and `gen_ms` separately so the LLM budget row (250 ms, zero slack) is diagnosable.
+LLM worker specifics: `mlx_lm.load(model_id)`; `make_prompt_cache(model)` primed with the system prompt at warm-up (since Milestone 3, with the fixed phone instructions and the "This call:" header, §14b.4); `stream_generate(model, tokenizer, prompt, max_tokens=..., prompt_cache=cache)`. Because history is a suffix of a stable prefix, the cache is reused every turn; the worker reports `prompt_eval_ms` and `gen_ms` separately so the LLM budget row (250 ms, zero slack) is diagnosable.
 
 ### 5.4 Linux backends **[D]**
 
 | Role | Package | Notes |
 |---|---|---|
-| STT | `sherpa-onnx` (parakeet or Nemotron via ONNX) or `faster-whisper` | pick by measured latency in M3 |
+| STT | `sherpa-onnx` (parakeet or Nemotron via ONNX) or `faster-whisper` | pick by measured latency in M4 |
 | LLM | `llama-cpp-python` with CUDA | PyPI has sdist only **[V]**; the Docker image installs from the maintainer's `cu12x` wheel index. GGUF 4-bit Qwen3.5 of the same tier. |
 | TTS | `kokoro-onnx` | requires Python < 3.14 |
 | VAD | `silero-vad` | — |
@@ -400,30 +401,47 @@ Two resamples on the outbound path (24→16 in Python, 16→8 in PJSIP) and one 
 
 ## 7. Layer 4: Control plane
 
-### 7.1 CLI (M2 unless noted)
+### 7.1 CLI (as built through Milestone 3 unless a milestone is noted)
 
 | Command | Does |
 |---|---|
 | `ai-phone run [--lan]` | Start the daemon in the foreground. `--lan` overrides `accept_invites_from` to `lan` and skips registration if no trunk is configured (dev and the timed install test) |
-| `ai-phone call <number> [--say "…"]` | Ask the running daemon (control socket) to place a call |
-| `ai-phone hangup` | End the current call |
-| `ai-phone status` | Registration state, current call, last turn latency |
-| `ai-phone doctor [--fetch]` | §7.3 |
-| `ai-phone models pull <tier>` | Download and verify a tier (the only networked command besides doctor --fetch) |
-| `ai-phone install-service` (M3) | Write and load the macOS LaunchAgent (§10.4) |
-| `ai-phone latency` (M4) | The TUI latency view |
+| `ai-phone call <target> [--prompt TEXT \| --prompt-file PATH] [--relay] [--line ID] [--timeout-sec N] [--json] [--yes]` | Place a call through the running daemon. Phone agent mode (no `--relay`): ai-phone's model holds the conversation with the prompt, and the command blocks until the call ends and prints the result with the transcript. `--relay`: returns once the call is answered; the calling AI goes on with `listen`, `say` and `hangup` (§14b.1) |
+| `ai-phone listen [--call ID] [--timeout-sec N] [--json]` | Wait (default 60 s) for the next event of the relay call in progress (`heard`, `ended`) or, with no call in progress, for an incoming call (`incoming`) |
+| `ai-phone say [--call ID] [--json] TEXT…` | Speak on the relay call in progress; returns `said` or `interrupted` |
+| `ai-phone hangup [--call ID] [--say TEXT] [--json]` | End the call in progress (either mode), speaking TEXT first if given; prints the call's result |
+| `ai-phone status [--last-call]` | Registration state per line, the call in progress, the brain in use; `--last-call` summarises the last call's turns |
+| `ai-phone lines …` | Buy, add, divert, verify and remove lines (§14a.4) |
+| `ai-phone doctor [--fetch]` (M4) | §7.3 |
+| `ai-phone models pull <tier>` (M4) | Download and verify a tier (with `doctor --fetch` and `lines`, the only networked commands) |
+| `ai-phone install-service` (M4) | Write and load the macOS LaunchAgent (§10.4) |
+| `ai-phone latency` (M5) | The TUI latency view |
 
 ### 7.2 Control socket **[D]**
 
-A Unix domain socket at `$AI_PHONE_HOME/run/control.sock` (mode 0600) carrying the same JSON-lines protocol as the worker pipes. The CLI is a thin client. The M4 HTTP API is a second client of the same internal commands, so there is exactly one command implementation.
+A Unix domain socket at `$AI_PHONE_HOME/control.sock` (`~/.ai-phone/control.sock`, mode 0600 from the moment it exists; a home directory too deep for `AF_UNIX` gets a short socket in a private `ai-phone-<uid>` directory under `/tmp`) carrying newline-delimited JSON: one request per connection, then the daemon's replies on that connection. The CLI is a thin client. The M5 HTTP API is a second client of the same internal commands, so there is exactly one command implementation. Commands: `status`, `call`, `listen`, `say`, `hangup`.
+
+| Request | Replies |
+|---|---|
+| `{"cmd": "status"}` | `{"ok": true, "lines": {<id>: {…}}, "active_call": {…} \| null, "call": <call record without transcript> \| null, "relay_listener": true \| false}` |
+| `{"cmd": "call", "to", "line", "timeout_sec", "prompt", "relay"}` | Progress events: `{"event": "created", "call_id"}`, `{"event": "dialling" \| "ringing" \| "answered" \| "busy" \| "no_answer" \| "rejected" \| "redirected" \| "cancelled", "code", "uri", "reason"}` (`cancelled` when `hangup` ended the call while it was ringing), and in phone agent mode `{"event": "turn", "turn", "first_audible_ms", "bargein"}` per turn. Then one final reply: for `relay`, `{"ok": true, "event": "answered", "call_id", "mode": "relay"}` once the call's audio is up; otherwise `{"event": "ended", "reason", "detail", "exit_code", "call_id", "result": <call record> \| null}`; or a refusal |
+| `{"cmd": "listen", "call_id"?, "timeout_sec"}` | `{"ok": true, "kind": "heard", "text"}` \| `{"ok": true, "kind": "incoming", "call_id", "line", "remote"}` (`remote` is the caller's SIP URI as PJSIP reports it) \| `{"ok": true, "kind": "ended", "result": <call record>}` \| `{"ok": true, "kind": "timeout"}` \| a refusal |
+| `{"cmd": "say", "call_id"?, "text"}` | `{"ok": true, "result": "said" \| "interrupted", "call_id"}` \| a refusal |
+| `{"cmd": "hangup", "call_id"?, "say"?}` | `{"ok": true, "result": <call record>}` \| a refusal |
+
+A refusal is `{"ok": false, "error": "<one line>", "code": <exit code>}` with the codes of §14b.1. A call record is the result object of §14b.1. `call_id` defaults to the call in progress.
+
+The server checks every request before the daemon sees it and refuses a bad one with code 2: not a JSON object; an unknown `cmd`; a `call_id` that is not 6 lowercase hex characters; a `call` without a non-empty `to`, with a non-string `line`, a non-boolean `relay`, a `prompt` that is not text of at most 4000 characters, or a `prompt` together with `relay`; a `timeout_sec` that is not a number in (0, 3600] (default 30 for `call`, 60 for `listen`); `say` text, or a `hangup` `say`, that is blank or longer than 2000 characters. A connection that sends nothing within 5 s, or something that is not JSON, is closed without a reply.
+
+One call in progress in the daemon: a `call` while any call, inbound or outbound, is up is refused with `{"ok": false, "error": "busy", "code": 5}` (the telephony claim decides, not the server). `status`, `listen`, `say` and `hangup` run alongside a call, each on its own connection. A client that goes away never unwinds a call: its later sends become no-ops, and a relay call carries on after its `call` has returned. `listen` is the exception: the server watches its connection and cancels it the moment the client disconnects, which frees the relay-listener slot (§14b.7). On shutdown the server cancels every waiting handler.
 
 ### 7.3 `doctor` checks **[D]**
 
 Config valid · weights present and hashes match (per tier) · spaCy `en_core_web_sm` importable (`spacy.util.is_package`) · `import ai_phone._pjsua2` works · null audio device set · GPU in use (MLX device / CUDA visible) · resident memory after warm-up vs tier expectation · warm-start latency of each worker · SIP registration state and last error · codec list offered (must be PCMU/PCMA only) · invite-acceptance mode with a warning for `any` · STUN configured (warning: outside the isolation criterion) · outbound connectivity check *disabled* (doctor itself must not phone home) · macOS: LaunchAgent loaded; Linux: `--network host` detected. Exit code non-zero on any hard failure.
 
-### 7.4 HTTP API (M4) **[D]**
+### 7.4 HTTP API (M5) **[D]**
 
-Bound to `127.0.0.1:8321` by default; a bearer token from config is required if `api.bind` is not loopback. Endpoints: `POST /calls {to, say?}` → `{call_id}`; `GET /calls/current`; `DELETE /calls/current`; `GET /status`; `GET /turns?last=n` (latency records). No streaming, no webhooks through launch (webhooks are M6). The Home Assistant integration (M6) is a client of this API.
+Bound to `127.0.0.1:8321` by default; a bearer token from config is required if `api.bind` is not loopback. Endpoints: `POST /calls {to, prompt?, relay?}` → `{call_id}`; `GET /calls/current`; `DELETE /calls/current`; `GET /status`; `GET /turns?last=n` (latency records). No streaming, no webhooks through launch (webhooks are post-launch). The Home Assistant integration (post-launch) is a client of this API.
 
 ### 7.5 Configuration file
 
@@ -431,7 +449,9 @@ See §8.
 
 ## 8. Configuration schema **[D]**
 
-`$AI_PHONE_HOME/config.yaml`, mode 0600 (contains the SIP password). Validated with a typed schema at startup; unknown keys are errors.
+`$AI_PHONE_HOME/config.yaml`, mode 0600. Validated with a typed schema at startup; unknown keys are errors.
+
+This is the 2026-09-02 baseline, kept for reference. Milestone 2 replaced the `sip:` block with `sip:` (transports) and `lines:`, with passwords in `secrets.env` (§14a.1). Milestone 3 moved `conversation.greeting` and `conversation.system_prompt` to `inbound:` and added `calls:` (§14b.9); there is no `outbound_opening_line`, because every outbound call opens with the fixed disclosure. `config.example.yaml` is the current excerpt.
 
 ```yaml
 sip:
@@ -445,7 +465,7 @@ sip:
   tls: { enabled: false, ca_file: null, verify_server: true }
   trusted_peers: []                  # extra IPs allowed under registered_trunk
   accept_invites_from: registered_trunk   # registered_trunk | lan | any
-  allowlist: []                      # M4: From-user allowlist; empty = everyone the mode permits
+  allowlist: []                      # M5: From-user allowlist; empty = everyone the mode permits
 nat:
   stun_servers: []                   # empty by default; each one is a network peer outside SIP/RTP
   keepalive_sec: 25
@@ -459,7 +479,7 @@ models:
 conversation:
   greeting: "Hi, this is the house. What can I do for you?"
   outbound_opening_line: "Hi, this is an automated call from …"
-  system_prompt: "…"                 # ≤ 60 tokens; hostname/chip appended automatically
+  system_prompt: "…"                 # baseline: ≤ 60 tokens; hostname/chip appended automatically (now §14b.4)
   endpoint_silence_ms: 300
   bargein_min_speech_ms: 250
   bargein_playback_gain: 3.0
@@ -469,7 +489,7 @@ conversation:
   silence_hangup_sec: 8
   max_call_sec: 600
   rtp_timeout_sec: 10
-api:                                 # M4
+api:                                 # M5
   enabled: false
   bind: "127.0.0.1:8321"
   token_env: AI_PHONE_API_TOKEN
@@ -494,7 +514,7 @@ Every turn writes one JSON line to `turns.jsonl`:
 
 Definitions **[D]**: `first_audible_ms = (t5 − t0)/1e6`. `t0` is the last VAD-positive chunk's timestamp; `t5` is stamped in `onFrameRequested` when the first non-silent frame of a generation is handed to PJSIP. `bargein_stop_ms` is from the first VAD-positive chunk of the interruption to the flush. The mouth-to-ear delta (phone speaker → Mac mic recording) is measured once per platform and stated in the README; it is *not* in the counter.
 
-The TUI (M4) tails this file. The gate check for M1 is a script over 20 turns: `scripts/latency_report.py turns.jsonl --last 20` printing p50/p95 per stage.
+The TUI (M5) tails this file. The gate check for M1 is a script over 20 turns: `scripts/latency_report.py turns.jsonl --last 20` printing p50/p95 per stage.
 
 ## 10. Packaging and deployment
 
@@ -510,7 +530,7 @@ ai-phone/
     pipeline/    turn.py vad.py bargein.py chunker.py audio_out.py timing.py
     services/    base.py ipc.py worker.py registry.py
       backends/  mlx_parakeet.py mlx_lm_backend.py mlx_kokoro.py sherpa_stt.py llamacpp_llm.py kokoro_onnx.py silero.py
-    control/     socket.py doctor.py api.py (M4) tui.py (M4) service.py
+    control/     socket.py doctor.py api.py (M5) tui.py (M5) service.py
     _pjsua2.so                      # built extension, vendored into the platform wheel
   native/pjsua2/                    # pjsua2.i, symbols.i (from pjproject 2.17), build.sh, GPL notice and source offer
   scripts/     latency_report.py  pjsua_peer.sh  pf/ai-phone.conf  utterances.txt
@@ -552,6 +572,7 @@ macOS: `ai-phone install-service` writes `~/Library/LaunchAgents/com.ai-phone.da
 - Threat: SIP scanners on the public internet. Defaults: `registered_trunk` acceptance (unsolicited INVITEs get 403), per-IP lockout, TLS+SRTP accepted when offered, RTP port range narrow and documented.
 - Secrets: config file mode 0600; `password_env` supported; never logged.
 - API: loopback by default; bearer token required otherwise.
+- Control socket: mode 0600, so any process of the same user can place calls and read transcripts, and nobody else can. The daemon itself refuses emergency numbers and enforces `calls.daily_limit` for every client (§14b.8).
 - Isolation: no outbound connections except SIP/RTP to the peer (and STUN if the user configures it, flagged by `doctor`). No telemetry, no update checks. Verified by the shipped pf ruleset during the launch demo.
 - Supply chain: pinned versions; the vendored PJSIP build script records the exact pjproject tarball SHA.
 
@@ -570,6 +591,9 @@ macOS: `ai-phone install-service` writes `~/Library/LaunchAgents/com.ai-phone.da
 | Incoming request assigned to the wrong line (PJSIP scores accounts by transport/domain/user; a registered trunk can win a LAN call meant for a `sip` line) | `AiEndpoint.onSelectAccount` re-selects with `line_for_request` (target user/host, then source proxy) | the call runs under the line it was addressed to; the override is logged |
 | Runaway generation | `max_tokens` cap; `max_call_sec` | hard stop |
 | Duplicate INVITE / retransmits | PJSIP transaction layer | handled by PJSIP |
+| Calling AI never replies (relay mode) | no `say` since the other person finished speaking | "One moment." after `calls.relay_filler_after_ms` (1.5 s), "Still with you, one moment." at `relay_second_filler_sec` (10 s), then "Sorry, I have to go. Goodbye." and BYE at `relay_reply_timeout_sec` (25 s), `ended_by: timeout`; on an outbound relay call before the first `say`, no fillers and the goodbye 25 s after the answer (§14b.6) |
+| Relay listener disappears (the `listen` client exits or is killed) | the server sees end-of-file on the `listen` connection | the `listen` is cancelled at once and the listener slot is free, so the next incoming call runs in phone agent mode with `inbound:`. If the client leaves at the very moment an incoming call is being handed to it, that call stays in relay mode with nobody listening: fillers, then the relay goodbye at the timeout (§14b.7) |
+| The call does not end after `hangup` (the `--say` text never plays, or PJSIP never reports the end) | the `hangup` handler waits 30 s for the end | BYE (again, for a plain `hangup`), then 10 s more; if the call has still not ended, `hangup` fails with exit 9 ("call … did not end after the hangup"), and the call may still be up |
 
 ## 14. Extension points (post-launch, do not build early)
 
@@ -579,10 +603,11 @@ macOS: `ai-phone install-service` writes `~/Library/LaunchAgents/com.ai-phone.da
 - **Multilingual**: swap to `parakeet-tdt-0.6b-v3` and other Kokoro voices; the G2P dependency changes per language.
 - **Full-duplex model** (Moshi-style): replaces Layers 2–3's STT→LLM→TTS with one worker; the media port and control plane stay.
 - **SMS**: SIP MESSAGE method only, where the trunk supports it.
+- **MCP server**: a thin wrapper over the control-socket commands (§7.2), so an MCP client can use the agent tool without a shell.
 
 ## 14a. Lines (Milestone 2, as built 2026-09-03)
 
-The daemon is carrier-free: it registers one pjsua2 `Account` per configured line over shared UDP/TCP(/TLS) transports and routes calls, personas and caller IDs by line. Provisioning is a CLI concern (`ai-phone lines …`) behind a `Provider` protocol with a resumable journal; the daemon never imports `ai_phone.providers` (a test pins this). Outbound calls run through a minimal control socket. The language-model worker has a second backend that streams from any OpenAI-compatible endpoint and reports recoverable `brain_error` events instead of dying. Configuration applies at daemon restart; live reload and IP-change handling are Milestone 4.
+The daemon is carrier-free: it registers one pjsua2 `Account` per configured line over shared UDP/TCP(/TLS) transports and routes calls and caller IDs by line. Provisioning is a CLI concern (`ai-phone lines …`) behind a `Provider` protocol with a resumable journal; the daemon never imports `ai_phone.providers` (a test pins this). Outbound calls run through a minimal control socket (extended in Milestone 3, §7.2). The language-model worker has a second backend that streams from any OpenAI-compatible endpoint and reports recoverable `brain_error` events instead of dying. Configuration applies at daemon restart; live reload and IP-change handling are Milestone 5.
 
 **Amended invariants.** During a call, ai-phone opens no network connection except SIP/RTP to the peer and HTTP(S), with its DNS lookup, to the one configured brain endpoint (the default brain is the local model and uses no socket). STUN and `trusted_peers` DNS resolution happen at daemon start only. One daemon, one or more lines, one call at a time across all of them; every telephony event carries `line_id`. Registration retry is PJSIP's own scheme (nominally 5 s, then every 30 s, each randomised by up to 10 s); the gate "re-registered within 60 s" is for induced transport loss with the carrier reachable. Latency is daemon-side (t0 → t5), on the PSTN leg as on the LAN.
 
@@ -592,7 +617,7 @@ The daemon is carrier-free: it registers one pjsua2 `Account` per configured lin
 
 **Paths.** Everything under `~/.ai-phone` comes from `ai_phone.paths` (`AI_PHONE_HOME` relocates it). The control socket falls back to a short deterministic `/tmp` path when the home is too deep for `AF_UNIX`.
 
-### 14a.1 Configuration (`sip:` is replaced; `conversation:` keeps its tuning keys, its greeting and system prompt moved to `personas.default`)
+### 14a.1 Configuration (`sip:` is replaced; `conversation:` keeps its tuning keys; its greeting and system prompt live in `inbound:` since Milestone 3, §14b.9)
 
 ```yaml
 sip:
@@ -630,7 +655,6 @@ lines:
     caller_id: "+442079460000"                      # outbound From user part; this line's number or a verified number
     diverted_from: []                               # E.164 numbers the user has diverted to this line (recorded by `lines forward`; used for the outbound warning)
     verified_caller_ids: []                         # [{number: "+447700900123", provider: telnyx, verified_at: "2026-09-10T12:00:00Z"}], written atomically by `verify-caller-id`
-    persona: default
     provider:                                       # only when a provider created the line
       name: telnyx
       state: ready                                  # pending | ready | failed (order rejected or cancelled by the carrier) | rollback_failed
@@ -644,14 +668,16 @@ lines:
     accept_invites_from: trusted
     trusted_peers: ["203.0.113.7", "friend.example.org"]
     caller_id: "sip:ai@home.example.org"
-    persona: default
 
-personas:
-  default:
-    greeting: "Hi, this is Sam's assistant. What can I do for you?"
-    system_prompt: "…"
-    outbound_opening: "Hi, this is an AI assistant calling on behalf of Sam. …"
-  receptionist: {…}                                 # shipped preset; text only
+inbound:                                            # Milestone 3 (§14b.9): the greeting every incoming call hears; the instructions when no AI listens
+  greeting: "Hi, you've reached an AI assistant. How can I help?"
+  instructions: "Take a message: ask for the caller's name, number and what it is about."
+
+calls:                                              # Milestone 3 (§14b.8, §14b.6)
+  daily_limit: 0                                    # outbound calls per local day; 0 = no limit
+  relay_filler_after_ms: 1500
+  relay_second_filler_sec: 10
+  relay_reply_timeout_sec: 25
 
 brain:
   kind: local                                       # local | openai_compatible
@@ -666,17 +692,17 @@ brain:
 conversation: {endpoint_silence_ms, bargein_*, timers …unchanged…}
 ```
 
-Validation (extending `config.py`): grammar first: `user` `[A-Za-z0-9]{4,32}`; `display_name` printable ASCII without `"`, `\\`, CR or LF (name-addr strings are built only from validated parts, never escaped); registrar and proxy `sip:host[:port][;transport=x]` with host a DNS name or IP; `dial_domain` `host[:port]`; `aor` `sip:user@host[:port]`; environment-variable names `[A-Z_][A-Z0-9_]*`; E.164 `\\+[1-9][0-9]{6,14}`. Then: line ids unique; trunk `user` unique; `persona` references exist; `number` and `caller_id` E.164 (or a `sip:` URI on sip lines); `registrar`/`outbound_proxy` are `sip:` URIs and `dial_domain` a hostname; `srtp != off` requires `transport: tls`; `trusted` requires non-empty `trusted_peers`; `registered_trunk` requires non-empty `trusted_cidrs` or a resolvable registrar (a warning if only the registrar); `tls` transport on a sip line requires `sip.tls.cert_file` and `key_file`; `tcp_port != tls_port`; `password_env` must be set in the environment at start, otherwise that line is skipped with an error and the others start; `brain.base_url` non-loopback must be `https`. The M1 `sip:` block (`user`, `domain`, `password_env`, `bind`, `public_addr`, `trusted_peers`, `accept_invites_from`) is read for one release and mapped to `sip.bind`/`sip.public_addr` plus `lines.main`, with a deprecation warning.
+Validation (extending `config.py`): grammar first: `user` `[A-Za-z0-9]{4,32}`; `display_name` printable ASCII without `"`, `\\`, CR or LF (name-addr strings are built only from validated parts, never escaped); registrar and proxy `sip:host[:port][;transport=x]` with host a DNS name or IP; `dial_domain` `host[:port]`; `aor` `sip:user@host[:port]`; environment-variable names `[A-Z_][A-Z0-9_]*`; E.164 `\\+[1-9][0-9]{6,14}`. Then: line ids unique; trunk `user` unique; `number` and `caller_id` E.164 (or a `sip:` URI on sip lines); `registrar`/`outbound_proxy` are `sip:` URIs and `dial_domain` a hostname; `srtp != off` requires `transport: tls`; `trusted` requires non-empty `trusted_peers`; `registered_trunk` requires non-empty `trusted_cidrs` or a resolvable registrar (a warning if only the registrar); `tls` transport on a sip line requires `sip.tls.cert_file` and `key_file`; `tcp_port != tls_port`; `password_env` must be set in the environment at start, otherwise that line is skipped with an error and the others start; `brain.base_url` non-loopback must be `https`. The M1 `sip:` block (`user`, `domain`, `password_env`, `bind`, `public_addr`, `trusted_peers`, `accept_invites_from`) is read for one release and mapped to `sip.bind`/`sip.public_addr` plus `lines.main`, with a deprecation warning.
 
 ### 14a.2 Line lifecycle in the daemon (as built: registration state, state file, control socket)
 
 - Transports are created once at start from `sip.bind`: UDP, TCP, and TLS only if a line uses it. Each line is an `Account` bound with `transportId` to its transport. `idUri` = `"<display_name>" <sip:<user>@<registrar host>>` for trunks, `<sip:<user>@<aor host>>` for sip lines. `AuthCredInfo("digest", "*", user, 0, password)` for trunks. `proxies` = `[outbound_proxy]` when set.
 - Per-line registration state: `unregistered → registering → registered → degraded (last REGISTER failed; PJSIP retry scheduled) → registered`. `RegState` events carry `line_id`, code, reason.
 - Registration loss during an established call: `dropCallsOnFail=false`, so the call continues; the line is `degraded`; `make_call` on a trunk line whose account is not registered raises `DialError` ("line … is not registered (degraded)") before dialling; inbound on that line is unavailable until re-registered. The RTP 10 s watchdog is unchanged and is the only thing that ends a call for network reasons. Tested separately from total network loss.
-- IP change (Wi-Fi to Ethernet, router reboot): not handled automatically in M2. `ai-phone status` shows the line `degraded` with the last error; the fix is a restart. (`Endpoint.handleIpChange` with `AccountIpChangeConfig` is the M4 follow-up, when there is a control plane to drive it while idle.)
+- IP change (Wi-Fi to Ethernet, router reboot): not handled automatically in M2. `ai-phone status` shows the line `degraded` with the last error; the fix is a restart. (`Endpoint.handleIpChange` with `AccountIpChangeConfig` is the M5 follow-up, when there is a control plane to drive it while idle.)
 - Acceptance policy per line: `registered_trunk` = the line's `trusted_cidrs` plus the registrar's addresses resolved at start; `trusted` = the line's `trusted_peers`; `lan`, `any` as before. INVITE on a line whose policy rejects the source → 403, logged with `line_id`. INVITE while any call is active, on any line → 486.
 - State file: the daemon writes `~/.ai-phone/state.json` (atomic, 0600) on every registration state change and call start/end: per line `{state, registrar, expires_at, last_error, since}`, plus `{active_call: {line_id, remote, started_at} | null, brain: {kind, base_url}}`. `ai-phone status` reads it and only probes the control socket for liveness (connect and close; connection refused or a missing socket → "daemon not running"); it never holds the socket, so it works during an outbound call.
-- Control socket (the minimum that `ai-phone call` needs): `~/.ai-phone/control.sock` (0600), newline-delimited JSON. Requests: `{"cmd":"status"}` → `{"ok": true, "lines": {<id>: LineStatus…}, "active_call": …}` (the CLI's `status` reads `state.json` instead and only probes the socket for liveness); `{"cmd":"call","to":"+44…|sip:…","line":"main","persona":"default","timeout_sec":30}` → streamed events `dialling`, `ringing`, `answered`, one `turn` per turn record, `ended {reason, exit_code}`; `{"cmd":"hangup"}` ends the active call. If the client disconnects, the call continues; the CLI's Ctrl-C handler sends `hangup` and then closes; if the socket closes unexpectedly the CLI exits 9 ("daemon went away"). `call` is exclusive: a second `call` while one is in flight is refused with `{"ok": false, "error": "busy"}`; `status` and `hangup` are accepted at any time, on their own connections. A client that goes away never unwinds the call handler: its later sends become no-ops.
+- Control socket: `~/.ai-phone/control.sock` (0600), newline-delimited JSON, one request per connection. Milestone 2 built `status`, `call` and `hangup`; Milestone 3 added `listen` and `say`, the `prompt` and `relay` fields of `call`, `call_id` and `say` on `hangup`, call records in the replies and a check of every request. The commands, their replies and the concurrency rules are in §7.2: one call in progress in the daemon, the other commands alongside it on their own connections. `ai-phone status` reads `state.json` and only probes the socket for liveness. If the client of a `call` disconnects, the call continues; the CLI's Ctrl-C handler sends `hangup` and waits up to about 7 s for the `ended` reply (a 2 s `hangup` request, then a 5 s cut-off); if the socket closes unexpectedly the CLI exits 9 ("daemon went away"). A client that goes away never unwinds the call handler: its later sends become no-ops.
 - Two lines on one carrier: distinct `user`, distinct accounts, shared transport. The gate registers **two** trunk lines to Telnyx (two credential connections; the second needs no number) over one transport and asserts both reach `registered` and that an inbound call on the first is attributed to `line_id: main`. The integration suite covers the routing logic with two `sip` lines on two ports and a unit test of account selection by `line_id`.
 
 ### 14a.3 Provider protocol (`ai_phone/providers/base.py`) and the two carriers
@@ -703,7 +729,7 @@ class Provider(Protocol):
 ### 14a.4 CLI surface
 
 ```
-ai-phone lines add <telnyx|twilio> --key-env NAME [--secret-env NAME] [--id main] [--country GB] [--area 020] [--number +44…] [--persona default] [--yes]
+ai-phone lines add <telnyx|twilio> --key-env NAME [--secret-env NAME] [--id main] [--country GB] [--area 020] [--number +44…] [--yes]
       # --id defaults to the provider name, or <provider>-2, -3 … if taken
       # search → up to 10 numbers with monthly price and any regulatory requirement → pick (or --number; --yes takes the first)
       # → provision with a journal → if the order is still pending, the line is written as pending and the command returns 2 at once (`lines resume` polls) → otherwise:
@@ -724,9 +750,10 @@ ai-phone lines forward <id> [--when all|busy|no-answer|unreachable] --from +4477
       # prints: "On your iPhone, dial **61*+442079460000# and press call. Check with *#61#. Cancel every divert with ##002#." and records +447700900123 in diverted_from
 ai-phone lines verify-caller-id <id> +447700900123 --key-env NAME [--secret-env NAME]
       # Telnyx: prompts for the code from the SMS or call; Twilio: shows the code to key in when Twilio calls, then polls; on success the number is allowed as caller_id
-ai-phone call <+E.164 | sip:…> [--line <id>] [--persona <name>] [--timeout-sec 30] [--yes]
+ai-phone call <+E.164 | sip:…> [--prompt TEXT | --prompt-file PATH] [--relay] [--line <id>] [--timeout-sec 30] [--json] [--yes]
       # --yes required when the target is in the line's diverted_from (calling a phone that diverts back to this line)
-      # exit codes: 0 answered and the conversation ran; 5 busy; 6 no answer (CANCEL after timeout); 7 rejected (reason printed); 8 redirected (refused); 9 daemon went away; Ctrl-C hangs up
+      # exit codes: 0 answered and the conversation ran (relay: answered); 5 busy; 6 no answer (CANCEL after timeout); 7 rejected (reason printed); 8 redirected (refused); 9 daemon went away; Ctrl-C hangs up
+      # the Milestone 3 options, the listen/say/hangup commands and the other exit codes: §14b.1
 ai-phone status                                    # per-line registration rows from state.json; active call; the brain in use and whether it is local
 ```
 
@@ -744,17 +771,189 @@ ai-phone status                                    # per-line registration rows 
 
 - `Call::makeCall` on the line's account. Request-URI: `sip:+E164@<dial_domain>` for PSTN targets on a trunk line; the URI itself for `sip:` targets (on a sip line by default, or a trunk line if `--line` says so). `CallOpParam.txOption.localUri` = `"<display_name>" <sip:<caller_id>@<registrar host>>` on trunk lines, and the line's `caller_id` URI verbatim on sip lines; `caller_id` is validated before dialling: this line's number, or a number in the line's `verified_caller_ids`, otherwise refused. Carrier rejections with a caller-ID reason (403, 603) are mapped to a plain message. Verification does not guarantee what the callee's handset displays (CNAM and STIR/SHAKEN attestation are the carrier's), and the CLI says so once.
 - Outbound states: `dialling → ringing (180/183; early media ignored: audio that becomes active before CONFIRMED is not connected to the media port until the 200 OK) → answered (CONFIRMED) | busy (486/600) | no-answer (timeout → CANCEL) | rejected (other 4xx/5xx/6xx) | redirected (3xx → onCallRedirected returns PJSIP_REDIRECT_STOP)`. 401/407 are handled by PJSIP with the account's credentials. Voicemail is not detected; the max-call and silence timers cover it.
-- On `answered`: the controller enters `OUTBOUND_OPENING`: the persona's `outbound_opening` plays (cached like the greeting), barge-in armed; then normal `LISTENING`. Everything else (gen_ids, timers, RTP baseline) is unchanged.
+- On `answered`: the controller enters `OUTBOUND_OPENING` and plays the cached disclosure "Hi, this is an AI assistant calling." in full (Milestone 3, §14b.5); then normal `LISTENING`, or in phone agent mode the model's opening sentence. Everything else (gen_ids, timers, RTP baseline) is unchanged.
 - Loop prevention is best-effort by design: the `diverted_from` warning before dialling, and the one-call-at-a-time 486 on any INVITE that arrives while the outbound call is up. No `Diversion`/`History-Info` parsing.
 
 ### 14a.7 Pluggable brain
 
-- `services/backends/openai_compat.py`: an `LLMBackend` that POSTs `<base_url>/chat/completions` with `stream: true`, the persona's system prompt (without the hostname/chip suffix the local brain gets) and the capped history, and yields `delta.content` tokens to the same clause chunker. Cancel closes the HTTP response. Redirects are not followed. TLS certificate verification on; `api_key_env` is sent as `Authorization: Bearer` and never logged.
+- `services/backends/openai_compat.py`: an `LLMBackend` that POSTs `<base_url>/chat/completions` with `stream: true`, the call's system prompt (§14b.4; without the hostname/chip line the local brain gets) and the capped history, and yields `delta.content` tokens to the same clause chunker. Cancel closes the HTTP response. Redirects are not followed. TLS certificate verification on; `api_key_env` is sent as `Authorization: Bearer` and never logged.
 - Failure rules: connect timeout, first-token timeout, idle timeout, non-2xx, malformed SSE, or `max_response_chars` exceeded → the backend raises `BrainError(kind)`; the LLM worker catches it and emits a typed IPC event `{"ev": "brain_error", "gen": <gen_id>, "kind": <kind>}` instead of dying (today any backend exception is a fatal worker error, so `run_worker` gains this catch for the generate path only). The controller, on `brain_error` for the current gen: first cancels that generation exactly like a barge-in (workers drop the gen, the outbound ring is flushed, a new `gen_id` is issued) so no partial model output is spoken over the apology, then plays the cached phrase "Sorry, I lost my train of thought. Could you say that again?", records `brain_error=<kind>` in the turn, returns to `LISTENING`; on the second consecutive `brain_error` in a call: cached goodbye and BYE. The counter resets on a turn that completes. No automatic retry (the caller is waiting). A stale-gen `brain_error` is discarded like any stale result.
 - Latency is recorded per turn exactly as for the local brain (`llm_first_clause_ms`), not gated.
 
 
 **Differences between the approved design and what was built** (each came out of a review or a test): Telnyx orders carry `customer_reference "ai-phone:<line-id>"` and an unfinished order is reconciled by that reference; a delivered order whose number is not yet listed stays `pending`; Twilio provisioning is one journal step per carrier request (credential list, credential, domain, domain mapping, number, trunk, trunk credential list), each reconciled by name; `lines resume` re-runs `provision()` (idempotent through the journal) rather than `poll()`, using a `target` step written first; pending results are written only if the line loads; `carrier_ready` is journaled only for ready results; the brain backend streams in a helper thread so the first-token and idle deadlines are enforced by the consumer (headers and SSE keepalives included) and `[DONE]` ends the stream at once; `brain_error` cancels the generation like a barge-in, keeps the partial reply in history as `[interrupted]`, holds the apology until the PJSIP-side flush has happened, and the goodbye drains before the BYE; `MediaActive` and `Dtmf` carry `line_id`; a single `threading.Lock` makes the one-call claim atomic between the PJSIP thread and the asyncio thread; the outbound answer timer is owned by its call; `dialling` is queued before `makeCall` and a synchronous failure closes the sequence with `rejected`. Two more came out of the Telnyx spike (2026-09-03): incoming requests are assigned to a line by `line_for_request` (request-URI/To user and host, then the trunk's registrar/trusted proxies) through `AiEndpoint.onSelectAccount`, because PJSIP's own scoring handed a LAN INVITE for the `sip` line to the registered trunk; and the MLX workers wire their model memory at warm-up with `conversation.reply_timeout_sec` as the backstop, because a busy host paged the idle models out and the first transcript took 10 s.
+
+## 14b. Agent tool (Milestone 3, as built 2026-09-16)
+
+Any AI that can run shell commands uses ai-phone as its phone. It places calls from the agent's number and answers calls to it, in one of two modes chosen per call:
+
+- **Phone agent mode.** The calling AI writes the call's instructions (`--prompt`). ai-phone's own model holds the whole conversation (listening, replying, interruptions, ending the call), and the calling AI gets the transcript when the call ends. The calling AI takes no part in between.
+- **Relay mode.** The calling AI holds the conversation itself. ai-phone turns the other person's speech into text (`ai-phone listen`), speaks the AI's replies (`ai-phone say`) and fills short gaps while the AI thinks.
+
+Nothing about the calling agent is saved: each call's instructions are written for that call, and incoming calls use one `inbound:` section. Not in this milestone: an MCP server (§14), the dashboard and HTTP API (M5), SMS, keypad tones, hold and voicemail detection, more than one call at a time. The six invariants are unchanged: the calling AI reaches the daemon over the local Unix control socket, and during a call the daemon still talks only SIP/RTP to the peer and HTTP(S) to the one configured brain endpoint.
+
+### 14b.1 Commands
+
+```
+ai-phone call <+E.164 | sip:…> [--prompt TEXT | --prompt-file PATH] [--relay] [--line ID] [--timeout-sec 30] [--json] [--yes]
+      # phone agent mode (no --relay): prints progress (call <id>, dialling, ringing, answered, one line per turn),
+      #   blocks until the call ends, then prints the result:
+      #     call c7f3a2 ended: completed, hung up by agent, 1m42s
+      #       agent: Hi, this is an AI assistant calling.
+      #       agent: I'd like to book a table for two at eight tonight.
+      #       them:  Sure, what name?
+      # --prompt / --prompt-file: UTF-8, at most 4000 characters (the file is read and trimmed); optional: without
+      #   it the model says it is calling on behalf of the owner of the number
+      # --relay: blocks until the call is answered or fails, prints "call c7f3a2 answered" and exits 0; the call carries on
+      # --prompt with --relay, or --prompt with --prompt-file: usage error, exit 2; --timeout-sec is how long it may ring
+ai-phone listen [--call ID] [--timeout-sec 60] [--json]
+      # a relay call in progress (or --call ID): its next unread event
+      #   heard: Sure, what name is it under?     everything said since the last listen, in order, as one text
+      #   call c7f3a2 ended: …                     the result, as for call; returned again on every later listen
+      # no call in progress: first a relay call that ended since anyone last listened, otherwise wait for an incoming call
+      #   incoming call c9b1e0 on main from sip:+15551234567@sip.carrier.example
+      #       already answered; inbound.greeting plays; the next listen returns the caller's first words; the text
+      #       after "from" is the caller's SIP URI as PJSIP reports it (it may carry a display name), not a bare number
+      # nothing within the timeout: prints "timeout", exits 10; a timeout never ends a call
+ai-phone say [--call ID] [--json] TEXT…
+      # speaks on the relay call in progress; prints "said" once it has played, or "interrupted" when the other person
+      #   talked over it (the next listen returns what they said); 1 to 2000 characters; waits up to 10 s for a call
+      #   whose audio is not up yet
+ai-phone hangup [--call ID] [--say TEXT] [--json]
+      # ends the call in either mode, speaking TEXT first if given (§14b.6); prints the call's result
+```
+
+`--call` defaults to the call in progress; a call that has ended can be named for as long as its record is kept (§14b.2). Every error ai-phone reports itself is one line, `error: …`, or with `--json` the object `{"ok": false, "error": "…", "code": N}`. With `--json` (accepted by these four commands, not by `run`, `status` or `lines`) each prints exactly one JSON object on stdout and nothing else there: the call's result with `"ok"` added; `{"ok": true, "call_id", "mode": "relay", "outcome": "answered"}` for an answered relay call; the `listen` and `say` replies of §7.2 (for `ended`, the result's fields sit beside `"kind": "ended"`); for any other ending, the result (when there is one) with `ok`, `outcome`, `detail` and `code` added. A malformed command line (a missing or unknown option) is reported by the argument parser on stderr with exit code 2, not as JSON.
+
+The result of a call:
+
+```json
+{"call_id": "c7f3a2", "mode": "agent", "direction": "out", "line": "main", "remote": "+15551234567",
+ "outcome": "completed", "detail": "", "ended_by": "agent",
+ "created_at": 1789600000.0, "answered_at": 1789600004.2, "ended_at": 1789600106.2, "duration_sec": 102.0,
+ "transcript": [{"who": "agent", "text": "Hi, this is an AI assistant calling.", "at": 1789600004.3, "interrupted": false},
+                {"who": "agent", "text": "I'd like to book a table for two at eight tonight.", "at": 1789600007.1, "interrupted": false},
+                {"who": "them", "text": "Sure, what name?", "at": 1789600009.8, "interrupted": false}]}
+```
+
+Times are Unix seconds; `duration_sec` runs from answer to end (null if the call was never answered). `outcome` is `completed`, `busy`, `no_answer`, `rejected`, `redirected` or `cancelled`. `ended_by` is `agent` (the model wrote the end marker), `them`, `timeout` (the relay reply timeout), `silence`, `max_duration`, `hangup_command`, or `error` (RTP timeout, a second brain error in a row, a model worker that died, ai-phone stopping, the `call` command failing; `detail` names it). An outbound call that was never answered has `ended_by` null, with these exceptions: `hangup_command` when `hangup` cancelled it (outcome `cancelled`); `error` when ai-phone stopped (outcome `cancelled`) or the `call` handler failed (outcome `rejected`). An incoming call that ends before its audio starts has `ended_by: them` and `answered_at` null. The transcript holds one entry per line spoken: the disclosure and the model's opening sentence are two `agent` entries.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | relay call answered; phone agent call answered and ended; `listen`, `say` or `hangup` did its job |
+| 2 | usage: an argument-parser error, a request the CLI or the control server refuses as malformed, or (for `call`) a config file that does not load |
+| 5 | busy: the other end (486/600), or a call already in progress in the daemon |
+| 6 | no answer within `--timeout-sec` (CANCEL sent) |
+| 7 | rejected (other 4xx–6xx; no line can dial the target; the target diverts back to this agent and `--yes` was not given), or cancelled by `hangup` while still ringing |
+| 8 | redirected (3xx, not followed) |
+| 9 | daemon not running, gone, or replying in a way the command does not understand; also `call` after Ctrl-C when the daemon does not confirm the end in time, and `hangup` when the call has still not ended 40 s after the hangup (30 s, then a BYE and 10 s more): the call may still be up |
+| 10 | `listen` timed out |
+| 11 | no such call (only the last 20 are kept), no call in progress, the call has ended or is not connected, or `listen`/`say` on a phone agent call |
+| 12 | another `listen` is already waiting for incoming calls |
+| 13 | the target matches an emergency number (§14b.8) |
+| 14 | the daily outbound limit is reached |
+| 130 | Ctrl-C while `listen`, `say` or `hangup` waits; a `listen` is cancelled, a `say` or `hangup` already sent carries on in the daemon |
+
+Ctrl-C during `call` sends `hangup` and waits up to about 7 s for the call's end (a 2 s `hangup` request, then a 5 s cut-off); the command then exits with the call's code (0 if it had been answered, 7 if it was still ringing), or 9 if the daemon never confirmed.
+
+### 14b.2 Call records (`calls.py`)
+
+Every call the daemon handles, inbound or outbound, in either mode, gets a `CallRecord`: an ID of 6 random lowercase hex characters, unique among the records held; `mode` (`agent` | `relay`); `direction` (`in` | `out`); the line; the remote party (the target as given for an outbound call; for an incoming one, the caller's SIP URI as PJSIP reports it, which may carry a display name); the prompt; created, answered and ended times; `outcome`, `detail` and `ended_by`; the transcript; and the relay event queue. The `CallRegistry` keeps the call in progress and the last 20 that ended, in memory only, so a restart forgets them. Nothing new is written to disk for a call: each turn record in `turns.jsonl`, which already held the transcribed and the spoken text, now also carries `call` and `mode`, and `active_call` in `state.json` carries `call`, `mode` and `direction`.
+
+The record, not the control connection, owns the call: a relay `call` returns at answer and the call goes on; a phone agent `call` whose client disappears runs to its natural end. The controller writes the transcript: the opening line (disclosure or greeting), each final transcript of the other person, each reply as it was spoken (without the end marker; a cut reply is marked `interrupted`), and the relay fillers and goodbye.
+
+Relay events: when the other person finishes speaking, the text is queued as `heard`, and unread `heard` texts are merged in order, so one `listen` returns everything said since the last one. Once the call has ended and its unread speech has been read, `listen` returns `ended` with the result, and keeps returning it. A `listen` cancelled before its reply went out (its client left) puts the event back for the next one. The registry remembers whether anyone has been handed a relay call's end (a `listen` or a `hangup` reply); `listen` with no call in progress reports the most recent unreported end first, and `say` or `hangup` with no call in progress names that call in its error.
+
+### 14b.3 Who writes the replies (`pipeline/replies.py`)
+
+`TurnController` takes a reply source instead of calling the model itself. `ModelReplies` (phone agent mode) asks the LLM worker to answer each finished utterance with the call's system prompt and history, as before. `RelayReplies` (relay mode) hands the transcript to the call record as `heard`, and the controller goes back to `LISTENING` at once. Everything else is shared by both modes: endpointing, barge-in, the timers, the brain-error path, ending.
+
+`say` text takes the path the model's tokens take: the clause chunker, TTS, playback in `SPEAKING`, barge-in. Texts are queued, and each is spoken once the line is free: the controller is listening, the other person is not mid-utterance, and nothing else is being said. The text counts as `said` when it has played and `interrupted` when the other person talked over it; the reply is kept in the history and the transcript either way, marked when cut. If the call ends first, `say` fails with exit 11. An end marker inside `say` text is removed and not obeyed.
+
+Incoming calls: when a relay listener is waiting and no call is in progress, the call runs in relay mode and the listener receives `incoming`; otherwise it runs in phone agent mode with `inbound.instructions`. Either way ai-phone answers and plays `inbound.greeting` first.
+
+### 14b.4 Instructions and the prompt cache (`pipeline/prompts.py`)
+
+The model's system prompt is, in order:
+
+1. `PHONE_INSTRUCTIONS`, fixed text in code: an AI assistant speaking on a live phone call; short, natural sentences, one or two at a time; no lists, markdown, emoji or stage directions; no invented facts, and say so plainly when something is not known; when the purpose of the call is done or the other person says goodbye, a short goodbye that ends with `[END]`;
+2. for the local brain only, the host line (`You are running on <hostname> (<machine>).`);
+3. the header "This call:";
+4. the call's section: the `--prompt` text on an outbound call, `inbound.instructions` on an incoming one, or, when that is empty, "You are calling on behalf of the owner of this phone number. Be polite and brief."
+
+The LLM worker caches parts 1 to 3. At warm-up it tokenises the prompt with two probe sections that differ from their first character, evaluates their common token prefix once and keeps that snapshot; each turn starts from a copy of it and evaluates only the call's section, the history and the new turn. Each turn therefore pays for the call's own section and the history, never for the fixed instructions. A remote brain receives the same prompt without the host line.
+
+The end marker: the clause chunker removes `[END]`, in any letter case, from what is spoken, and never speaks a fragment of it. When the model's reply contained the marker, the controller lets the reply play in full, then ends the call with `ended_by: agent`.
+
+### 14b.5 Openings
+
+- **Outbound, both modes.** The disclosure "Hi, this is an AI assistant calling." (synthesised at daemon start; not configurable) plays as soon as the call's audio is up, in `OUTBOUND_OPENING`. It always plays in full: speech during it does not cut it; the speech is kept and handled right after.
+- **Phone agent mode.** As the disclosure starts, the model is asked for its first sentence: a cue in the history says the other person has just answered and the disclosure has been said, and asks for one sentence on why the call is being made. The model writes it while the disclosure plays; its audio is held until the disclosure has finished and then follows without a gap. If the other person spoke during the disclosure, the opening is dropped and the model answers them instead.
+- **Relay mode.** The disclosure plays, then the calling AI's first `say`.
+- **Incoming, both modes.** `inbound.greeting` (synthesised at start) plays on answer. It can still be interrupted: speech over it stops it and becomes the caller's first turn.
+
+### 14b.6 Relay wait and `hangup --say`
+
+When a `heard` has been handed over, the controller listens again and waits for the calling AI:
+
+- after `calls.relay_filler_after_ms` (1500) without a `say` it plays "One moment.", and at `calls.relay_second_filler_sec` (10 s) "Still with you, one moment."; each plays at most once between two `say`s;
+- at `calls.relay_reply_timeout_sec` (25 s) it plays "Sorry, I have to go. Goodbye." and hangs up once that has played (after 5 s at most), with `ended_by: timeout`;
+- the wait restarts whenever the other person finishes speaking again, so a caller who keeps talking does not run down the calling AI's time; a `say` ends the wait;
+- while it waits, the silence prompt ("Still there?") and the silence hangup are off;
+- speech while waiting never cancels anything: it becomes more `heard` text, merged with any text not yet read;
+- on an outbound relay call, before the calling AI's first `say`, there are no fillers and the timeout counts from the answer, even if the other person speaks first;
+- speech that starts while the previous utterance is still being transcribed is held, not treated as barge-in, and is transcribed as soon as the pending transcript is in;
+- barge-in during a `say` works as it does for the model's replies: playback stops within the barge-in budget and `say` returns `interrupted`.
+
+The three phrases are synthesised at daemon start, like the apology and the goodbye.
+
+`hangup --say TEXT` queues the text like a `say` whose end reason is `hangup_command`: the call ends once the text has played, and also if the other person interrupts it. If the call has not ended within 30 s, the daemon sends a BYE (a second one for a plain `hangup`) and waits 10 s more; if it still has not ended, `hangup` fails with exit 9 ("call … did not end after the hangup"), and the call may still be up. `hangup` without text sends the BYE at once, with the same waits. `hangup` on a call that is still ringing cancels it without speaking any `--say` text: the call ends with outcome `cancelled`, `call` sends a `cancelled` progress event, and the blocked `call` command exits 7.
+
+### 14b.7 The relay listener
+
+`listen` with no call in progress and no `--call` takes the registry's single listener slot and waits; a second one is refused with exit 12. The slot is freed when the wait ends (an incoming call, the timeout), and at once when the client disconnects: the control server watches the `listen` connection for end-of-file and cancels the handler. An incoming call that arrives just as the wait times out is still reported, since it is already in relay mode. If the client disconnects at the very moment an incoming call is being handed to it, that call runs in relay mode with nobody listening: the caller hears the greeting and, once they speak, the fillers and then the relay goodbye at the timeout (or, if they say nothing, the silence prompt and the silence hangup).
+
+### 14b.8 Safety
+
+- **Emergency numbers are never dialled** (`call_guard.is_emergency`, the first check in the daemon's `call` handler, so every client is covered; exit 13). A target is refused when its digits equal 000, 100, 101, 102, 103, 108, 110, 112, 118, 119, 190, 911 or 999: alone, behind a 1–3 digit country code, or behind an international access prefix (00 or 011) and such a country code. A `sip:` target is checked by its user part when that part has no letters (only digits, spaces and `+ . _ - ( )`). Extensions that look like an emergency number (100, 1000, 4112) are refused too; call such extensions by a name with letters.
+- **Daily limit** (`calls.daily_limit`; 0 means no limit; exit 14). It is checked before dialling. Every dial attempt the SIP stack accepted counts, busy and unanswered calls included, per local day. The count lives in `~/.ai-phone/calls-today.json` (`{"date", "count"}`, written to a temporary file, synced and renamed), so a restart does not reset it. It is a file of its own because the daemon rewrites `state.json` whole on every registration change. A missing or malformed file, or one from another day, reads as 0.
+- **Call length** stays capped by `conversation.max_call_sec` (600 s) in both modes; the silence, RTP and brain-error rules are unchanged.
+- **Where transcripts go.** Transcripts leave ai-phone only through the command that asked for them (each turn also stays in `turns.jsonl`, as before), and, with a remote brain (`brain.kind: openai_compatible`, §14a.7), through that endpoint during the call: what callers say, the call's system prompt and the conversation so far go there on every turn in phone agent mode. If the calling AI runs on a cloud model, that service sees them. The README says so next to the examples.
+
+### 14b.9 Configuration
+
+```yaml
+inbound:                       # incoming calls: every caller hears the greeting; the instructions apply when no AI listens
+  greeting: "Hi, you've reached an AI assistant. How can I help?"   # 1 to 500 characters; synthesised at start
+  instructions: "…"            # at most 4000 characters; the default asks who is calling and offers to take a message
+calls:
+  daily_limit: 0               # outbound calls per local day; 0 = no limit
+  relay_filler_after_ms: 1500  # more than 0
+  relay_second_filler_sec: 10  # must come after relay_filler_after_ms
+  relay_reply_timeout_sec: 25  # must be longer than relay_second_filler_sec
+```
+
+An explicit `inbound:` section wins over anything converted from an older config. A Milestone 1 `conversation.greeting` and `conversation.system_prompt` become `inbound.greeting` and `inbound.instructions`, with a warning. How a Milestone 2 config is converted is in the decision log (§15, 2026-09-16). `lines add` writes nothing about what the agent says.
+
+### 14b.10 Decisions made while building
+
+Each came out of planning or a review:
+
+- The daily counter lives in `calls-today.json`, not `state.json` (§14b.8).
+- `listen` replies use the key `kind`, not `event`, so the CLI's progress handling never mistakes a result for a progress event.
+- The end reasons `rtp_timeout`, `brain_error` and model-worker errors map to `ended_by: error`, with the reason in `detail`.
+- In relay mode the controller returns to `LISTENING` as soon as it hands a `heard` over, with a "waiting for the calling AI" flag that turns off the silence prompt. That is how speech while waiting never cancels anything: it simply becomes more `heard` text.
+- The relay wait restarts at every new `heard`; each filler still plays at most once between two `say`s.
+- On an outbound relay call, before the first `say`, there are no fillers and the timeout counts from the answer.
+- Relay speech that arrives while the previous utterance is still being transcribed is held, not treated as barge-in, and replayed (and finalised, if it has already ended) once the pending transcript arrives. Otherwise barge-in would cancel the transcript and lose the caller's words.
+- The model's opening sentence is generated while the disclosure plays; its audio is held until the disclosure has finished.
+- `hangup --say` reaches the controller as a `say` with the end reason `hangup_command`, so an interruption still ends the call; the daemon hangs up anyway after 30 s, and `hangup` reports exit 9 if the call has still not ended 10 s after that.
+- A `call` cancelled by `hangup` before it was answered ends with outcome `cancelled` (exit 7), not `completed`.
+- The daily limit counts every dial attempt the SIP stack accepted: every attempt can cost money.
+- `listen` with no call in progress first reports a relay call that ended since anyone last listened; a `listen` whose client disconnects is cancelled at once, so it never holds the listener slot.
+- "Busy" is decided by the daemon's one-call claim; the control server only checks the shape of each request.
+- Argument-parser errors stay plain text on stderr with exit 2, even under `--json`; the JSON contract covers everything a command reports itself.
+- Extensions such as 100 and 1000 stay blocked by the emergency rule; such extensions are dialled by name.
 
 ## 15. Decision log
 
@@ -783,6 +982,8 @@ ai-phone status                                    # per-line registration rows 
 | 2026-09-03 | Qwen3.5's prompt cache is hybrid (24 ArraysCache + 8 KVCache) and cannot be trimmed; the system prefix is evaluated once and each turn starts from a deep copy (0.2 ms); history is re-evaluated each turn | [D] |
 | 2026-09-03 | Speech during the greeting stops it (barge-in on greeting); STT worker owns draining its ring and the daemon cancels the workers' generation at call end (otherwise consecutive calls' audio blended); TTS resamples in its worker; STT partials not streamed in M1; first TTS unit is 4–8 tokens, later units 6–12 | [D] |
 | 2026-09-03 | Dev-machine finding: the 9B tier (≈8.5 GB with fp16 parakeet) swaps beside a normal app load on 24 GB; minimum-hardware tiers stand (16 GB → t4) | [D] |
+| 2026-09-16 | **Personas replaced by per-call prompts; relay mode added** (Milestone 3, the agent tool, §14b). Any AI with a shell drives ai-phone: phone agent mode (`ai-phone call --prompt`, ai-phone's model holds the conversation, the transcript is returned) or relay mode (`call --relay`, `listen`, `say`, `hangup`; the calling AI holds the conversation). The `personas:` section, each line's `persona` key and `outbound_opening` are removed: an outbound call carries its own prompt and opens with the fixed disclosure "Hi, this is an AI assistant calling.", and incoming calls use one `inbound:` section. A config with `personas:` still loads: the first line's persona (or `default`) supplies `inbound.greeting` and `inbound.instructions` (from its `system_prompt`), the other personas and `outbound_opening` are dropped, line `persona` keys are ignored, and one warning says so. `lines add` no longer writes `persona`; `call --persona` and a control-socket `persona` field are refused with exit 2. Emergency numbers are refused in the daemon; `calls.daily_limit` is counted in `calls-today.json` | [D] |
+| 2026-09-16 | **Roadmap renumbered:** M3 agent tool, M4 packaging, M5 local dashboard (calls, transcripts, line status, logs; reachable only from the machine) and HTTP API, M6 launch, then post-launch work with no milestone number. Rows above this one use the old numbers (M3 packaging, M4 control plane, M5 launch, M6 post-launch). Not in M3: an MCP server (a thin wrapper, later), SMS, keypad tones, more than one call | [D] |
 
 ## 16. Verified facts (2026-09-02; Milestone 2 rows added 2026-09-03)
 

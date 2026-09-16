@@ -24,7 +24,7 @@ One daemon, one or more lines, one phone call at a time across them. It register
                           │ L2 Pipeline: asyncio TurnController, VAD, endpointing,   │  main thread
                           │        barge-in, clause chunker, resampler, timers       │
                           │ L4 Control: CLI over Unix socket, config, doctor,        │
-                          │        HTTP API (M4), TUI (M4)                           │
+                          │        HTTP API (M5), TUI (M5)                           │
                           └───────┬────────────┬────────────┬────────────────────────┘
                      JSON pipe + shm ▼          ▼            ▼
                               stt-worker   llm-worker   tts-worker      (L3, child processes, one model each)
@@ -52,31 +52,37 @@ caller audio → `rx_ring` → VAD (Silero, 32 ms chunks) → **speech_end after
 
 ## Call rules
 
-Answer with a fixed cached greeting. Second INVITE while busy → 486. INVITE from a disallowed source → 403. Acceptance modes: `registered_trunk` (default), `lan` (RFC 1918 + loopback + link-local; used by `ai-phone run --lan`, the test peer, and CI), `any` (warned). Silence 8 s → "Still there?", 8 s more → BYE. Max call 10 min. RTP silent 10 s → BYE. Single call through launch.
+Answer with the cached `inbound.greeting`; every outbound call opens with the cached disclosure "Hi, this is an AI assistant calling.", played in full. Second INVITE while busy → 486. INVITE from a disallowed source → 403. Acceptance modes: `registered_trunk` (default), `lan` (RFC 1918 + loopback + link-local; used by `ai-phone run --lan`, the test peer, and CI), `any` (warned). Silence 8 s → "Still there?", 8 s more → BYE. Max call 10 min. RTP silent 10 s → BYE. Single call through launch.
 
 ## Where things live
 
 ```
 src/ai_phone/  telephony/ (endpoint, call, media_port, policy, events, state, rings)
-               pipeline/  (turn, vad, bargein, chunker, audio_out, timing)
+               pipeline/  (turn, replies, prompts, vad, bargein, chunker, audio_out, timing)
                services/  (base, ipc, worker, client, errors, backends/ incl. openai_compat)
                lines/     (journal, config_writer, forward, credentials)     — provisioning bookkeeping (CLI only)
                providers/ (base, telnyx, twilio, fake)                       — carrier REST (CLI only; the daemon never imports it)
                control/   (protocol, server, client)                        — the unix control socket
-               cli.py, cli_lines.py, cli_status.py, cli_call.py, daemon.py, config.py, secrets.py, paths.py
+               calls.py (call records), call_guard.py (emergency block, daily limit)
+               cli.py, cli_lines.py, cli_status.py, cli_call.py (call, listen, say, hangup), daemon.py, config.py, secrets.py, paths.py
 native/pjsua2/ SWIG interface + build script (GPL source offer)
 scripts/       latency_report.py, pjsua_peer.sh, pf/ ruleset, utterances.txt
 packaging/     Homebrew formula, Dockerfile.cuda, launchd plist
 config:        ~/.ai-phone/config.yaml (0600) · models: ~/.ai-phone/models · logs: ~/Library/Logs/ai-phone
+state:         ~/.ai-phone/state.json · control.sock · calls-today.json (daily outbound counter)
 ```
 
 ## Lines (Milestone 2)
 
 An agent is reachable through lines: a number bought with your own Telnyx or Twilio key (`ai-phone lines add telnyx --key-env TELNYX_API_KEY`), your own phone diverted to it (`ai-phone lines forward main --when no-answer --from +44…` prints the dial codes), a free SIP address for agent-to-agent calls (`ai-phone lines add sip …`), or a trunk you bring. The daemon sees only SIP either way; `ai-phone call <number|sip:…>` dials out with the agent's number (or your verified mobile) as caller ID and opens with an AI disclosure line; `ai-phone status` shows registration per line. Provisioning is journaled and resumable (`lines resume`), and `lines remove` undoes everything a carrier created. Configuration applies at restart. The brain is pluggable: `brain: {kind: openai_compatible, base_url: …}` makes any OpenAI-compatible server the agent. Full detail in `architecture.md` §14a.
 
+## Agent tool (Milestone 3)
+
+Any AI that can run shell commands uses ai-phone as its phone, in one of two modes chosen per call. **Phone agent mode** (`ai-phone call <target> --prompt "…"`): ai-phone's own model holds the whole conversation, following fixed phone instructions (the cached prefix) plus the call's prompt; it ends the call by writing `[END]`, and the command returns the transcript. **Relay mode** (`ai-phone call <target> --relay`, then `ai-phone listen`, `say` and `hangup`): the calling AI holds the conversation; ai-phone turns the other person's speech into text and speaks the AI's replies, says "One moment." when a reply is slow and hangs up politely after `calls.relay_reply_timeout_sec` (25 s). Every incoming call hears `inbound.greeting`; `ai-phone listen` with no call in progress waits for an incoming call and takes it in relay mode, and with nobody listening an incoming call runs in phone agent mode with `inbound.instructions`. Every outbound call opens with the fixed disclosure "Hi, this is an AI assistant calling."; the daemon refuses emergency numbers and enforces `calls.daily_limit`. Each call gets a 6-character hex ID and an in-memory record (the call in progress and the last 20 that ended). `call`, `listen`, `say` and `hangup` take `--json` and then print exactly one JSON object. The calling AI reaches the daemon over the local control socket, so the six invariants are unchanged. Full detail in `architecture.md` §14b.
+
 ## Milestone gates
 
-M1 latency proof: p50 < 1.0 s at 8 kHz over the 20-utterance script, else the 4B tier becomes default (passed: p50 874 ms). M2 lines: a Telnyx number bought by `lines add` registers from behind the home router and stays registered 24 h (≥ 99 %, induced drops recovered within 60 s); an iPhone call answered under 1 s daemon-side; the iPhone diverted with `**61*` reaches the agent; `ai-phone call` rings it with the agent's number; two daemons call each other over `sip:`; Twilio passes the same inbound/outbound flow; a killed brain yields the apology, not silence; `lines remove` leaves nothing in the carrier account; no worker ever holds a line password. M3 packaging: install-to-first-call under 10 min on both platforms. M4 control plane: API drives a call. M5 launch. Nothing is built before its gate.
+M1 latency proof: p50 < 1.0 s at 8 kHz over the 20-utterance script, else the 4B tier becomes default (passed: p50 874 ms). M2 lines: a Telnyx number bought by `lines add` registers from behind the home router and stays registered 24 h (≥ 99 %, induced drops recovered within 60 s); an iPhone call answered under 1 s daemon-side; the iPhone diverted with `**61*` reaches the agent; `ai-phone call` rings it with the agent's number; two daemons call each other over `sip:`; Twilio passes the same inbound/outbound flow; a killed brain yields the apology, not silence; `lines remove` leaves nothing in the carrier account; no worker ever holds a line password. M3 agent tool: an AI places a phone agent call and a relay call through the CLI, both end to end with transcripts; emergency numbers refused. M4 packaging: install-to-first-call under 10 min on both platforms. M5 local dashboard and HTTP API: the API drives a call. M6 launch. Nothing is built before its gate.
 
 ## Test peer (same box)
 
@@ -110,4 +116,6 @@ pjsua --local-port 5062 --null-audio --play-file utt.wav --auto-play --auto-play
 | Security model | §12 |
 | Failure modes and recovery | §13 |
 | Post-launch extension points | §14 |
+| Lines, providers, outbound calls, pluggable brain | §14a |
+| Agent tool: call records, relay mode, prompts, emergency block, daily limit | §14b |
 | Which facts were verified against source | §16 |

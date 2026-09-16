@@ -1,4 +1,4 @@
-# ai-phone configuration (copy to ~/.ai-phone/config.yaml, chmod 600). Full schema: architecture.md §8 and §14a.
+# ai-phone configuration (copy to ~/.ai-phone/config.yaml, chmod 600). Full schema: architecture.md §8, §14a and §14b.
 # Lines are usually added for you by `ai-phone lines add …`. This is an excerpt, not the whole schema: it shows the
 # fields you normally set, and omits the ones that have a working default. Notably absent from the line entries below:
 # transport, register_via_proxy, outbound_proxy, register_expiry_sec, srtp, diverted_from, verified_caller_ids and the
@@ -24,7 +24,6 @@ lines:
     accept_invites_from: registered_trunk       # registered_trunk | trusted | lan | any
     trusted_cidrs: []                           # the carrier's signalling ranges; written by the provider
     caller_id: "+442079460000"
-    persona: default
   agents:                                 # a SIP address with no carrier (agents calling agents)
     kind: sip
     user: agents
@@ -33,17 +32,17 @@ lines:
     accept_invites_from: trusted
     trusted_peers: ["203.0.113.7"]
     caller_id: "sip:agents@home.example.org"
-    persona: default
 
-personas:
-  default:
-    greeting: "Hi, this is the house. What can I do for you?"
-    system_prompt: "You are ai-phone, a local phone assistant. Answer in one short sentence."
-    outbound_opening: "Hi, this is an AI assistant calling on behalf of the owner of this number. Is now a good time?"
-  receptionist:
-    greeting: "Hello, you've reached the office. How can I help?"
-    system_prompt: "You are a receptionist. Find out who is calling and why, take a message, and keep replies to one sentence."
-    outbound_opening: "Hi, this is the office's AI assistant calling. Is now a good time?"
+inbound:                       # incoming calls: every caller hears the greeting; the model follows the instructions
+                               # when no AI is waiting in `ai-phone listen`
+  greeting: "Hi, you've reached an AI assistant. How can I help?"
+  instructions: "Take a message: ask for the caller's name, number and what it is about."
+
+calls:
+  daily_limit: 0               # outbound calls per local day; 0 = no limit
+  relay_filler_after_ms: 1500  # relay mode: say "One moment." after this long without a reply from your AI
+  relay_second_filler_sec: 10  # and "Still with you, one moment." at this many seconds
+  relay_reply_timeout_sec: 25  # then apologise and hang up
 
 rtp:
   port_min: 10000
