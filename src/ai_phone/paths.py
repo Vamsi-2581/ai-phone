@@ -49,3 +49,7 @@ def lines_dir() -> Path:
 
 def logs_dir(cfg_log_dir: str) -> Path:
     return Path(cfg_log_dir).expanduser()
+
+
+def call_counter_path() -> Path:
+    return home() / "calls-today.json"

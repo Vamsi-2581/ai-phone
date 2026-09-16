@@ -37,3 +37,9 @@ def test_socket_path_falls_back_to_a_short_tmp_path(monkeypatch, tmp_path: Path)
         assert paths.socket_path() == short / "control.sock"
     else:  # macOS tmp paths are long: the private fallback applies, with the shape checked above
         assert paths.socket_path().suffix == ".sock" and paths.socket_path().parent.name == f"ai-phone-{os.getuid()}"
+
+
+def test_call_counter_lives_in_the_home(tmp_path, monkeypatch):
+    from ai_phone import paths
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    assert paths.call_counter_path() == tmp_path / "calls-today.json"
