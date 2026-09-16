@@ -83,6 +83,13 @@ ai-phone call +15551234567 --json \
   --prompt "Ask whether they have a table for two at 8 tonight, under the name Sam."
 ```
 
+A phone agent `call` blocks until the call ends, which can take up to `conversation.max_call_sec` (600 seconds). With
+`--json` it also writes each progress event to stderr as one JSON line, starting with
+`{"event": "created", "call_id": "c7f3a2"}`. If your agent's shell kills the command before the call ends, the call
+carries on. Take the ID from that `created` line and run `ai-phone listen --call c7f3a2 --json` once the call is over;
+it prints the result with the transcript. While the call is still going, that `listen` exits 11 at once, so wait and try
+again (`ai-phone status` shows the call while it is up). The daemon keeps the last 20 calls.
+
 **Relay mode**: your agent holds the conversation itself, one turn at a time:
 
 ```bash
@@ -97,14 +104,17 @@ ai-phone hangup --say "That's all, thank you. Goodbye." --json
 relay call that ended since anyone last listened). When someone calls, ai-phone answers with `inbound.greeting` and
 `listen` prints `incoming call c9b1e0 on main from sip:+15551234567@sip.carrier.example` (the caller's SIP URI as the
 SIP stack reports it, sometimes with a display name, not a bare number); your agent carries on with `listen` and
-`say`. While your agent is thinking, ai-phone says "One moment." so the line never goes silent, and "Still with you,
+`say`. While a phone agent call is in progress (an outbound one, or an incoming call that arrived while nobody was
+listening), `listen` without `--call` exits 11 at once instead of waiting, so an agent that polls for incoming calls
+should pause before it tries again. While your agent is thinking, ai-phone says "One moment." so the line never goes silent, and "Still with you,
 one moment." after 10 seconds; after 25 seconds without a reply it apologises and hangs up. On an outbound relay call
 the 25 seconds count from the answer until your agent's first `say`, with no "One moment." before it, so say the first
 line straight away. Every outbound call starts with "Hi, this is an AI assistant calling." Emergency numbers are never
 dialled (a target whose digits look like one, such as extension 100 or 1000, is refused too; call such extensions by
 name), and `calls.daily_limit` caps outbound calls per day.
 
-With `--json`, each of these four commands (`call`, `listen`, `say`, `hangup`) prints exactly one JSON object; a
+With `--json`, each of these four commands (`call`, `listen`, `say`, `hangup`) prints exactly one JSON object on stdout
+(`call` also writes its progress events to stderr, one JSON object per line); a
 malformed command line (a missing or unknown option) is reported by the argument parser on stderr with exit code 2,
 and Ctrl-C while `listen`, `say` or `hangup` is waiting exits 130 (Ctrl-C during `call` hangs the call up and prints
 its result).
@@ -117,7 +127,7 @@ its result).
 | 6 | no answer |
 | 7 | rejected, or cancelled by `hangup` while still ringing |
 | 8 | redirected |
-| 9 | ai-phone is not running, went away, or sent a reply this command does not understand; from `hangup`, also: the call had still not ended 40 seconds after the hangup (30 for the goodbye, then 10), so it may still be up |
+| 9 | ai-phone is not running, went away, or sent a reply this command does not understand; from `hangup`, also: the call had still not ended 40 seconds after the hangup (ai-phone waits 30 seconds for the call to end, including any `--say` text, hangs up again, then waits 10 more), so it may still be up |
 | 10 | `listen` timed out (the call, if any, goes on) |
 | 11 | no such call, no call in progress, call already ended, or `listen`/`say` on a phone agent call |
 | 12 | another `listen` is already waiting for calls |

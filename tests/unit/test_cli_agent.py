@@ -48,6 +48,22 @@ def test_json_output_is_one_object_and_nothing_else(sock_dir, monkeypatch, capsy
     assert rc == 0 and json.loads(out) == {"ok": True, **RESULT}
 
 
+def test_json_progress_goes_to_stderr_so_a_killed_call_can_be_recovered(sock_dir, monkeypatch, capsys):
+    async def handler(msg, send):
+        await send({"event": "created", "call_id": "c7f3a2"})
+        await send({"event": "dialling", "uri": "x"})
+        await send({"event": "answered", "code": 200, "uri": "", "reason": "OK"})
+        await send({"event": "turn", "turn": 0, "first_audible_ms": 812.0, "bargein": False})
+        await send({"event": "ended", "reason": "completed", "detail": "", "exit_code": 0, "call_id": "c7f3a2", "result": RESULT})
+
+    rc = run_with(sock_dir, monkeypatch, handler, ["call", "+15550000000", "--prompt", "Ask the hours.", "--json", "--yes"])
+    captured = capsys.readouterr()
+    assert rc == 0 and json.loads(captured.out) == {"ok": True, **RESULT}
+    progress = [json.loads(line) for line in captured.err.splitlines()]
+    assert progress[0] == {"event": "created", "call_id": "c7f3a2"}
+    assert [p["event"] for p in progress] == ["created", "dialling", "answered", "turn"]
+
+
 def test_relay_call_returns_at_answer(sock_dir, monkeypatch, capsys):
     async def handler(msg, send):
         assert msg["relay"] is True and msg["prompt"] is None

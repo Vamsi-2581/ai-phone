@@ -15,7 +15,7 @@ from pathlib import Path
 from ai_phone import paths
 from ai_phone.call_guard import DailyCounter, is_emergency
 from ai_phone.calls import CallRecord, CallRegistry, ListenerBusy
-from ai_phone.config import Config, LineConfig, line_password_env
+from ai_phone.config import Config, InboundConfig, LineConfig, line_password_env
 from ai_phone.control.protocol import EXIT
 from ai_phone.control.server import ControlServer
 from ai_phone.pipeline import prompts
@@ -133,8 +133,12 @@ class Daemon:
         return specs
 
     def _write_state(self) -> None:
+        """state.json is for `ai-phone status`; a write that fails (a full disk) is logged and never stops a call."""
         brain = {"kind": self.cfg.brain.kind, "base_url": self.cfg.brain.base_url if self.remote_brain else None}
-        self.state_file.write(self.line_status, self.active_call, brain)
+        try:
+            self.state_file.write(self.line_status, self.active_call, brain)
+        except OSError as e:
+            log.warning("could not write %s: %s", self.state_file.path, e)
 
     def _on_reg(self, e: ev.RegState) -> None:
         st = self.line_status.get(e.line_id)
@@ -431,9 +435,17 @@ class Daemon:
             except DialError as e:
                 return await self._send_quiet(send, {"event": "ended", "reason": "rejected", "detail": str(e),
                                                      "exit_code": EXIT["rejected"], "call_id": None, "result": None})
-            self.counter.record()  # every accepted dial attempt counts: busy and unanswered calls can cost too
             rec = self.calls.new("relay" if relay else "agent", "out", line_id, to, prompt)
             rec.pj_call_id = cid
+            try:
+                self.counter.record()  # every accepted dial attempt counts: busy and unanswered calls can cost too
+            except Exception as e:  # an attempt the daily limit cannot see is never let through
+                error = f"could not update the daily call counter: {e}"
+                log.error("control: call %s refused: %s", rec.id, error)
+                rec.finish("rejected", ended_by="error", detail=error)
+                self.calls.end_current(rec)
+                self._hangup_quietly(tel, cid)
+                return await self._err(send, "rejected", error)
             log.info("control: %s call %s on line %s to %s -> pjsip call %s", rec.mode, rec.id, line_id, to, cid)
             mine = self._outbound = {"call_id": cid, "record": rec, "send": send}
             self.active_call = {"call_id": cid, "call": rec.id, "mode": rec.mode, "line_id": line_id, "remote": to,
@@ -491,17 +503,22 @@ class Daemon:
             await self._send_quiet(send, {"event": "ended", "reason": rec.outcome, "detail": rec.detail, "exit_code": code,
                                           "call_id": rec.id, "result": rec.result()})
         finally:
+            failure = sys.exception()  # None when the handler returned normally
+            stopped = isinstance(failure, asyncio.CancelledError)
+            ended_before = rec is not None and rec.is_ended  # the call's own end was already recorded
             if mine is not None and self._outbound is mine:
                 self._outbound = None  # only our own: a `call` refused as busy must not touch the call in progress
             self._call_waiters.remove(q)
-            if rec is not None and not rec.is_ended and not handed_over and rec.id not in self._controllers:
+            running = rec is not None and rec.id in self._controllers
+            if rec is not None and not rec.is_ended and not handed_over and not running:
                 # left early, with no conversation running that would finish the record: cancelled when the daemon
                 # stops (ControlServer.stop), or a failure in this handler
-                failure = sys.exception()
-                stopped = isinstance(failure, asyncio.CancelledError)
                 rec.finish("completed" if outcome == "answered" else ("cancelled" if stopped else "rejected"), ended_by="error",
                            detail="ai-phone stopped" if stopped else f"the call command failed ({type(failure).__name__})")
                 self.calls.end_current(rec)
+            if cid is not None and failure is not None and not stopped and outcome != "answered" and not handed_over \
+                    and not running and not ended_before:
+                self._hangup_quietly(tel, cid)  # this handler failed: nobody is behind the call, so it must not ring on
             if cid is not None and outcome != "answered":
                 if rec is not None and self.active_call is not None and self.active_call.get("call") == rec.id:
                     self.active_call = None  # never reached media, so _run_call never cleared it
@@ -509,6 +526,15 @@ class Daemon:
                 # the main loop releases on `ended` too; both are idempotent, so the claim can never be left behind
                 if getattr(tel, "current_call", None) is not None and tel.current_call.getId() == cid and tel.current_call.ended:
                     tel.release_call(cid)
+
+    @staticmethod
+    def _hangup_quietly(tel, cid: int) -> None:
+        """Hang up a call nobody is behind. PJSIP may refuse one it has just ended; that changes nothing, and must not
+        replace the failure being handled."""
+        try:
+            tel.hangup(cid)
+        except Exception as e:
+            log.warning("hangup of pjsip call %s failed: %s", cid, e)
 
     @staticmethod
     async def _next_or_connected(q: asyncio.Queue, rec: CallRecord):
@@ -576,7 +602,9 @@ class Daemon:
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
 
-        section = rec.prompt if out else self.cfg.inbound.instructions
+        # an outbound call without --prompt falls back to prompts.DEFAULT_CALL_SECTION (calling on the owner's behalf);
+        # an incoming call never does: blank inbound instructions mean the take-a-message default
+        section = rec.prompt if out else (self.cfg.inbound.instructions.strip() or InboundConfig().instructions)
         tc = TurnController(self.cfg.conversation, tel.port, stt, llm, tts, rx, tx, stt_in, tts_out,
                             Endpointer(vad, self.cfg.conversation.endpoint_silence_ms), ctx["greeting"],
                             prompts.system_prompt(ctx["fixed"], section), on_turn,
@@ -638,6 +666,6 @@ class Daemon:
                 for r_ in (rx, tx, tts_out):
                     r_.flush()
                 self.active_call = None
-                self._write_state()
                 tel.release_call(call_id)  # only now may the next call be claimed
                 self.calls.end_current(rec)
+                self._write_state()  # last: nothing it raises may keep the line claimed or the record current

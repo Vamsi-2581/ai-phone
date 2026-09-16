@@ -43,8 +43,10 @@ def render_last_call(turns_path: Path) -> str:
             continue  # a record cut short by an interrupted write must not hide the rest
     if not rows:
         return "no turns recorded yet"
-    last_id = rows[-1]["call_id"]
-    call = [r for r in rows if r["call_id"] == last_id]
+    # PJSIP reuses its call IDs, so records that carry the call record's own ID are grouped by that
+    key = "call" if rows[-1].get("call") else "call_id"
+    last_id = rows[-1][key]
+    call = [r for r in rows if r.get(key) == last_id]
     lat = [r["first_audible_ms"] for r in call if r.get("first_audible_ms") is not None]
     p50 = f"{statistics.median(lat):.0f} ms" if lat else "n/a"
     return (f"call {last_id}: {len(call)} turns, first audible p50 {p50}, "

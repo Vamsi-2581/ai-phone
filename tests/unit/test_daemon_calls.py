@@ -716,3 +716,76 @@ async def test_a_call_command_that_fails_is_not_labelled_as_a_shutdown(tmp_path,
     assert rec.is_ended and rec.outcome == "rejected" and rec.ended_by == "error"
     assert rec.detail == "the call command failed (OSError)" and d.calls.current is None
     assert d._outbound is None and d._call_waiters == [] and d.active_call is None
+    assert tel.hung == [7]                       # the phone must not go on ringing with nobody behind the call
+
+
+@pytest.mark.asyncio
+async def test_a_call_whose_daily_count_cannot_be_written_is_hung_up_and_refused(tmp_path, monkeypatch):
+    d, tel, out = daemon(tmp_path, monkeypatch, limit=5), Tel(), Sink()
+
+    def record_fails():
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(d.counter, "record", record_fails)
+    await asyncio.wait_for(d._control({"cmd": "call", "to": "sip:x@127.0.0.1", "line": "agents", "prompt": "hi"},
+                                      out, ctx(tel)), 2)
+    error = "could not update the daily call counter: [Errno 28] No space left on device"
+    assert out.msgs == [{"ok": False, "error": error, "code": 7}]
+    assert tel.calls == [("agents", "sip:x@127.0.0.1")] and tel.hung == [7]
+    [rec] = d.calls._records.values()
+    assert rec.is_ended and rec.outcome == "rejected" and rec.ended_by == "error" and rec.detail == error
+    assert d.calls.current is None and d._outbound is None and d.active_call is None and d._call_waiters == []
+
+
+@pytest.mark.asyncio
+async def test_a_state_file_that_cannot_be_written_never_stops_an_incoming_call(tmp_path, monkeypatch):
+    from ai_phone.telephony.state import StateFile
+
+    def write_fails(self, lines, active_call, brain):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(StateFile, "write", write_fails)
+    d, tel, lis = daemon(tmp_path, monkeypatch), Tel(), Sink()
+    listener = asyncio.create_task(d._control({"cmd": "listen", "timeout_sec": 2}, lis, ctx(tel)))
+    await asyncio.sleep(0.05)
+    rec = d._on_incoming(ev.IncomingCall(3, "agents", "sip:a@10.0.0.2", "10.0.0.2"), tel)
+    await asyncio.wait_for(listener, 1)
+    assert tel.answered == [3] and rec.mode == "relay" and d.active_call["call"] == rec.id
+    assert lis.msgs[-1] == {"ok": True, "kind": "incoming", "call_id": rec.id, "line": "agents", "remote": "sip:a@10.0.0.2"}
+
+
+@pytest.mark.asyncio
+async def test_run_call_releases_the_line_and_ends_the_record_before_writing_state(tmp_path, monkeypatch):
+    from ai_phone import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "TurnController", FakeTC)
+    monkeypatch.setattr(FakeTC, "script", "agent")
+    d, tel = daemon(tmp_path, monkeypatch), CallTel()
+    rec = d.calls.new("agent", "in", "agents", "sip:a@10.0.0.2")
+    rec.pj_call_id = 7
+
+    def write_breaks():
+        raise RuntimeError("state writer broke")
+
+    monkeypatch.setattr(d, "_write_state", write_breaks)
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(d._run_call(rec, run_ctx(tel)), 2)
+    assert tel.released == [7] and rec.is_ended and d.calls.current is None and d.active_call is None
+
+
+@pytest.mark.asyncio
+async def test_an_incoming_call_with_blank_instructions_gets_the_inbound_default(tmp_path, monkeypatch):
+    from ai_phone import daemon as daemon_mod
+    from ai_phone.config import InboundConfig
+    from ai_phone.pipeline import prompts
+
+    monkeypatch.setattr(daemon_mod, "TurnController", FakeTC)
+    monkeypatch.setattr(FakeTC, "script", "agent")
+    d, tel = daemon(tmp_path, monkeypatch), CallTel(3)
+    d.cfg.inbound.instructions = ""
+    rec = d.calls.new("agent", "in", "agents", "sip:a@10.0.0.2")
+    rec.pj_call_id = 3
+    await asyncio.wait_for(d._run_call(rec, run_ctx(tel)), 2)
+    composed = FakeTC.last.args[11]
+    assert "calling on behalf" not in composed
+    assert composed == prompts.system_prompt("FIXED", InboundConfig().instructions)

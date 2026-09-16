@@ -107,12 +107,15 @@ def test_ctrl_c_hangs_up_and_exits_promptly_when_the_daemon_confirms(sock_dir: P
     import os, signal, threading, time
     monkeypatch.setenv("AI_PHONE_HOME", str(sock_dir))
     hung_up = threading.Event()
+    hangups = []
 
     async def handler(msg, send):
         if msg["cmd"] == "hangup":
+            hangups.append(msg)
             hung_up.set()
             await send({"ok": True})
             return
+        await send({"event": "created", "call_id": "c7f3a2"})
         await send({"event": "dialling", "uri": "sip:x"})
         await send({"event": "answered"})
         while not hung_up.is_set():
@@ -124,6 +127,7 @@ def test_ctrl_c_hangs_up_and_exits_promptly_when_the_daemon_confirms(sock_dir: P
     t0 = time.monotonic()
     try:
         assert main(["call", "sip:x@127.0.0.1", "--yes"]) == 0
+        assert [m["call_id"] for m in hangups] == ["c7f3a2"], "Ctrl-C hangs up this call, never another one"
         assert time.monotonic() - t0 < 3.0, "the 5 s cut-off timer must not delay a confirmed hangup"
         assert all(not th.name.startswith("Timer") or th.daemon for th in threading.enumerate())
     finally:

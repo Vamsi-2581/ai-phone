@@ -1,11 +1,13 @@
 """`ai-phone call | listen | say | hangup`: the agent tool. Every command talks to the running daemon; `--json`
-prints exactly one JSON object and nothing else."""
+prints exactly one JSON object on stdout and nothing else there (`call` also writes its progress to stderr, one JSON
+object per line)."""
 from __future__ import annotations
 
 import argparse
 import json
 import signal
 import socket
+import sys
 import threading
 from pathlib import Path
 
@@ -100,10 +102,19 @@ def cmd_call(a) -> int:
     if not _alive(a):
         return EXIT["daemon_gone"]
 
+    holder: dict = {}
+    interrupted = {"flag": False}
+
     def on_event(e: dict) -> None:
-        if a.json:
-            return
         kind = e.get("event")
+        if kind == "created":
+            holder["call_id"] = e.get("call_id")  # Ctrl-C hangs up this call, never another one
+        if a.json:
+            # progress goes to stderr, one JSON object per line, so a caller whose command is killed still has the
+            # call ID from `created` (`ai-phone listen --call ID` returns the result); stdout keeps its one object
+            if kind != "ended" and "ok" not in e:
+                print(json.dumps(e), file=sys.stderr, flush=True)
+            return
         if kind == "turn":
             print(f"turn {e.get('turn')}: first audible {e.get('first_audible_ms')} ms", flush=True)
         elif kind == "created":
@@ -111,14 +122,11 @@ def cmd_call(a) -> int:
         elif kind not in ("ended",) and "ok" not in e:
             print(f"{kind} {e.get('uri', '')}".strip(), flush=True)
 
-    holder: dict = {}
-    interrupted = {"flag": False}
-
     def on_sigint(*_):
         """Hang up, give the daemon a moment to report `ended`, then stop waiting whatever happens."""
         interrupted["flag"] = True
         try:
-            request(paths.socket_path(), {"cmd": "hangup"}, timeout=2)
+            request(paths.socket_path(), {"cmd": "hangup", "call_id": holder.get("call_id")}, timeout=2)
         except DaemonGone:
             pass
 

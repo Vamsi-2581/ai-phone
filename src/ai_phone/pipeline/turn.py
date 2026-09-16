@@ -17,8 +17,8 @@ import numpy as np
 
 from ai_phone.config import CallsConfig, ConversationConfig
 from ai_phone.pipeline.bargein import BargeInDetector
-from ai_phone.pipeline.chunker import ClauseChunker
-from ai_phone.pipeline.prompts import END_MARKER, OPENING_CUE
+from ai_phone.pipeline.chunker import ClauseChunker, remove_end_marker
+from ai_phone.pipeline.prompts import OPENING_CUE
 from ai_phone.pipeline.replies import ModelReplies, Phrase, RelayPhrases, ReplySource
 from ai_phone.pipeline.timing import TurnTimer
 from ai_phone.pipeline.vad import Endpointer, SpeechChunk, SpeechEnd, SpeechStart
@@ -29,13 +29,13 @@ from ai_phone.telephony.rings import FrameRing
 
 _log = logging.getLogger("ai-phone.turn")
 OPENING = ("GREETING", "OUTBOUND_OPENING")  # the cached line that opens a call, then LISTENING; only a greeting can be cut
+GREETING_MAX_SEC = 1.5  # held speech shorter than this that ended during the disclosure is a greeting, not a turn
 _DEBUG_RX = os.environ.get("AI_PHONE_DEBUG_RX")  # path prefix: every call's inbound audio is written as <prefix>-<n>.raw (16 kHz int16)
-_END_MARKER_RE = re.compile(re.escape(END_MARKER), re.IGNORECASE)
 
 
 def _without_marker(text: str) -> str:
     """The reply as it was spoken: the end marker (any case) is an instruction, never part of the transcript."""
-    return _END_MARKER_RE.sub("", text)
+    return remove_end_marker(text)[0]
 
 
 class PortLike(Protocol):
@@ -155,7 +155,9 @@ class TurnController:
         self._relay_wait_from, self._fillers_armed, self._fillers_played = None, False, 0
         self._say_active, self._end_after_reply = fut, end_reason
         t = self.timer = self._timer()
-        t.t1 = t.t2 = t.t0_end = now  # t0_end arms the reply timeout for a stalled TTS; there is no speech, so no t0
+        # t0_end arms the reply timeout for a stalled TTS; no speech and no model, so no t0, t1 or t2 (and no latency
+        # figures for this turn)
+        t.t0_end = now
         self.state = "THINKING"
         self.port.arm_t5()
         self.chunker = ClauseChunker()
@@ -402,9 +404,15 @@ class TurnController:
         self._interrupt_t = None
         self.bargein.reset()
         self._arm_outbound_relay_wait()
+        held_sec = sum(len(pcm) for pcm in candidate) / 16000
+        if candidate and self._opening_pending and self.state == "OUTBOUND_OPENING" and held_end is not None \
+                and held_sec < GREETING_MAX_SEC:
+            # the "Hello?" at pickup: the model's opening answers it, so the held audio is dropped, not transcribed
+            _log.info("short speech during the disclosure treated as a greeting (%.1f s of audio)", held_sec)
+            candidate = []
         if candidate:
             if self._opening_pending:
-                self._cancel_opening()  # they spoke first: answer them, not the cue
+                self._cancel_opening()  # they said more, or are still talking: answer them, not the cue
             self.state = "LISTENING"
             self.timer = self._timer()
             for pcm in candidate:
@@ -570,14 +578,18 @@ class TurnController:
         for c in (self.stt, self.llm, self.tts):
             if c.kind != kind:
                 c.cancel(c.current_gen)
-        self._flush_tx()
+        if self.state not in OPENING:
+            self._flush_tx()  # an opening (the disclosure above all) plays in full; the model's held audio is dropped
         self.tts_out.flush()
         self._new_gen()
         self.end_reason = f"worker error: {kind}"
         if self.goodbye_frames:  # the goodbye is cached audio: it needs no worker, only the tx ring
             self._queue_cached(self.goodbye_frames)
             self.state = "ENDING_DRAIN"
-            self._drain_deadline_ns = now + int(3e9)
+            # time for everything queued (an unflushed opening, then the goodbye) at 20 ms a frame, plus 1 s; a flush
+            # still owed by the PJSIP thread empties tx, and the goodbye then waits in _after_flush
+            queued = len(self._after_flush) + (0 if self._flush_pending() else self.tx.available())
+            self._drain_deadline_ns = now + queued * 20_000_000 + int(1e9)
         else:
             self.state = "ENDING"
             self.hangup_requested.set()
@@ -598,7 +610,9 @@ class TurnController:
         t.brain_error = kind
         t.reply_text = _without_marker("".join(self._reply_parts)).strip()
         t.rx_overruns, t.tx_underruns = self.rx.overruns, self.tx.underruns
-        if t.reply_text:  # what was already said stays in history and the transcript, marked, exactly as after a barge-in
+        if self.state in OPENING:  # the opening's audio was held, so none of its text was heard: none of it is kept
+            self.history.append({"role": "assistant", "content": "[interrupted]"})
+        elif t.reply_text:  # what was already said stays in history and the transcript, marked, exactly as after a barge-in
             self.history.append({"role": "assistant", "content": (t.reply_text + " [interrupted]").strip()})
             self._line("agent", t.reply_text, interrupted=True)
         self.on_turn(t)

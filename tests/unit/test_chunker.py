@@ -94,3 +94,30 @@ def test_mixed_case_partial_marker_is_held_then_removed():
     assert c.feed("Bye [En") == []       # would hit max_tokens, but the buffer ends with a partial marker
     assert c.feed("d]") == ["Bye"]
     assert c.ended
+
+
+def feed_all(toks):
+    c = ClauseChunker()
+    out = []
+    for t in toks:
+        out += c.feed(t)
+    return out + c.flush(), c
+
+
+@pytest.mark.parametrize("toks", [["Goodbye", ".", " [END]", "."], ["Goodbye", ".", " [", "END", "]", "."],
+                                  ["Goodbye. [END]."]])
+def test_punctuation_after_the_marker_is_never_a_unit_of_its_own(toks):
+    out, c = feed_all(toks)
+    assert out == ["Goodbye."] and c.ended
+
+
+@pytest.mark.parametrize("toks", [["Thanks", ",", " bye", " [END]", "."], ["Thanks, bye [END]."],
+                                  ["Thanks", ",", " bye", " [", "END", "]", " ."]])
+def test_no_space_is_left_before_punctuation_where_the_marker_was(toks):
+    out, c = feed_all(toks)
+    assert out == ["Thanks, bye."] and c.ended
+
+
+def test_a_unit_without_letters_or_digits_is_never_emitted():
+    assert run(["Okay", ".", " ..."]) == ["Okay."]
+    assert run(["-", " !"]) == []

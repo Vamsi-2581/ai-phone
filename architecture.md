@@ -809,7 +809,9 @@ ai-phone call <+E.164 | sip:…> [--prompt TEXT | --prompt-file PATH] [--relay] 
 ai-phone listen [--call ID] [--timeout-sec 60] [--json]
       # a relay call in progress (or --call ID): its next unread event
       #   heard: Sure, what name is it under?     everything said since the last listen, in order, as one text
-      #   call c7f3a2 ended: …                     the result, as for call; returned again on every later listen
+      #   call c7f3a2 ended: …                     the result, as for call; with --call ID it is returned again on
+      #                                            every later listen, without --call it is reported once
+      # a phone agent call in progress, or --call naming one that has not ended: exit 11 at once
       # no call in progress: first a relay call that ended since anyone last listened, otherwise wait for an incoming call
       #   incoming call c9b1e0 on main from sip:+15551234567@sip.carrier.example
       #       already answered; inbound.greeting plays; the next listen returns the caller's first words; the text
@@ -823,7 +825,7 @@ ai-phone hangup [--call ID] [--say TEXT] [--json]
       # ends the call in either mode, speaking TEXT first if given (§14b.6); prints the call's result
 ```
 
-`--call` defaults to the call in progress; a call that has ended can be named for as long as its record is kept (§14b.2). Every error ai-phone reports itself is one line, `error: …`, or with `--json` the object `{"ok": false, "error": "…", "code": N}`. With `--json` (accepted by these four commands, not by `run`, `status` or `lines`) each prints exactly one JSON object on stdout and nothing else there: the call's result with `"ok"` added; `{"ok": true, "call_id", "mode": "relay", "outcome": "answered"}` for an answered relay call; the `listen` and `say` replies of §7.2 (for `ended`, the result's fields sit beside `"kind": "ended"`); for any other ending, the result (when there is one) with `ok`, `outcome`, `detail` and `code` added. A malformed command line (a missing or unknown option) is reported by the argument parser on stderr with exit code 2, not as JSON.
+`--call` defaults to the call in progress; a call that has ended can be named for as long as its record is kept (§14b.2). Every error ai-phone reports itself is one line, `error: …`, or with `--json` the object `{"ok": false, "error": "…", "code": N}`. With `--json` (accepted by these four commands, not by `run`, `status` or `lines`) each prints exactly one JSON object on stdout and nothing else there: the call's result with `"ok"` added; `{"ok": true, "call_id", "mode": "relay", "outcome": "answered"}` for an answered relay call; the `listen` and `say` replies of §7.2 (for `ended`, the result's fields sit beside `"kind": "ended"`); for any other ending, the result (when there is one) with `ok`, `outcome`, `detail` and `code` added. A malformed command line (a missing or unknown option) is reported by the argument parser on stderr with exit code 2, not as JSON. `call --json` also writes every progress event (`created`, `dialling`, `ringing`, `answered`, `turn`, …) to stderr, one JSON object per line. `created` carries the call ID, so a calling AI whose `call` command is killed can still fetch the result with `listen --call ID` once the call has ended.
 
 The result of a call:
 
@@ -846,7 +848,7 @@ Times are Unix seconds; `duration_sec` runs from answer to end (null if the call
 | 6 | no answer within `--timeout-sec` (CANCEL sent) |
 | 7 | rejected (other 4xx–6xx; no line can dial the target; the target diverts back to this agent and `--yes` was not given), or cancelled by `hangup` while still ringing |
 | 8 | redirected (3xx, not followed) |
-| 9 | daemon not running, gone, or replying in a way the command does not understand; also `call` after Ctrl-C when the daemon does not confirm the end in time, and `hangup` when the call has still not ended 40 s after the hangup (30 s, then a BYE and 10 s more): the call may still be up |
+| 9 | daemon not running, gone, or replying in a way the command does not understand; also `call` after Ctrl-C when the daemon does not confirm the end in time, and `hangup` when the call has still not ended 40 s after the hangup (30 s, then a second hangup and 10 s more): the call may still be up |
 | 10 | `listen` timed out |
 | 11 | no such call (only the last 20 are kept), no call in progress, the call has ended or is not connected, or `listen`/`say` on a phone agent call |
 | 12 | another `listen` is already waiting for incoming calls |
@@ -854,7 +856,7 @@ Times are Unix seconds; `duration_sec` runs from answer to end (null if the call
 | 14 | the daily outbound limit is reached |
 | 130 | Ctrl-C while `listen`, `say` or `hangup` waits; a `listen` is cancelled, a `say` or `hangup` already sent carries on in the daemon |
 
-Ctrl-C during `call` sends `hangup` and waits up to about 7 s for the call's end (a 2 s `hangup` request, then a 5 s cut-off); the command then exits with the call's code (0 if it had been answered, 7 if it was still ringing), or 9 if the daemon never confirmed.
+Ctrl-C during `call` sends `hangup` for that call (by its ID, once `created` has arrived) and waits up to about 7 s for the call's end (a 2 s `hangup` request, then a 5 s cut-off); the command then exits with the call's code (0 if it had been answered, 7 if it was still ringing), or 9 if the daemon never confirmed.
 
 ### 14b.2 Call records (`calls.py`)
 
@@ -862,7 +864,7 @@ Every call the daemon handles, inbound or outbound, in either mode, gets a `Call
 
 The record, not the control connection, owns the call: a relay `call` returns at answer and the call goes on; a phone agent `call` whose client disappears runs to its natural end. The controller writes the transcript: the opening line (disclosure or greeting), each final transcript of the other person, each reply as it was spoken (without the end marker; a cut reply is marked `interrupted`), and the relay fillers and goodbye.
 
-Relay events: when the other person finishes speaking, the text is queued as `heard`, and unread `heard` texts are merged in order, so one `listen` returns everything said since the last one. Once the call has ended and its unread speech has been read, `listen` returns `ended` with the result, and keeps returning it. A `listen` cancelled before its reply went out (its client left) puts the event back for the next one. The registry remembers whether anyone has been handed a relay call's end (a `listen` or a `hangup` reply); `listen` with no call in progress reports the most recent unreported end first, and `say` or `hangup` with no call in progress names that call in its error.
+Relay events: when the other person finishes speaking, the text is queued as `heard`, and unread `heard` texts are merged in order, so one `listen` returns everything said since the last one. Once the call has ended and its unread speech has been read, `listen` returns `ended` with the result; `listen --call ID` keeps returning it. A `listen` cancelled before its reply went out (its client left) puts the event back for the next one. The registry remembers whether anyone has been handed a relay call's end (a `listen` or a `hangup` reply); `listen` with no call in progress reports the most recent unreported end first, and `say` or `hangup` with no call in progress names that call in its error.
 
 ### 14b.3 Who writes the replies (`pipeline/replies.py`)
 
@@ -879,7 +881,7 @@ The model's system prompt is, in order:
 1. `PHONE_INSTRUCTIONS`, fixed text in code: an AI assistant speaking on a live phone call; short, natural sentences, one or two at a time; no lists, markdown, emoji or stage directions; no invented facts, and say so plainly when something is not known; when the purpose of the call is done or the other person says goodbye, a short goodbye that ends with `[END]`;
 2. for the local brain only, the host line (`You are running on <hostname> (<machine>).`);
 3. the header "This call:";
-4. the call's section: the `--prompt` text on an outbound call, `inbound.instructions` on an incoming one, or, when that is empty, "You are calling on behalf of the owner of this phone number. Be polite and brief."
+4. the call's section: on an outbound call the `--prompt` text, or, without one, "You are calling on behalf of the owner of this phone number. Be polite and brief."; on an incoming call `inbound.instructions`, or, when that is blank, the default instructions (find out who is calling and what they need, and offer to take a message). An incoming call never gets the outbound default.
 
 The LLM worker caches parts 1 to 3. At warm-up it tokenises the prompt with two probe sections that differ from their first character, evaluates their common token prefix once and keeps that snapshot; each turn starts from a copy of it and evaluates only the call's section, the history and the new turn. Each turn therefore pays for the call's own section and the history, never for the fixed instructions. A remote brain receives the same prompt without the host line.
 
@@ -887,8 +889,11 @@ The end marker: the clause chunker removes `[END]`, in any letter case, from wha
 
 ### 14b.5 Openings
 
-- **Outbound, both modes.** The disclosure "Hi, this is an AI assistant calling." (synthesised at daemon start; not configurable) plays as soon as the call's audio is up, in `OUTBOUND_OPENING`. It always plays in full: speech during it does not cut it; the speech is kept and handled right after.
-- **Phone agent mode.** As the disclosure starts, the model is asked for its first sentence: a cue in the history says the other person has just answered and the disclosure has been said, and asks for one sentence on why the call is being made. The model writes it while the disclosure plays; its audio is held until the disclosure has finished and then follows without a gap. If the other person spoke during the disclosure, the opening is dropped and the model answers them instead.
+- **Outbound, both modes.** The disclosure "Hi, this is an AI assistant calling." (synthesised at daemon start; not configurable) plays as soon as the call's audio is up, in `OUTBOUND_OPENING`. It always plays in full: speech during it does not cut it (the speech is kept and handled right after), and neither does a brain error or a model worker that dies (the apology or the goodbye follows it).
+- **Phone agent mode.** As the disclosure starts, the model is asked for its first sentence: a cue in the history says the other person has just answered and the disclosure has been said, and asks for one sentence on why the call is being made. The model writes it while the disclosure plays; its audio is held until the disclosure has finished and then follows without a gap. What the other person said during the disclosure decides what happens next:
+  - speech that ended before the disclosure did, with less than 1.5 s of held audio (the "Hello?" at pickup), is treated as a greeting: the opening plays as planned, and the held audio is dropped, with no transcript line and one INFO log line ("short speech during the disclosure treated as a greeting");
+  - longer speech, or speech still going when the disclosure ends, drops the opening, and the model answers what they said instead;
+  - a brain error while the opening is held drops it without a trace: the history records `[interrupted]` and the transcript gets no line, since nothing of it was heard.
 - **Relay mode.** The disclosure plays, then the calling AI's first `say`.
 - **Incoming, both modes.** `inbound.greeting` (synthesised at start) plays on answer. It can still be interrupted: speech over it stops it and becomes the caller's first turn.
 
@@ -907,7 +912,7 @@ When a `heard` has been handed over, the controller listens again and waits for 
 
 The three phrases are synthesised at daemon start, like the apology and the goodbye.
 
-`hangup --say TEXT` queues the text like a `say` whose end reason is `hangup_command`: the call ends once the text has played, and also if the other person interrupts it. If the call has not ended within 30 s, the daemon sends a BYE (a second one for a plain `hangup`) and waits 10 s more; if it still has not ended, `hangup` fails with exit 9 ("call … did not end after the hangup"), and the call may still be up. `hangup` without text sends the BYE at once, with the same waits. `hangup` on a call that is still ringing cancels it without speaking any `--say` text: the call ends with outcome `cancelled`, `call` sends a `cancelled` progress event, and the blocked `call` command exits 7.
+`hangup --say TEXT` queues the text like a `say` whose end reason is `hangup_command`: the call ends once the text has played, and also if the other person interrupts it. If the call has not ended within 30 s, the daemon hangs up (a second time for a plain `hangup`) and waits 10 s more; if it still has not ended, `hangup` fails with exit 9 ("call … did not end after the hangup"), and the call may still be up. `hangup` without text hangs up at once, with the same waits. Hanging up sends a BYE on an answered call and a CANCEL on a call that is still ringing. `hangup` on a call that is still ringing cancels it without speaking any `--say` text: the call ends with outcome `cancelled`, `call` sends a `cancelled` progress event, and the blocked `call` command exits 7.
 
 ### 14b.7 The relay listener
 
@@ -916,7 +921,7 @@ The three phrases are synthesised at daemon start, like the apology and the good
 ### 14b.8 Safety
 
 - **Emergency numbers are never dialled** (`call_guard.is_emergency`, the first check in the daemon's `call` handler, so every client is covered; exit 13). A target is refused when its digits equal 000, 100, 101, 102, 103, 108, 110, 112, 118, 119, 190, 911 or 999: alone, behind a 1–3 digit country code, or behind an international access prefix (00 or 011) and such a country code. A `sip:` target is checked by its user part when that part has no letters (only digits, spaces and `+ . _ - ( )`). Extensions that look like an emergency number (100, 1000, 4112) are refused too; call such extensions by a name with letters.
-- **Daily limit** (`calls.daily_limit`; 0 means no limit; exit 14). It is checked before dialling. Every dial attempt the SIP stack accepted counts, busy and unanswered calls included, per local day. The count lives in `~/.ai-phone/calls-today.json` (`{"date", "count"}`, written to a temporary file, synced and renamed), so a restart does not reset it. It is a file of its own because the daemon rewrites `state.json` whole on every registration change. A missing or malformed file, or one from another day, reads as 0.
+- **Daily limit** (`calls.daily_limit`; 0 means no limit; exit 14). It is checked before dialling. Every dial attempt the SIP stack accepted counts, busy and unanswered calls included, per local day. The count lives in `~/.ai-phone/calls-today.json` (`{"date", "count"}`, written to a temporary file, synced and renamed), so a restart does not reset it. It is a file of its own because the daemon rewrites `state.json` whole on every registration change. A missing or malformed file, or one from another day, reads as 0. If the count cannot be written after the dial (a full disk, an unwritable `~/.ai-phone`), the call is hung up at once and refused with exit 7; its record ends `rejected` with `ended_by: error` and the detail "could not update the daily call counter: …", so no attempt escapes the limit. A `call` handler that fails for any other reason also hangs up a call that has not been answered, so the phone never goes on ringing with nobody behind it.
 - **Call length** stays capped by `conversation.max_call_sec` (600 s) in both modes; the silence, RTP and brain-error rules are unchanged.
 - **Where transcripts go.** Transcripts leave ai-phone only through the command that asked for them (each turn also stays in `turns.jsonl`, as before), and, with a remote brain (`brain.kind: openai_compatible`, §14a.7), through that endpoint during the call: what callers say, the call's system prompt and the conversation so far go there on every turn in phone agent mode. If the calling AI runs on a cloud model, that service sees them. The README says so next to the examples.
 
@@ -954,6 +959,7 @@ Each came out of planning or a review:
 - "Busy" is decided by the daemon's one-call claim; the control server only checks the shape of each request.
 - Argument-parser errors stay plain text on stderr with exit 2, even under `--json`; the JSON contract covers everything a command reports itself.
 - Extensions such as 100 and 1000 stay blocked by the emergency rule; such extensions are dialled by name.
+- A `state.json` write that fails (a full disk) is logged as a warning and never stops a call; at the end of a call the line is released and the record ended before the state is written.
 
 ## 15. Decision log
 

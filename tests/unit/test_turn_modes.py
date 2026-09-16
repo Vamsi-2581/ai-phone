@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 
 import pytest
@@ -360,7 +361,8 @@ async def test_relay_speech_during_the_disclosure_is_heard_after_it():
 
 
 @pytest.mark.asyncio
-async def test_agent_speech_during_the_disclosure_cancels_the_opening_then_the_model_replies():
+async def test_a_short_hello_during_the_disclosure_keeps_the_opening(caplog):
+    caplog.set_level(logging.INFO, logger="ai-phone.turn")
     loop = asyncio.get_running_loop()
     tc, rings, clients, heard, lines = await stack(loop, opening_frames=[OPEN] * 50, direction="out",
                                                    opening_text=DISCLOSURE, generate_opening=True)
@@ -368,8 +370,61 @@ async def test_agent_speech_during_the_disclosure_cancels_the_opening_then_the_m
     runner = asyncio.create_task(tc.run(stop))
     try:
         await asyncio.sleep(0.1)
-        await speak(rings[0], seconds=0.8)         # the model's opening is ready and held meanwhile
-        assert tc.state == "OUTBOUND_OPENING" and rings[1].available() == 50
+        await speak(rings[0], seconds=0.8)         # "Hello?" at pickup; it has ended before the disclosure has
+        assert tc.state == "OUTBOUND_OPENING" and rings[1].available() == 50 and tc._held_end is not None
+        played = await drain(rings[1], 3.0)
+        assert played[:50] == [OPEN] * 50 and len(played) == 75   # the disclosure, then the opening, no gap
+        assert await until(lambda: tc.state == "LISTENING")
+        await asyncio.sleep(0.3)
+        assert tc.history == [{"role": "user", "content": OPENING_CUE}, {"role": "assistant", "content": MODEL_REPLY}]
+        assert lines == [("agent", DISCLOSURE, False), ("agent", MODEL_REPLY, False)]   # the greeting is not transcribed
+        notes = [r.getMessage() for r in caplog.records if "treated as a greeting" in r.getMessage()]
+        assert len(notes) == 1 and notes[0].startswith("short speech during the disclosure treated as a greeting")
+    finally:
+        await teardown(stop, runner, rings, clients)
+
+
+@pytest.mark.asyncio
+async def test_still_talking_when_the_disclosure_ends_cancels_the_opening():
+    loop = asyncio.get_running_loop()
+    tc, rings, clients, heard, lines = await stack(loop, opening_frames=[OPEN] * 25, direction="out",
+                                                   opening_text=DISCLOSURE, generate_opening=True)
+    rx, tx = rings[0], rings[1]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await asyncio.sleep(0.3)                   # the model's opening is ready and held
+        played = []
+        frames = speech_frames(1.2) + [SILENCE] * 25
+        for i, f in enumerate(frames):             # the disclosure plays out from the 6th frame on, while they talk
+            rx.push(f)
+            if i >= 5 and (p := tx.pop()) is not None:
+                played.append(p)
+            if i == 40:
+                assert played == [OPEN] * 25 and tc._held_end is None and tc.history[-1]["content"] == "[interrupted]"
+            await asyncio.sleep(0.02)
+        played += await drain(tx, 2.5)
+        assert played[:25] == [OPEN] * 25 and len(played) == 50   # the disclosure, then one reply: the opening was dropped
+        assert await until(lambda: tc.state == "LISTENING" and len(tc.history) == 4)
+        assert tc.history == [{"role": "user", "content": OPENING_CUE}, {"role": "assistant", "content": "[interrupted]"},
+                              {"role": "user", "content": "fake utterance 1"},
+                              {"role": "assistant", "content": MODEL_REPLY}]
+        assert lines == [("agent", DISCLOSURE, False), ("them", "fake utterance 1", False), ("agent", MODEL_REPLY, False)]
+    finally:
+        await teardown(stop, runner, rings, clients)
+
+
+@pytest.mark.asyncio
+async def test_long_speech_during_the_disclosure_cancels_the_opening_then_the_model_replies():
+    loop = asyncio.get_running_loop()
+    tc, rings, clients, heard, lines = await stack(loop, opening_frames=[OPEN] * 50, direction="out",
+                                                   opening_text=DISCLOSURE, generate_opening=True)
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await asyncio.sleep(0.1)
+        await speak(rings[0], seconds=2.0)         # more than a greeting; the model's opening is ready and held meanwhile
+        assert tc.state == "OUTBOUND_OPENING" and rings[1].available() == 50 and tc._held_end is not None
         played = await drain(rings[1], 3.0)
         assert played[:50] == [OPEN] * 50 and len(played) == 75   # the disclosure, then one reply: the opening was dropped
         assert await until(lambda: tc.state == "LISTENING" and len(tc.history) == 4)
@@ -546,3 +601,84 @@ async def test_pending_says_resolve_ended_when_the_call_stops():
     await teardown(stop, runner, rings, clients)
     assert fut.result() == "ended"
     assert tc.say("Too late.").result() == "ended"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply, spoken", [("Thanks, bye [END].", "Thanks, bye."), ("Goodbye. [END].", "Goodbye.")])
+async def test_the_transcript_has_no_space_or_stray_punctuation_where_the_marker_was(reply, spoken):
+    loop = asyncio.get_running_loop()
+    tc, rings, clients, heard, lines = await stack(loop, llm_args={"reply": reply})
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await speak(rings[0])
+        await drain(rings[1], 2.0)
+        assert await until(lambda: tc.hangup_requested.is_set()) and tc.end_reason == "agent"
+        assert [(w, t) for w, t, _ in lines if w == "agent"] == [("agent", spoken)]
+        assert tc.history[-1] == {"role": "assistant", "content": spoken}
+    finally:
+        await teardown(stop, runner, rings, clients)
+
+
+def test_a_say_turn_adds_no_speech_or_model_stage_to_the_latency_record():
+    async def body():
+        tc, tx, lines = bare()
+        try:
+            tc.say("Sure. What name is it under?")
+            tc._pump_says(int(5e9))
+            assert tc.state == "THINKING" and tc.timer.t0_end == int(5e9)   # the reply timeout still has its start
+            r = tc.timer.to_record("c", 0)
+            assert r["stt_ms"] is None and r["llm_first_clause_ms"] is None and r["first_audible_ms"] is None
+        finally:
+            tx.close()
+            tx.unlink()
+    asyncio.run(body())
+
+
+@pytest.mark.asyncio
+async def test_a_brain_error_mid_opening_writes_nothing_that_was_never_spoken():
+    loop = asyncio.get_running_loop()
+    tc, rings, clients, heard, lines = await stack(loop, llm="PartialFailLLM", opening_frames=[OPEN] * 50,
+                                                   direction="out", opening_text=DISCLOSURE, generate_opening=True,
+                                                   apology_frames=[SORRY] * 3)
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        assert await until(lambda: tc._brain_errors == 1)   # "Sure, one moment." was written, then the brain failed
+        assert tc.state == "OUTBOUND_OPENING"
+        played = await drain(rings[1], 1.5)
+        assert played == [OPEN] * 50 + [SORRY] * 3          # the opening's audio was held, then dropped
+        assert tc.history == [{"role": "user", "content": OPENING_CUE}, {"role": "assistant", "content": "[interrupted]"}]
+        assert lines == [("agent", DISCLOSURE, False)]
+    finally:
+        await teardown(stop, runner, rings, clients)
+
+
+@pytest.mark.asyncio
+async def test_a_worker_that_dies_during_the_disclosure_lets_it_play_then_the_goodbye():
+    loop = asyncio.get_running_loop()
+    goodbye = b"\x77\x00" * 320
+    tc, rings, clients, heard, lines = await stack(loop, opening_frames=[OPEN] * 150, direction="out",
+                                                   opening_text=DISCLOSURE, generate_opening=True,
+                                                   goodbye_frames=[goodbye] * 5)
+    tx = rings[1]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await asyncio.sleep(0.2)
+        clients[1]._proc.kill()                             # the model worker dies 0.2 s into a 3 s disclosure
+        assert await until(lambda: tc.state == "ENDING_DRAIN")
+        assert tx.available() == 155                        # nothing flushed: the disclosure, then the goodbye
+        # 155 frames at 20 ms each, plus 1 s: the old fixed 3 s would hang up before the goodbye had played
+        assert tc._drain_deadline_ns - time.monotonic_ns() > 3.5e9
+        played = []
+        while not tc.hangup_requested.is_set() and len(played) < 200:
+            for _ in range(2):                              # faster than real time: the deadline is checked above
+                f = tx.pop()
+                if f is not None:
+                    played.append(f)
+            await asyncio.sleep(0.02)
+        assert await until(lambda: tc.hangup_requested.is_set())
+        assert played == [OPEN] * 150 + [goodbye] * 5 and tc.end_reason == "worker error: llm"
+    finally:
+        await teardown(stop, runner, rings, clients)

@@ -7,7 +7,18 @@ from ai_phone.pipeline.prompts import END_MARKER
 
 _SENT = set(".!?")
 _CLAUSE = set(",;:")
-_MARKER = re.compile(re.escape(END_MARKER), re.IGNORECASE)  # the model may write [end] or [End]
+# the model may write [end] or [End]; the match takes the spaces before the marker and a punctuation mark after it
+_MARKER = re.compile(r"\s*" + re.escape(END_MARKER) + r"(\s*[.,!?;:])?", re.IGNORECASE)
+
+
+def remove_end_marker(text: str) -> tuple[str, int]:
+    """The text as spoken, and how many end markers it held. No space is left before punctuation, and a mark written
+    after the marker stays only when the words before it end without one: "Thanks, bye [END]." gives "Thanks, bye.",
+    "Goodbye. [END]." gives "Goodbye."."""
+    def keep(m: re.Match) -> str:
+        before = text[:m.start()].rstrip()
+        return "" if before[-1:] in _SENT | _CLAUSE else (m.group(1) or "").strip()
+    return _MARKER.subn(keep, text)
 
 
 def _partial_marker_len(text: str) -> int:
@@ -41,12 +52,12 @@ class ClauseChunker:
     def flush(self) -> list[str]:
         text = "".join(self._buf)
         self._buf = []
-        text, found = _MARKER.subn("", text)
+        text, found = remove_end_marker(text)
         if found:
             self.ended = True
         # a reply cut off inside a marker is not a request to end, and the fragment is never spoken
         text = text[:len(text) - _partial_marker_len(text)].strip()
-        if text:
+        if any(ch.isalnum() for ch in text):  # a unit of punctuation alone ("." after the marker) is never spoken
             self._emitted += 1
             return [text]
         return []

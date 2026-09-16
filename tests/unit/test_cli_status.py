@@ -57,3 +57,13 @@ def test_last_call_survives_a_truncated_record(tmp_path: Path):
     turns = tmp_path / "turns.jsonl"
     turns.write_text(json.dumps({"call_id": "3", "turn": 0, "first_audible_ms": 700.0, "rx_overruns": 0, "tx_underruns": 0}) + "\n" + '{"call_id": "4", "tu')
     assert "call 3" in render_last_call(turns)
+
+
+def test_last_call_groups_by_the_unique_call_id_when_records_carry_one(tmp_path: Path):
+    turns = tmp_path / "turns.jsonl"
+    rows = [{"call_id": "2", "call": "a1b2c3", "turn": 0, "first_audible_ms": 900.0, "brain_error": "http_503"},
+            {"call_id": "2", "call": "a1b2c3", "turn": 1, "first_audible_ms": 900.0},
+            {"call_id": "2", "call": "d4e5f6", "turn": 0, "first_audible_ms": 700.0}]   # PJSIP reused call ID 2
+    turns.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    out = render_last_call(turns)
+    assert out.startswith("call d4e5f6: 1 turns") and "p50 700 ms" in out and "brain errors: 0" in out
