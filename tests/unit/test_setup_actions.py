@@ -658,6 +658,19 @@ def quick(monkeypatch):
     monkeypatch.setattr(act, "POLL_SEC", 0.01)
     monkeypatch.setattr(act, "CHECK_SEC", 0.5)
     monkeypatch.setattr(act, "STOP_SEC", 0.05)
+    monkeypatch.setattr(act, "EXIT_STOP_SEC", 0.05)
+
+
+class FakeAtexit:
+    def __init__(self):
+        self.hooks = []
+
+    def register(self, fn):
+        self.hooks.append(fn)
+        return fn
+
+    def unregister(self, fn):
+        self.hooks = [h for h in self.hooks if h != fn]
 
 
 def test_check_lines_starts_ai_phone_briefly(home, monkeypatch, quick):
@@ -672,6 +685,28 @@ def test_check_lines_starts_ai_phone_briefly(home, monkeypatch, quick):
     assert daemon.argv == [sys.executable, "-c", "import sys; from ai_phone.cli import main; sys.exit(main(sys.argv[1:]))",
                            "run", "--fake"]
     assert daemon.signals == [signal.SIGINT] and not daemon.killed
+
+
+@pytest.mark.parametrize("stubborn", [False, True])
+def test_the_trial_daemon_is_stopped_if_setup_exits_while_it_runs(home, monkeypatch, quick, stubborn):
+    """A forced quit skips the flow thread's cleanup (it is a daemon thread), so an exit hook stops the trial start:
+    SIGINT, a short wait, then kill. Stopping twice is harmless."""
+    exits = FakeAtexit()
+    monkeypatch.setattr(act, "atexit", exits)
+    registered = []
+
+    class Quitting(FakeDaemon):
+        def poll(self):
+            registered.append(len(exits.hooks))
+            if len(registered) == 2:
+                exits.hooks[0]()  # the interpreter exits now
+            return super().poll()
+
+    daemon = Quitting(home, states=[[status("main", "trunk", "registering")]] * 10, ignores_sigint=stubborn)
+    monkeypatch.setattr(act.subprocess, "Popen", daemon)
+    assert make(home).check_lines() == [("lines", "failed", "ai-phone stopped before it reported its lines")]
+    assert registered[:2] == [1, 1] and exits.hooks == []  # registered while it ran, removed once it was stopped
+    assert daemon.signals == [signal.SIGINT] and daemon.killed is stubborn
 
 
 def test_check_lines_reports_a_daemon_that_exits(home, monkeypatch, quick):

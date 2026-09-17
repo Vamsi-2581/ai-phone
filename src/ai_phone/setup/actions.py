@@ -5,8 +5,10 @@ Config writes take the lines lock, change one section, write, and load the resul
 put back as it was and the ConfigError becomes the ActionError."""
 from __future__ import annotations
 
+import atexit
 import contextlib
 import copy
+import functools
 import json
 import os
 import signal
@@ -41,6 +43,7 @@ BRAIN_KEY_ENV = "AI_PHONE_BRAIN_API_KEY"  # a secret name by the daemon's rules 
 VENDOR = Path(ai_phone.__file__).parent / "vendor"  # where install.sh puts the PJSIP binding
 DAEMON = [sys.executable, "-c", "import sys; from ai_phone.cli import main; sys.exit(main(sys.argv[1:]))", "run", "--fake"]
 CHECK_SEC, POLL_SEC, STOP_SEC = 20, 0.5, 10  # how long a trial start may take to register, how often to look, how long to stop
+EXIT_STOP_SEC = 2  # how long a trial start may take to stop when setup itself is exiting
 SAMPLE_RATE = 24000  # Kokoro's own rate
 LOOPBACK = ("127.0.0.1", "localhost", "::1")  # the config's rule: plain http only to this machine
 
@@ -471,6 +474,10 @@ class Actions:
                 proc = subprocess.Popen(DAEMON, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
             except OSError as e:
                 return [("lines", "failed", f"could not start ai-phone: {e.strerror or e}")]
+            # a forced quit ends the flow thread (a daemon thread) without the finally below: stop it at exit too, so no
+            # trial ai-phone is left holding registrations and a control socket that a later check would believe
+            stop_at_exit = functools.partial(_stop, proc, EXIT_STOP_SEC)
+            atexit.register(stop_at_exit)
             try:
                 while True:
                     if proc.poll() is not None:
@@ -483,6 +490,7 @@ class Actions:
                     time.sleep(POLL_SEC)
             finally:
                 _stop(proc)
+                atexit.unregister(stop_at_exit)
         if doc is None:
             return [("lines", "registering", f"ai-phone did not report its lines within {CHECK_SEC:g} seconds")]
         return _line_rows(doc)
@@ -540,12 +548,13 @@ def _line_rows(doc: dict) -> list[tuple[str, str, str]]:
     return rows
 
 
-def _stop(proc) -> None:
+def _stop(proc, wait: float | None = None) -> None:
+    """SIGINT, then kill if it has not stopped within `wait` seconds (STOP_SEC by default). Stopping twice is harmless."""
     if proc.poll() is not None:
         return
     proc.send_signal(signal.SIGINT)
     try:
-        proc.wait(timeout=STOP_SEC)
+        proc.wait(timeout=STOP_SEC if wait is None else wait)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
