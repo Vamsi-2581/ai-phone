@@ -488,6 +488,38 @@ def test_no_owned_numbers_offers_to_buy_one():
     assert [(f.label, f.placeholder) for f in ui.fields[:1]] == [("API key", "KEY…")]
 
 
+def test_numbers_already_connected_are_left_out():
+    """Connecting a number twice would overwrite its routing, so numbers that are already a line are not offered."""
+    ui = ScriptedUI([
+        *add_a_line("Telnyx"),
+        ("Use the saved Telnyx key?", "Use the saved key"),
+        ("A new number or one you already have?", "One I already have"),
+        ("Which number?", "+15550100008"),
+        ("Connect +15550100008 to ai-phone?", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"},
+                          lines={"telnyx": {"kind": "trunk", "number": "+15550100007"}, "agent": SIP_LINE})
+    flow.run(ui, actions)
+    assert [o.label for o in ui.menu("Which number?")[1]] == ["+15550100008"]
+    assert ui.questions("A new number or one")[0].checks == [Check("Telnyx key", "works · 2 numbers on this account", True)]
+
+    ui = ScriptedUI([
+        *add_a_line("Telnyx"),
+        ("Use the saved Telnyx key?", "Use the saved key"),
+        ("A new number or one you already have?", "One I already have"),
+        ("No other numbers on this Telnyx account", "Buy a new number"),
+        ("Where should the number be?", ["", ""]),
+        ("Pick a number", "<quit>"),
+    ])
+    lines = {"telnyx": {"kind": "trunk", "number": "+15550100007"}, "telnyx-2": {"kind": "trunk", "number": "+15550100008"}}
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}, lines=lines)
+    flow.run(ui, actions)
+    page = ui.questions("No other numbers")[0]
+    assert page.detail == "Buy one instead, or add a number in the carrier's console and run setup again."
+    assert [o.label for o in ui.menu("No other numbers")[1]] == ["Buy a new number"]
+    assert not actions.args("attach_number")
+
+
 def test_bad_key_is_asked_again_with_the_error():
     ui = ScriptedUI([
         *add_a_line("Telnyx"),

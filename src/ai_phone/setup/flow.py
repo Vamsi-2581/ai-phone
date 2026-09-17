@@ -254,12 +254,15 @@ def phone_number(ui, actions, session: Session) -> None:
     new = ui.choose(Page(LINE, "A new number or one you already have?",
                          checks=[Check(f"{name} key", f"works · {plural(len(owned), 'number')} on this account", True)]),
                     [Option("A new number", "search and buy one"), Option("One I already have", f"{len(owned)} on this account")]) == 0
-    if not new and not owned:
-        ui.choose(Page(LINE, f"No numbers on this {name} account",
+    # a number that is already a line is not offered: connecting it again would overwrite its routing
+    connected = {ln.get("number") for ln in actions.current().lines.values()}
+    free = [n for n in owned if n.e164 not in connected]
+    if not new and not free:
+        ui.choose(Page(LINE, f"No other numbers on this {name} account" if owned else f"No numbers on this {name} account",
                        "Buy one instead, or add a number in the carrier's console and run setup again."),
                   [Option("Buy a new number")])
         new = True
-    result = buy_number(ui, actions, carrier, name, creds) if new else attach_number(ui, actions, carrier, name, creds, owned)
+    result = buy_number(ui, actions, carrier, name, creds) if new else attach_number(ui, actions, carrier, name, creds, free)
     if result.code != 0:
         ui.choose(Page(LINE, "The number is not ready yet" if result.code == 2 else "Something went wrong",
                        body="\n".join(result.messages)), [Option("Continue")], back=False)

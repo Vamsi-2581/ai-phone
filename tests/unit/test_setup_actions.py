@@ -280,7 +280,9 @@ def test_buy_number_writes_a_ready_line_quietly(home, capsys):
     assert Journal.open(home / "lines", "fake").state == "ready"
     assert raw(home)["inbound"] == {"greeting": "Hi"}
     assert capsys.readouterr() == ("", "")
-    assert a.buy_number("fake", FAKE_KEY, n).line_id == "fake-2"
+    other = a.search_numbers("fake", FAKE_KEY, "GB", None)[1]
+    assert (a.buy_number("fake", FAKE_KEY, other).line_id, load_config(home / "config.yaml").lines["fake-2"].number) == \
+        ("fake-2", other.e164)
 
 
 def test_a_pending_or_failed_number_comes_back_with_its_messages(home):
@@ -290,7 +292,7 @@ def test_a_pending_or_failed_number_comes_back_with_its_messages(home):
     assert pending.code == 2 and any("pending" in m for m in pending.messages)
     assert load_config(home / "config.yaml").lines["fake"].provider.state == "pending"
     a = make(home, provider_loader=lambda name, key, secret=None: FakeProvider(key=key, crash_after="connection"))
-    failed = a.buy_number("fake", FAKE_KEY, n)
+    failed = a.buy_number("fake", FAKE_KEY, a.search_numbers("fake", FAKE_KEY, "GB", None)[1])
     assert failed == LineResult("fake-2", 3, failed.messages)
     assert "simulated crash after connection" in failed.messages[0] and "lines resume fake-2" in failed.messages[0]
 
