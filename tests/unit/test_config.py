@@ -261,3 +261,53 @@ def test_bad_yaml_and_missing_file_are_config_errors(tmp_path):
         load_config(bad)
     with pytest.raises(ConfigError, match="does not exist"):
         load_config(tmp_path / "nope.yaml")
+
+
+def _installed(monkeypatch, *names):
+    from ai_phone import voices
+    monkeypatch.setattr(voices, "installed_voices", lambda root=None: list(names))
+
+
+def test_default_voice_loads_without_looking_on_disk(tmp_path: Path, monkeypatch):
+    from ai_phone import voices
+
+    def boom(*a, **k):
+        raise AssertionError("the default voice must not look for installed voices")
+    monkeypatch.setattr(voices, "installed_voices", boom)
+    monkeypatch.setattr(voices, "voices_dir", boom)
+    cfg = _load(tmp_path, "")
+    assert (cfg.tts.voice, cfg.tts.speed) == ("af_heart", 1.0)
+    assert _load(tmp_path, "tts: {voice: af_heart, speed: 1.2}\n").tts.speed == 1.2
+    assert cfg.warnings == []
+
+
+def test_an_installed_voice_loads(tmp_path: Path, monkeypatch):
+    _installed(monkeypatch, "af_heart", "bm_george")
+    cfg = _load(tmp_path, "tts:\n  voice: bm_george\n  speed: 0.9\n")
+    assert (cfg.tts.voice, cfg.tts.speed) == ("bm_george", 0.9)
+    assert cfg.warnings == []
+
+
+def test_a_voice_that_is_not_installed_lists_the_installed_ones(tmp_path: Path, monkeypatch):
+    _installed(monkeypatch, "af_heart", "bm_george")
+    with pytest.raises(ConfigError, match="config.tts.voice: bm_nobody is not installed; installed: af_heart, bm_george"):
+        _load(tmp_path, "tts: {voice: bm_nobody}\n")
+
+
+def test_voice_must_be_english(tmp_path: Path, monkeypatch):
+    _installed(monkeypatch, "af_heart", "jf_alpha")
+    with pytest.raises(ConfigError, match="config.tts.voice: 'jf_alpha' is not an English voice"):
+        _load(tmp_path, "tts: {voice: jf_alpha}\n")
+
+
+@pytest.mark.parametrize("speed", ["3", "0.4", "true"])
+def test_speed_is_bounded(tmp_path: Path, speed):
+    with pytest.raises(ConfigError, match="config.tts.speed"):
+        _load(tmp_path, f"tts: {{speed: {speed}}}\n")
+
+
+def test_voice_cannot_be_checked_before_the_model_is_downloaded(tmp_path: Path, monkeypatch):
+    _installed(monkeypatch)
+    cfg = _load(tmp_path, "tts: {voice: bf_emma}\n")
+    assert cfg.tts.voice == "bf_emma"
+    assert cfg.warnings == ["config.tts.voice: bf_emma cannot be checked until the speech model is downloaded (ai-phone models pull)"]

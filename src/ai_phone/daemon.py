@@ -176,7 +176,8 @@ class Daemon:
                                              "max_response_chars": b.max_response_chars})
         else:
             llm = WorkerClient("llm", F["llm"][self.tier], loop, None, None, {"system_prompt": default_prompt, **wa}, keep_warm_sec=kw)
-        tts = WorkerClient("tts", F["tts"], loop, None, tts_out, dict(wa), keep_warm_sec=kw)
+        tts = WorkerClient("tts", F["tts"], loop, None, tts_out, dict(wa),
+                           factory_args=None if self.fake else {"voice": self.cfg.tts.voice, "speed": self.cfg.tts.speed}, keep_warm_sec=kw)
         tel: Telephony | None = None
         control: ControlServer | None = None
         started: list[WorkerClient] = []

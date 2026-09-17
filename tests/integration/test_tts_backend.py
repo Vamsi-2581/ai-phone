@@ -30,3 +30,14 @@ def test_cancel_stops_early():
         if n == 5:
             tts.cancel(10)
     assert n < 40
+
+
+def test_british_voice_speaks():
+    from ai_phone.services.backends.mlx_kokoro import KokoroTTS
+
+    tts = KokoroTTS(voice="bf_emma", speed=1.1)
+    tts.warmup()
+    assert tts._voice_ref.endswith("/voices/bf_emma.safetensors")  # a file path: mlx-audio must not look it up online
+    frames = list(tts.stream(11, 0, "Hello, this is a British voice."))
+    assert len(frames) > 20 and all(len(f) == 640 for f in frames)
+    assert np.abs(np.frombuffer(b"".join(frames), dtype="<i2")).max() > 2000

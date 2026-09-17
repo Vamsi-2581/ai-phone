@@ -5,12 +5,14 @@ import time
 
 import numpy as np
 
+from ai_phone import voices
 from ai_phone.pipeline.audio_out import Framer
 
 
 class KokoroTTS:
-    def __init__(self, model_id: str = "mlx-community/Kokoro-82M-bf16", voice: str = "af_heart"):
-        self.model_id, self.voice = model_id, voice
+    def __init__(self, model_id: str = "mlx-community/Kokoro-82M-bf16", voice: str = "af_heart", speed: float = 1.0):
+        self.model_id, self.voice, self.speed = model_id, voice, speed
+        self._voice_ref = voice
         self._model = None
         self._mx = None
         self._cancelled: set[int] = set()
@@ -24,6 +26,9 @@ class KokoroTTS:
 
         self._mx = mx
         t = time.monotonic_ns()
+        path = voices.voice_path(self.voice)
+        # a file path loads directly; a bare name makes mlx-audio look in another repo (and download there)
+        self._voice_ref = str(path) if path is not None else self.voice
         begin_wiring(wire_memory)
         self._model = load_model(self.model_id)
         wired = wire_resident(self._model, wire_memory)
@@ -46,7 +51,7 @@ class KokoroTTS:
         t0 = time.monotonic_ns()
         first = None
         speech_started = False
-        for res in self._model.generate(text=text, voice=self.voice, speed=1.0, lang_code="a"):
+        for res in self._model.generate(text=text, voice=self._voice_ref, speed=self.speed, lang_code=voices.lang_code(self.voice)):
             if gen_id in self._cancelled:
                 break
             # Kokoro returns a whole sentence per result, so cancellation is checked per frame, not per result

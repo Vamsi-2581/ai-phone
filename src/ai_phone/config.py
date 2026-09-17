@@ -5,6 +5,7 @@ lines:      one entry per line (trunk or sip); each is a pjsua2 Account
 inbound:    what the agent says and does when someone calls and no AI is listening
 calls:      outbound limits and relay-mode timing
 brain:      local model or an OpenAI-compatible endpoint
+tts:        the voice ai-phone speaks with, and how fast
 """
 from __future__ import annotations
 
@@ -142,6 +143,12 @@ class BrainConfig:
 
 
 @dataclass
+class TtsConfig:
+    voice: str = "af_heart"  # an English Kokoro voice: af_/am_ American, bf_/bm_ British
+    speed: float = 1.0
+
+
+@dataclass
 class ConversationConfig:
     endpoint_silence_ms: int = 300
     bargein_min_speech_ms: int = 250
@@ -172,6 +179,7 @@ class Config:
     inbound: InboundConfig = field(default_factory=InboundConfig)
     calls: CallsConfig = field(default_factory=CallsConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
+    tts: TtsConfig = field(default_factory=TtsConfig)
     conversation: ConversationConfig = field(default_factory=ConversationConfig)
     log: LogConfig = field(default_factory=LogConfig)
     warnings: list[str] = field(default_factory=list, init=False, repr=False)
@@ -457,6 +465,16 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
         _require(loopback or u.scheme == "https", "config.brain.base_url: a brain that is not on this machine must use https")
         if br.api_key_env is not None:
             _require(bool(ENV_RE.fullmatch(br.api_key_env)), "config.brain.api_key_env: must match " + ENV_RE.pattern)
+    from ai_phone import voices
+    t = cfg.tts
+    _require(bool(voices.VOICE_RE.fullmatch(t.voice)), f"config.tts.voice: {t.voice!r} is not an English voice (like af_heart or bm_george)")
+    _require(0.5 <= t.speed <= 2.0, "config.tts.speed: must be between 0.5 and 2.0")
+    if t.voice != voices.DEFAULT:  # the default ships with every copy of the model; only look on disk for the others
+        installed = voices.installed_voices()
+        if not installed:
+            warnings.append(f"config.tts.voice: {t.voice} cannot be checked until the speech model is downloaded (ai-phone models pull)")
+        else:
+            _require(t.voice in installed, f"config.tts.voice: {t.voice} is not installed; installed: {', '.join(installed)}")
     return warnings
 
 
