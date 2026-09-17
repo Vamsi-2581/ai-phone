@@ -5,6 +5,7 @@ Config writes take the lines lock, change one section, write, and load the resul
 put back as it was and the ConfigError becomes the ActionError."""
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -14,10 +15,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 from urllib.parse import urlsplit
 
 import httpx
@@ -77,6 +79,14 @@ class LineResult:
 
 class ActionError(RuntimeError):
     pass
+
+
+class Unfinished(NamedTuple):
+    """What a provisioning journal records."""
+    number: str | None   # None: no setup recorded yet (an empty journal); "?": the journal cannot be read
+    brought: bool        # the number was already on the account (connected, not bought)
+    state: str
+    resumable: bool      # it has the `target` step provision_flow needs to pick it up
 
 
 def sip_library_built() -> bool:
@@ -263,20 +273,37 @@ class Actions:
         except ProviderError as e:
             raise self._carrier_error(carrier, creds, e, "Could not search for numbers") from None
 
+    def unfinished_numbers(self) -> set[str]:
+        """Numbers an earlier attempt left half set up (a journal with no line in the config)."""
+        try:
+            lines = _section(self._read(), "lines")
+        except ActionError:
+            lines = {}
+        return {j.number for line_id, j in _journals().items() if line_id not in lines and j.number not in (None, "?")}
+
     def _line_id(self, raw: dict, carrier: str, number, existing: bool) -> str:
-        """twilio, twilio-2, …: the first id with neither a line nor a journal, or the id of an unfinished attempt to set
-        up this same number the same way (bought, or brought), which provisioning then picks up where it stopped. Any
-        other journal belongs to `lines resume` / `lines remove` and is left alone."""
-        lines = _section(raw, "lines")
+        """The id for setting up `number`. An earlier attempt at this number (a journal with no line, under any id) is
+        picked up where it stopped when it was set up the same way (bought, or brought); otherwise the person is told how
+        to finish or undo it. A second id for one number would let `lines remove` of the first release the number the
+        second depends on. Anything else gets twilio, twilio-2, …: the first id with neither a line nor a journal."""
+        lines, journals = _section(raw, "lines"), _journals()
+        for line_id, j in journals.items():
+            if line_id in lines or j.number != number.e164:
+                continue
+            if j.state == "rollback_failed":
+                raise ActionError(f"An earlier setup of {number.e164} (line {line_id}) could not be fully undone. Finish "
+                                  f"removing it in your {carrier.capitalize()} account, then run "
+                                  f"`ai-phone lines remove {line_id} --local-only`.")
+            if j.resumable and j.brought == existing:
+                return line_id
+            raise ActionError(f"line {line_id} has an unfinished setup for {number.e164}; run `ai-phone lines resume "
+                              f"{line_id}` to finish it or `ai-phone lines remove {line_id}` to undo it, then try again")
         n = 1
         while True:
             line_id = carrier if n == 1 else f"{carrier}-{n}"
             n += 1
-            if line_id in lines:
-                continue
-            target = _journal_target(paths.lines_dir() / f"{line_id}.journal.json")
-            if target is None or target == (number.e164, existing):
-                return line_id
+            if line_id not in lines and (line_id not in journals or journals[line_id].number is None):
+                return line_id  # an empty journal records nothing, so it can be used
 
     def _connect(self, carrier: str, creds: dict[str, str], number, existing: bool) -> LineResult:
         provider = self._provider(carrier, creds)
@@ -423,6 +450,8 @@ class Actions:
             running = probe(paths.socket_path())
         except RuntimeError as e:  # socket_path refuses an unsafe directory under /tmp (a symlink, another owner)
             return [("lines", "failed", str(e))]
+        except OSError as e:  # or cannot make it (a file in the way)
+            return [("lines", "failed", f"could not use the control socket: {e.strerror or type(e).__name__}")]
         if running:
             try:
                 return _line_rows(StateFile.read(paths.state_path()))
@@ -459,20 +488,30 @@ class Actions:
         return _line_rows(doc)
 
 
-def _journal_target(path: Path) -> tuple[str | None, bool | None] | None:
-    """(number, brought) of the setup a journal records; None when it records none. Unreadable: ('?', None)."""
-    if not os.path.lexists(path):
-        return None
+def _journals() -> dict[str, Unfinished]:
+    """Every provisioning journal under lines/, by line id. Read only: Journal.open() would write the file."""
+    d = paths.lines_dir()
+    return {path.name.removesuffix(".journal.json"): _journal(path) for path in sorted(d.glob("*.journal.json"))} \
+        if d.is_dir() else {}
+
+
+def _journal(path: Path) -> Unfinished:
     try:
         if path.is_symlink():
             raise ValueError("a symlink")
-        steps = json.loads(path.read_text())["steps"]
-        if not steps:  # Journal.open() writes an empty one; it holds nothing
-            return None
-        planned = next(s["planned"] for s in steps if s["name"] == "target")
-        return planned.get("phone_number"), bool(planned.get("brought"))
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, StopIteration):
-        return "?", None
+        doc = json.loads(path.read_text())
+        steps = doc["steps"]
+
+        def planned(step: str, key: str):
+            return next((s["planned"].get(key) for s in steps if s["name"] == step), None)
+
+        number = (planned("target", "phone_number") or planned("order", "phone_number")  # this version, older Telnyx
+                  or planned("number", "phone_number") or planned("number", "name"))    # older Twilio, older fake
+        resumable = any(s["name"] == "target" for s in steps)
+        number = (number or "?") if steps else None  # steps but no number: not ours to pick up or to reuse
+        return Unfinished(number, bool(planned("target", "brought")), str(doc.get("state")), resumable)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return Unfinished("?", False, "?", False)
 
 
 def _fresh_state(since: float) -> dict | None:
@@ -519,6 +558,14 @@ def _last_line(log) -> str:
     return redact(text, _saved().values())[:160]
 
 
+@contextlib.contextmanager
+def _quiet():
+    with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink), \
+            warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        yield
+
+
 def _samples(audio):
     import numpy as np
     if type(audio).__module__.startswith("mlx"):
@@ -542,13 +589,15 @@ class KokoroPlayer:
         path = voices.voice_path(voice)
         if path is None:  # a bare voice name would make mlx-audio fetch it from another repo
             raise ActionError(f"could not play the sample: the voice {voice} is not installed")
-        if self._model is None:
-            load = self._load
-            if load is None:
-                from mlx_audio.tts.utils import load_model as load
-            self._model = load(str(snapshot))
-        parts = [_samples(r.audio) for r in self._model.generate(text=text, voice=str(path), speed=speed,
-                                                                  lang_code=voices.lang_code(voice))]
+        with _quiet():  # mlx-audio prints progress and warnings; plain mode and the terminal stay clean
+            if self._model is None:
+                load = self._load
+                if load is None:
+                    from mlx_audio.tts.utils import load_model as load
+                # the snapshot folder is named by a hash, so the model type cannot be read from the path
+                self._model = load(str(snapshot), model_type="kokoro")
+            parts = [_samples(r.audio) for r in self._model.generate(text=text, voice=str(path), speed=speed,
+                                                                      lang_code=voices.lang_code(voice))]
         pcm = (np.clip(np.concatenate(parts), -1.0, 1.0) * 32767).astype("<i2")
         fd, wav = tempfile.mkstemp(prefix="ai-phone-voice-", suffix=".wav")
         os.close(fd)

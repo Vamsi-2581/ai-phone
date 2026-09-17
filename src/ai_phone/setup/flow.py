@@ -227,6 +227,7 @@ def brain_endpoint(ui, actions, cur) -> None:
             Field("Model", model, validate=required),
             Field("API key", "", secret=True, placeholder=keep),
         ])
+        key = key.strip()  # a pasted key's spaces are never part of it (a trunk password's may be)
         try:
             where = urlsplit(base_url).hostname or base_url
         except ValueError:
@@ -270,14 +271,16 @@ def phone_number(ui, actions, session: Session) -> None:
         if not creds:
             page = Page(LINE, f"Your {name} credentials", f"Saved to {home_dir()}/secrets.env, readable only by you. "
                         "Never shown or sent anywhere else.", error=error)
-            creds = dict(zip(CARRIER_KEYS[carrier], ask(ui, page, credential_fields(carrier)), strict=True))
+            typed = [v.strip() for v in ask(ui, page, credential_fields(carrier))]  # pasted keys: spaces are not part of them
+            creds = dict(zip(CARRIER_KEYS[carrier], typed, strict=True))
             page = replace(page, error="")
         try:
             owned = ui.busy(page, f"Checking your {name} account…", lambda: actions.owned_numbers(carrier, creds))
         except ActionError as e:
             creds, error = None, str(e)
-    # a number that is already a line is not offered: connecting it again would overwrite its routing
-    connected = {ln.get("number") for ln in actions.current().lines.values()}
+    # a number that is already a line is not offered (connecting it again would overwrite its routing), nor one an
+    # earlier attempt left half set up (that belongs to `lines resume` / `lines remove`)
+    connected = {ln.get("number") for ln in actions.current().lines.values()} | actions.unfinished_numbers()
     free = [n for n in owned if n.e164 not in connected]
     left = f"{len(free)} not yet connected" if free else "none left to connect" if owned else "none on this account"
     new = ui.choose(Page(LINE, "A new number or one you already have?",
@@ -368,8 +371,9 @@ def forward(ui, actions, line_id: str) -> None:
             error = ""
         except ActionError as e:
             error = str(e)
-    body = (f"Turn on     {codes['activate']}\nCheck       {codes['check']}\nTurn off    {codes['cancel']}\n"
-            f"Turn off every divert   {codes['cancel_all']}")
+    rows = [("Turn on", codes["activate"]), ("Check", codes["check"]), ("Turn off", codes["cancel"]),
+            ("Turn off every divert", codes["cancel_all"])]
+    body = "\n".join(f"{label.ljust(21)}   {code}" for label, code in rows)
     ui.choose(Page(LINE, "Dial this on your mobile", "Open the phone app, type the code and press call.", body=body),
               [Option("Done")], back=False)
 
@@ -522,8 +526,8 @@ def check_models(ui, actions, page: Page) -> Check:
     if not actions.missing_models():
         return Check("Models", "downloaded", True)
     size = ui.busy(page, "Checking the download size…", actions.download_size)
-    later = ui.choose(Page(CHECK, "Download the models now?", f"About {gb(size)} into the Hugging Face cache "
-                           "(~/.cache/huggingface). ai-phone needs them to answer calls."),
+    later = ui.choose(Page(CHECK, "Download the models now?", f"About {gb(size)}, saved in the Hugging Face cache. "
+                           "ai-phone needs them to answer calls."),
                       [Option("Download now", gb(size)), Option("Later", "run: uv run ai-phone models pull")]) == 1
     if later:
         return Check("Models", "not downloaded yet · uv run ai-phone models pull", None)
@@ -555,57 +559,61 @@ def done(ui, actions, session: Session) -> None:
         pass  # everything is saved already: leaving here is finishing
 
 
+WIDTH = 88  # the Done page shows this many columns without scrolling
+AI_COMMANDS = (('uv run ai-phone call +15550100000 --prompt "…" --json', "ai-phone's agent talks"),
+               ("uv run ai-phone call +15550100000 --relay --json", "your AI talks (say, listen)"),
+               ("uv run ai-phone listen --json", "wait for a call"),
+               ("uv run ai-phone hangup", "end the call"))
+
+
 def done_text(actions, session: Session) -> str:
     cur = actions.current()
-    config, secrets = tilde(paths.config_path()), tilde(paths.secrets_path())
-    w = max(len(config), len(secrets)) + 5
-    out = ["Saved",
-           f"  {config.ljust(w)}lines, brain, voice, what callers hear",
-           f"  {secrets.ljust(w)}keys and passwords, readable only by you",
-           "",
-           "Lines"]
+    out = [f"Saved in {home_dir()}/   config.yaml and secrets.env (keys and passwords, private to you)", ""]
     rows = [(line_id, ln.get("number") or ln.get("aor") or "", line_kind(ln)) for line_id, ln in cur.lines.items()]
     if rows:
         a, b = (max(len(r[i]) for r in rows) for i in (0, 1))
-        out += [f"  {i.ljust(a)}   {where.ljust(b)}   {kind}" for i, where, kind in rows]
+        out += [f"{'Lines' if k == 0 else '':9}{i.ljust(a)}   {where.ljust(b)}   {kind}" for k, (i, where, kind) in enumerate(rows)]
     else:
-        out.append("  none yet · run setup again to add one")
-    brain_row = (f"on this Mac · {tier_name(cur.tier)}" if cur.brain_kind == "local" else f"{cur.base_url} · {cur.model}")
+        out.append("Lines    none yet · run setup again to add one")
+    brain_row = f"on this Mac · {tier_name(cur.tier)}" if cur.brain_kind == "local" else f"{cur.base_url} · {cur.model}"
     out += [f"Brain    {brain_row}",
             f"Voice    {voices.title(cur.voice)} · {voices.describe(cur.voice)} · {speed_text(cur.speed)}×",
-            "",
-            "Start ai-phone",
-            "  uv run ai-phone run",
-            "",
-            "Try it"]
-    tries = []
-    for ln in cur.lines.values():
-        if ln.get("kind") == "sip":
-            user = ln.get("user") or (ln.get("aor") or "sip:agent@").split(":", 1)[-1].split("@", 1)[0]
-            tries += [f"  pjsua --local-port 5070 sip:{user}@127.0.0.1",
-                      "    talk to your agent through this Mac's mic and speakers (free)"]
-        elif ln.get("number"):
-            tries.append(f"  call {ln['number']} from any phone (your normal call rates)")
-    out += tries or ["  add a line first: uv run ai-phone setup"]
-    repo = tilde(Path(ai_phone.__file__).parents[2])
-    out += ["",
-            "Give your AI the phone",
-            '  Tell your AI: "You can make and take phone calls with the ai-phone command,',
-            f'  run from {repo}: `uv run ai-phone call +15550100000 --prompt "…" --json`',
-            "  lets ai-phone's own agent talk and returns the transcript; `uv run ai-phone call … --relay --json`,",
-            '  then `ai-phone listen --json` and `ai-phone say "…"`, lets you talk yourself; `ai-phone listen --json`',
-            '  waits for incoming calls; `ai-phone hangup` ends a call."']
+            "", "Start ai-phone", "  uv run ai-phone run", "", "Try it"]
+    out += try_it(cur.lines)
+    width = max(len(command) for command, _ in AI_COMMANDS)
+    out += ["", f"Give your AI the phone: from {tilde(Path(ai_phone.__file__).parents[2])}, it can run"]
+    out += [f"  {command.ljust(width)}   {what}" for command, what in AI_COMMANDS]
     return "\n".join(out)
 
 
+def try_it(lines: dict[str, dict]) -> list[str]:
+    """One call to a ready number and one free call to a SIP address, when there are such lines."""
+    numbers = [ln["number"] for ln in lines.values() if ln.get("kind", "trunk") == "trunk" and ln.get("number")
+               and provider_of(ln).get("state", "ready") == "ready"]
+    users = [ln.get("user") or str(ln.get("aor") or "").removeprefix("sip:").split("@", 1)[0]
+             for ln in lines.values() if ln.get("kind") == "sip"]
+    out = [f"  call {numbers[0]} from any phone (your normal call rates)"] if numbers else []
+    if users:
+        command, what = f"  pjsua --local-port 5070 sip:{users[0]}@127.0.0.1", "talk through this Mac's mic, free"
+        out += [f"{command}   {what}"] if len(command) + 3 + len(what) <= WIDTH else [command, f"    {what}"]
+    if out:
+        return out
+    return ["  nothing to call yet: the number is still being set up"] if lines else ["  add a line first: uv run ai-phone setup"]
+
+
+def provider_of(ln: dict) -> dict:
+    provider = ln.get("provider")
+    return provider if isinstance(provider, dict) else {}  # a hand-edited config may hold anything here
+
+
 def line_kind(ln: dict) -> str:
-    kind = ln.get("kind", "trunk")
-    provider = ln.get("provider") or {}
-    if provider.get("name"):
-        kind += f" · {provider['name']}"
-        if provider.get("state", "ready") != "ready":
-            kind += f" · {provider['state']}"
-    return kind
+    provider = provider_of(ln)
+    if ln.get("kind") == "sip":
+        return "SIP address"
+    if not provider.get("name"):
+        return "SIP trunk"
+    kind = f"{str(provider['name']).capitalize()} number"
+    return kind if provider.get("state", "ready") == "ready" else f"{kind} · {provider['state']}"
 
 
 STEP = {BRAIN: brain, LINE: line, VOICE: voice, CALLERS: callers, CHECK: check, DONE: done}

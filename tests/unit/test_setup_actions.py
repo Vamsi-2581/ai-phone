@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import time
+import warnings
 import wave
 from pathlib import Path
 
@@ -318,21 +319,62 @@ def test_a_stale_journal_never_blocks_a_new_line(home):
     number gets an id of its own instead of being refused."""
     unfinished(home, "fake", "+442079460055", brought=False)
     (home / "lines" / "fake-2.journal.json").write_text("{not json")
+    early = Journal.open(home / "lines", "fake-3", "fake")  # stopped before it recorded a number
+    early.start("profile", name="ai-phone:fake-3")
+    Journal.open(home / "lines", "fake-4", "fake")  # empty: it records nothing, so its id can be used
     a = make(home)
     result = a.buy_number("fake", FAKE_KEY, Number(BOUGHT, 1.0, "GBP", False, "src-0"))
-    assert (result.line_id, result.code) == ("fake-3", 0)
+    assert (result.line_id, result.code) == ("fake-4", 0)
     assert json.loads((home / "lines" / "fake.journal.json").read_text())["steps"][0]["planned"]["phone_number"] == "+442079460055"
 
 
 def test_an_unfinished_connection_of_the_same_number_is_picked_up(home):
-    unfinished(home, "fake", OWNED, brought=True)
+    unfinished(home, "other", OWNED, brought=True)  # any id: the journal is found by its number
     a = make(home)
     result = a.attach_number("fake", FAKE_KEY, a.owned_numbers("fake", FAKE_KEY)[0])
-    assert (result.line_id, result.code) == ("fake", 0)
-    assert load_config(home / "config.yaml").lines["fake"].number == OWNED
-    unfinished(home, "fake-2", "+442079460001", brought=True)  # the same number, but it was being connected, not bought
-    result = a.buy_number("fake", FAKE_KEY, Number("+442079460001", 1.0, "GBP", False, "src-1"))
-    assert (result.line_id, result.code) == ("fake-3", 0)
+    assert (result.line_id, result.code) == ("other", 0)
+    assert load_config(home / "config.yaml").lines["other"].number == OWNED
+
+
+def test_a_number_set_up_the_other_way_is_never_set_up_again(home):
+    """A purchase that stopped part-way, then the same number connected under a new id: `lines remove` of the first id
+    would release the number the new line depends on. So the wizard stops with the way out instead."""
+    unfinished(home, "fake", OWNED, brought=False)
+    a = make(home)
+    with pytest.raises(ActionError) as e:
+        a.attach_number("fake", FAKE_KEY, a.owned_numbers("fake", FAKE_KEY)[0])
+    assert str(e.value) == (f"line fake has an unfinished setup for {OWNED}; run `ai-phone lines resume fake` to finish it "
+                            f"or `ai-phone lines remove fake` to undo it, then try again")
+    unfinished(home, "fake-2", "+442079460001", brought=True)
+    with pytest.raises(ActionError, match="^line fake-2 has an unfinished setup for \\+442079460001;"):
+        a.buy_number("fake", FAKE_KEY, Number("+442079460001", 1.0, "GBP", False, "src-1"))
+    old = home / "lines" / "old.journal.json"  # an older journal: no target step, so it cannot be picked up
+    old.write_text(json.dumps({"line_id": "old", "provider": "fake", "state": "pending",
+                               "steps": [{"name": "number", "status": "done", "planned": {"name": "+442079460002"}}]}))
+    with pytest.raises(ActionError, match="^line old has an unfinished setup for \\+442079460002;"):
+        a.buy_number("fake", FAKE_KEY, Number("+442079460002", 1.0, "GBP", False, "src-2"))
+    assert not (home / "config.yaml").exists() and FakeProvider().created == {}
+
+
+def test_a_setup_that_could_not_be_undone_is_never_reused(home):
+    unfinished(home, "fake", OWNED, brought=True)
+    Journal.open(home / "lines", "fake", "fake").set_state("rollback_failed")
+    a = make(home)
+    with pytest.raises(ActionError) as e:
+        a.attach_number("fake", FAKE_KEY, a.owned_numbers("fake", FAKE_KEY)[0])
+    assert str(e.value) == (f"An earlier setup of {OWNED} (line fake) could not be fully undone. Finish removing it in your "
+                            f"Fake account, then run `ai-phone lines remove fake --local-only`.")
+
+
+def test_unfinished_numbers(home):
+    a = make(home)
+    assert a.unfinished_numbers() == set()
+    unfinished(home, "fake", OWNED, brought=True)
+    unfinished(home, "gone", "+442079460003", brought=False)
+    Journal.open(home / "lines", "empty", "fake")
+    (home / "lines" / "broken.journal.json").write_text("{not json")
+    a.buy_number("fake", FAKE_KEY, Number(BOUGHT, 1.0, "GBP", False, "src-0"))  # a journal with its line: not unfinished
+    assert a.unfinished_numbers() == {OWNED, "+442079460003"}
 
 
 def test_a_refused_number_comes_back_with_the_reason(home):
@@ -549,6 +591,15 @@ def test_check_lines_when_the_control_socket_is_unsafe(home, monkeypatch):
                                                             "the control socket there")]
 
 
+def test_check_lines_when_the_control_socket_cannot_be_made(home, monkeypatch):
+    def blocked():
+        raise FileExistsError(17, "File exists", "/private/tmp/ai-phone-501")
+
+    monkeypatch.setattr(act.paths, "socket_path", blocked)
+    monkeypatch.setattr(act.subprocess, "Popen", None)
+    assert make(home).check_lines() == [("lines", "failed", "could not use the control socket: File exists")]
+
+
 def test_check_lines_when_ai_phone_cannot_start(home, monkeypatch):
     def missing(*a, **k):
         raise FileNotFoundError(2, "No such file or directory")
@@ -653,16 +704,21 @@ class Result:
 
 
 class FakeKokoro:
+    """Talks like mlx-audio: a line on stdout, one on stderr and a warning while it generates."""
+
     def __init__(self):
         self.calls = []
 
     def generate(self, **kw):
         self.calls.append(kw)
+        print("Creating new KokoroPipeline for language: b")
+        print("some warning", file=sys.stderr)
+        warnings.warn("words count mismatch", UserWarning)
         yield Result(np.full(2400, 0.5, dtype=np.float32))
         yield Result(np.full(1200, -2.0, dtype=np.float32))
 
 
-def test_kokoro_player_writes_a_wav_and_plays_it(tmp_path, monkeypatch):
+def test_kokoro_player_writes_a_wav_and_plays_it(tmp_path, monkeypatch, capsys, recwarn):
     snapshot = tmp_path / "kokoro"
     (snapshot / "voices").mkdir(parents=True)
     (snapshot / "voices" / "bf_emma.safetensors").write_bytes(b"")
@@ -678,10 +734,16 @@ def test_kokoro_player_writes_a_wav_and_plays_it(tmp_path, monkeypatch):
         assert frames[0] == 16383 and frames[-1] == -32767  # scaled, and clipped
         played.append(path)
 
-    player = KokoroPlayer(load=lambda path: loads.append(path) or kokoro, run=run)
+    def load(path, **kw):
+        loads.append((path, kw))
+        print("fetching 1 file")
+        return kokoro
+
+    player = KokoroPlayer(load=load, run=run)
     player.play("bf_emma", 1.1, "Hello.")
     player.play("bf_emma", 1.0, "Again.")
-    assert loads == [str(snapshot)]  # loaded once
+    assert loads == [(str(snapshot), {"model_type": "kokoro"})]  # loaded once; the snapshot folder name is a hash
+    assert capsys.readouterr() == ("", "") and len(recwarn) == 0  # plain mode stays clean
     assert played[0] == ("afplay", 1, 2, 24000, 3600, 30, True)
     assert kokoro.calls[0] == {"text": "Hello.", "voice": str(snapshot / "voices" / "bf_emma.safetensors"), "speed": 1.1,
                                "lang_code": "b"}
@@ -690,7 +752,7 @@ def test_kokoro_player_writes_a_wav_and_plays_it(tmp_path, monkeypatch):
 
 def test_kokoro_player_needs_the_model_and_the_voice(tmp_path, monkeypatch):
     monkeypatch.setattr(models, "local_path", lambda repo: None)
-    player = KokoroPlayer(load=lambda path: pytest.fail("nothing to load"), run=lambda *a, **k: pytest.fail("nothing to play"))
+    player = KokoroPlayer(load=lambda path, **kw: pytest.fail("nothing to load"), run=lambda *a, **k: pytest.fail("nothing to play"))
     with pytest.raises(ActionError, match="^could not play the sample: the speech model is not downloaded$"):
         player.play("af_heart", 1.0, "Hi.")
     monkeypatch.setattr(models, "local_path", lambda repo: tmp_path)

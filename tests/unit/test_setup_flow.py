@@ -155,6 +155,9 @@ class FakeActions:
     def lan_address(self):
         return self._call("lan_address")
 
+    def unfinished_numbers(self):
+        return self._call("unfinished_numbers") or set()
+
     def voices(self):
         return self._call("voices")
 
@@ -488,7 +491,10 @@ def test_telnyx_existing_number_and_forward():
     assert actions.args("forward") == [("telnyx", "+447700900123", "busy")]
     codes = ui.questions("Dial this on your mobile")[0]
     assert "**67*+15550100008#" in codes.body and "##002#" in codes.body
-    assert codes.body.splitlines()[0] == "Turn on     **67*+15550100008#"
+    assert codes.body.splitlines() == ["Turn on                 **67*+15550100008#",
+                                       "Check                   *#67#",
+                                       "Turn off                ##67#",
+                                       "Turn off every divert   ##002#"]
     assert all("KEYsaved" not in page_text(p) for p in ui.pages)
 
 
@@ -582,6 +588,50 @@ def test_a_forward_that_cannot_be_saved_is_asked_again():
     assert first.error == "" and second.error == broken
     assert actions.args("forward") == [("telnyx", "+447700900123", "all")]
     assert not ui.questions("Dial this")
+
+
+def test_numbers_with_an_unfinished_setup_are_left_out():
+    """A number an earlier attempt left half set up belongs to `lines resume` / `lines remove`, not to a new line."""
+    ui = ScriptedUI([
+        *add_a_line("Telnyx"),
+        ("Use the saved Telnyx key?", "Use the saved key"),
+        ("A new number or one you already have?", "One I already have"),
+        ("Which number?", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}, unfinished_numbers={"+15550100007"})
+    drive(ui, actions)
+    assert [o.label for o in ui.menu("Which number?")[1]] == ["+15550100008"]
+    assert ui.menu("A new number or one")[1][1].hint == "1 not yet connected"
+
+
+def test_pasted_keys_lose_their_spaces():
+    ui = ScriptedUI([
+        *add_a_line("Twilio"),
+        ("Your Twilio credentials", [" ACsid ", "tokSECRET\t "]),
+        ("A new number or one you already have?", "<quit>"),
+    ])
+    actions = FakeActions(exists=True)
+    drive(ui, actions)
+    assert actions.args("owned_numbers") == [("twilio", TWILIO)]
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My own endpoint"),
+        ("Your endpoint", ["https://api.example.com/v1", "qwen", "  sk-test  "]),
+        ("A few things need attention", "Check again"),
+        ("A few things need attention", "<quit>"),
+    ])
+    actions = FakeActions(exists=True)
+    drive(ui, actions)
+    assert actions.args("test_endpoint") == [("https://api.example.com/v1", "qwen", "sk-test")]
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My own endpoint"),
+        ("Your endpoint", ["https://api.example.com/v1", "qwen", "   "]),
+        ("A few things need attention", "<quit>"),
+    ])
+    actions = FakeActions(exists=True)
+    drive(ui, actions)
+    assert actions.args("save_brain_endpoint") == [("https://api.example.com/v1", "qwen", None)]  # only spaces: no key
 
 
 def test_bad_key_is_asked_again_with_the_error():
@@ -1007,8 +1057,7 @@ def test_check_offers_the_download_and_reports():
                           pull_models=Seq(None, ActionError(failed)))
     assert drive(ui, actions).code == 0
     offer = ui.questions("Download the models now?")[0]
-    assert offer.detail == ("About 4.3 GB into the Hugging Face cache (~/.cache/huggingface). "
-                            "ai-phone needs them to answer calls.")
+    assert offer.detail == "About 4.3 GB, saved in the Hugging Face cache. ai-phone needs them to answer calls."
     assert [(o.label, o.hint) for o in ui.menu("Download the models now?")[1]] == [
         ("Download now", "4.3 GB"), ("Later", "run: uv run ai-phone models pull")]
     assert "Checking the download size…" in ui.labels
@@ -1070,32 +1119,54 @@ def test_check_shows_a_skipped_row_without_the_sip_library():
         Check("Lines", "skipped · SIP library not built · run ./scripts/install.sh", None)
 
 
-def test_done_text_uses_tilde_paths(monkeypatch):
+def test_done_text_fits_the_page(monkeypatch):
     monkeypatch.delenv("AI_PHONE_HOME", raising=False)
-    actions = FakeActions(exists=True, lines={"agent": SIP_LINE, "twilio": NUMBER_LINE})
-    text = flow.done_text(actions, flow.Session())
+    lines = {"agent": SIP_LINE, "twilio": NUMBER_LINE, "office": {"kind": "trunk", "number": "+15550100002"},
+             "telnyx": {"kind": "trunk", "number": "+15550100003", "provider": {"name": "telnyx", "state": "pending"}},
+             "desk": {"kind": "sip", "user": "desk", "aor": "sip:desk@192.0.2.10"},
+             "odd": {"kind": "trunk", "number": "+15550100004", "provider": "twilio"}}
+    text = flow.done_text(FakeActions(exists=True, lines=lines), flow.Session())
     assert str(Path.home()) not in text
     repo = Path(ai_phone.__file__).parents[2]
     shown = "~/" + str(repo.relative_to(Path.home())) if repo.is_relative_to(Path.home()) else str(repo)
-    assert f"run from {shown}:" in text
-    lines = text.splitlines()
-    assert lines[:3] == ["Saved",
-                         "  ~/.ai-phone/config.yaml     lines, brain, voice, what callers hear",
-                         "  ~/.ai-phone/secrets.env     keys and passwords, readable only by you"]
-    assert "Brain    on this Mac · Qwen 4B" in lines and "Voice    Heart · American · female · 1.0×" in lines
-    assert any(ln.startswith("  agent") and "sip:agent@192.0.2.10" in ln and ln.endswith("sip") for ln in lines)
-    assert any(ln.startswith("  twilio") and "+15550100001" in ln and "trunk · twilio" in ln for ln in lines)
-    for section in ("Lines", "Start ai-phone", "Try it", "Give your AI the phone"):
-        assert section in lines
-    assert "  uv run ai-phone run" in lines
-    assert "  pjsua --local-port 5070 sip:agent@127.0.0.1" in lines
-    assert "  call +15550100001 from any phone (your normal call rates)" in lines
-    assert 'Tell your AI: "You can make and take phone calls with the ai-phone command,' in text
-    assert "`ai-phone hangup` ends a call.\"" in text
+    assert text.splitlines() == [
+        "Saved in ~/.ai-phone/   config.yaml and secrets.env (keys and passwords, private to you)",
+        "",
+        "Lines    agent    sip:agent@192.0.2.10   SIP address",
+        "         twilio   +15550100001           Twilio number",
+        "         office   +15550100002           SIP trunk",
+        "         telnyx   +15550100003           Telnyx number · pending",
+        "         desk     sip:desk@192.0.2.10    SIP address",
+        "         odd      +15550100004           SIP trunk",
+        "Brain    on this Mac · Qwen 4B",
+        "Voice    Heart · American · female · 1.0×",
+        "",
+        "Start ai-phone",
+        "  uv run ai-phone run",
+        "",
+        "Try it",
+        "  call +15550100001 from any phone (your normal call rates)",
+        "  pjsua --local-port 5070 sip:agent@127.0.0.1   talk through this Mac's mic, free",
+        "",
+        f"Give your AI the phone: from {shown}, it can run",
+        '  uv run ai-phone call +15550100000 --prompt "…" --json   ai-phone\'s agent talks',
+        "  uv run ai-phone call +15550100000 --relay --json        your AI talks (say, listen)",
+        "  uv run ai-phone listen --json                           wait for a call",
+        "  uv run ai-phone hangup                                  end the call",
+    ]
+    assert max(len(ln) for ln in text.splitlines() if not ln.startswith("Give your AI the phone")) <= 88
 
 
-def test_done_text_without_lines():
+def test_done_text_with_one_kind_of_line():
     text = flow.done_text(FakeActions(exists=True), flow.Session())
     lines = text.splitlines()
-    assert "  none yet · run setup again to add one" in lines
+    assert "Lines    none yet · run setup again to add one" in lines
+    assert lines[lines.index("Try it") + 1] == "  add a line first: uv run ai-phone setup"
     assert not any("pjsua" in ln for ln in lines)
+    long_name = {"a" * 32: {"kind": "sip", "user": "a" * 32, "aor": f"sip:{'a' * 32}@192.0.2.10"}}
+    lines = flow.done_text(FakeActions(exists=True, lines=long_name), flow.Session()).splitlines()
+    tried = lines[lines.index("Try it") + 1:lines.index("Try it") + 3]
+    assert tried == [f"  pjsua --local-port 5070 sip:{'a' * 32}@127.0.0.1", "    talk through this Mac's mic, free"]
+    pending = {"twilio": dict(NUMBER_LINE, provider={"name": "twilio", "state": "pending"})}
+    lines = flow.done_text(FakeActions(exists=True, lines=pending), flow.Session()).splitlines()
+    assert lines[lines.index("Try it") + 1] == "  nothing to call yet: the number is still being set up"
