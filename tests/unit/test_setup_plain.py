@@ -6,7 +6,7 @@ import types
 
 import pytest
 
-from ai_phone.setup import run_setup
+from ai_phone.setup import flow, run_setup
 from ai_phone.setup.plain import PlainUI
 from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
 from tests.unit.test_setup_flow import FakeActions
@@ -93,6 +93,17 @@ def test_b_goes_back_and_knows_whether_it_is_the_first_question(typed):
     assert not later.value.at_start
 
 
+def test_enter_on_a_menu_whose_default_is_back_goes_back(typed, capsys):
+    typed.answers += ["", "1"]
+    ui = PlainUI()
+    confirm = Page(2, "Buy +15550100001 for $1.15/month?")
+    with pytest.raises(Back):
+        ui.choose(confirm, [Option("Buy +15550100001", "$1.15/month")], default=1)
+    assert ui.choose(confirm, [Option("Buy +15550100001", "$1.15/month")], default=1) == 0
+    assert typed.prompts == ["Choose [b]: "] * 2
+    assert capsys.readouterr().out.count("  b) Back\n") == 2
+
+
 def test_q_quits(typed):
     typed.answers.append("q")
     with pytest.raises(Cancel):
@@ -132,12 +143,13 @@ def test_ask_takes_defaults_and_asks_again_until_valid(typed, capsys):
 
 
 def test_a_secret_is_read_hidden_and_never_printed(typed, capsys):
-    typed.answers += ["", "sk-live-SECRET", "  sk-live-SECRET  "]
-    required = lambda v: None if v else "Enter a value."  # noqa: E731
+    typed.answers += ["", "sk-live-SECRET", "  pw SECRET  "]
+    required = lambda v: None if v.strip() else "Enter a value."  # noqa: E731
     page = Page(1, "Your endpoint", "Any server that speaks the OpenAI chat API.")
     ui = PlainUI()
     assert ui.ask(page, [Field("API key", secret=True, validate=required)]) == ["sk-live-SECRET"]
-    assert ui.ask(page, [Field("API key", secret=True, placeholder="leave empty for none")]) == ["sk-live-SECRET"]
+    # a secret is kept exactly as typed: a password may start or end with a space
+    assert ui.ask(page, [Field("API key", secret=True, placeholder="leave empty for none")]) == ["  pw SECRET  "]
     out = capsys.readouterr()
     assert "SECRET" not in out.out and "SECRET" not in out.err
     assert typed.prompts == ["API key: ", "API key: ", "API key (leave empty for none): "]
@@ -203,6 +215,38 @@ def test_run_setup_plain_end_to_end(typed, capsys, monkeypatch, tmp_path):
     assert "  pjsua --local-port 5070 sip:agent@127.0.0.1" in out
     assert out.splitlines()[-2:] == ["  1) Finish", "Choose [1]: "]
     assert not typed.answers
+
+
+class EndOfInput:
+    """Blank lines (Enter), then the end of the input."""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+
+    def __call__(self, prompt=""):
+        print(prompt, end="")
+        if not self.answers:
+            raise EOFError
+        return self.answers.pop(0)
+
+
+def test_pressing_enter_never_buys_or_connects_a_number(capsys, monkeypatch):
+    """Plain mode reads piped input: blank lines are no answer, so they must never reach a purchase."""
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": pytest.fail("the saved key is used"))
+    saved = {"TWILIO_ACCOUNT_SID": "ACsid", "TWILIO_AUTH_TOKEN": "tok"}
+    actions = FakeActions(exists=True, saved_keys=saved)
+    monkeypatch.setattr("builtins.input", EndOfInput([""] * 60))
+    assert flow.run(PlainUI(), actions).code == 1
+    assert len(actions.args("search_numbers")) >= 3  # it went round the purchase questions several times
+    assert not actions.args("buy_number") and not actions.args("attach_number")
+    assert "Buy +15550100001 for $1.15/month?" in capsys.readouterr().out
+
+    actions = FakeActions(exists=True, saved_keys=saved)
+    # Add a line, A phone number, Twilio, Use the saved key, One I already have, the first number, then Enter
+    monkeypatch.setattr("builtins.input", EndOfInput(["", "", "", "", "2", ""] + [""] * 30))
+    assert flow.run(PlainUI(), actions).code == 1
+    assert "Connect +15550100007 to ai-phone?" in capsys.readouterr().out
+    assert not actions.args("buy_number") and not actions.args("attach_number")
 
 
 def test_run_setup_without_a_terminal_uses_plain_prompts(typed, capsys, monkeypatch, tmp_path):

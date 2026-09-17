@@ -6,6 +6,7 @@ put back as it was and the ConfigError becomes the ActionError."""
 from __future__ import annotations
 
 import copy
+import json
 import os
 import signal
 import socket
@@ -39,6 +40,7 @@ VENDOR = Path(ai_phone.__file__).parent / "vendor"  # where install.sh puts the 
 DAEMON = [sys.executable, "-c", "import sys; from ai_phone.cli import main; sys.exit(main(sys.argv[1:]))", "run", "--fake"]
 CHECK_SEC, POLL_SEC, STOP_SEC = 20, 0.5, 10  # how long a trial start may take to register, how often to look, how long to stop
 SAMPLE_RATE = 24000  # Kokoro's own rate
+LOOPBACK = ("127.0.0.1", "localhost", "::1")  # the config's rule: plain http only to this machine
 
 
 @dataclass
@@ -170,13 +172,16 @@ class Actions:
         return env if brain.get("kind") == "openai_compatible" and isinstance(env, str) else None
 
     def test_endpoint(self, url: str, model: str, key: str | None) -> str:
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname or url
+        except ValueError:
+            parts, host = None, url
+        if parts is not None and parts.scheme == "http" and parts.hostname not in LOOPBACK:
+            raise ActionError("a brain that is not on this machine must use https")  # before a key can cross the network
         if key is None:
             env = self._brain_key_env()
             key = _saved().get(env) if env else None
-        try:
-            host = urlsplit(url).hostname or url
-        except ValueError:
-            host = url
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         body = {"model": model, "messages": [{"role": "user", "content": "Say OK."}], "max_tokens": 5}
         try:
@@ -258,6 +263,21 @@ class Actions:
         except ProviderError as e:
             raise self._carrier_error(carrier, creds, e, "Could not search for numbers") from None
 
+    def _line_id(self, raw: dict, carrier: str, number, existing: bool) -> str:
+        """twilio, twilio-2, …: the first id with neither a line nor a journal, or the id of an unfinished attempt to set
+        up this same number the same way (bought, or brought), which provisioning then picks up where it stopped. Any
+        other journal belongs to `lines resume` / `lines remove` and is left alone."""
+        lines = _section(raw, "lines")
+        n = 1
+        while True:
+            line_id = carrier if n == 1 else f"{carrier}-{n}"
+            n += 1
+            if line_id in lines:
+                continue
+            target = _journal_target(paths.lines_dir() / f"{line_id}.journal.json")
+            if target is None or target == (number.e164, existing):
+                return line_id
+
     def _connect(self, carrier: str, creds: dict[str, str], number, existing: bool) -> LineResult:
         provider = self._provider(carrier, creds)
         messages: list[str] = []
@@ -265,7 +285,8 @@ class Actions:
             for name, value in creds.items():
                 write_secret(name, value)
             with line_lock(paths.lines_dir()):
-                line_id = next_line_id(self._read(), carrier)
+                raw = self._read()
+                line_id = self._line_id(raw, carrier, number, existing)
                 if self.config_path.exists():
                     load_config(self.config_path)  # the line is written into this config: it must load before anything is bought
                 journal = Journal.open(paths.lines_dir(), line_id, provider.name)
@@ -310,7 +331,17 @@ class Actions:
 
     def add_sip_line(self, name: str, host: str) -> str:
         with line_lock(paths.lines_dir()):
-            line_id = next_line_id(self._read(), name)
+            raw = self._read()
+            # two SIP lines with one address: the endpoint gives every call to the first, so the other never rings
+            for other, ln in _section(raw, "lines").items():
+                if not isinstance(ln, dict) or ln.get("kind") != "sip":
+                    continue
+                aor = str(ln.get("aor") or "")
+                if name == aor.removeprefix("sip:").split("@", 1)[0]:
+                    raise ActionError(f"{aor} is already line {other}; pick another name")
+                if name == ln.get("user"):
+                    raise ActionError(f"sip:{name}@… is already line {other}; pick another name")
+            line_id = next_line_id(raw, name)
             try:
                 write_line(self.config_path, line_id, manual_line("sip", user=name, host=host))
             except ValueError as e:  # a ConfigError is a ValueError too
@@ -390,7 +421,7 @@ class Actions:
         """(line id, state, detail) for each line: from the running ai-phone, or from a short trial start of it."""
         try:
             running = probe(paths.socket_path())
-        except RuntimeError as e:
+        except RuntimeError as e:  # socket_path refuses an unsafe directory under /tmp (a symlink, another owner)
             return [("lines", "failed", str(e))]
         if running:
             try:
@@ -407,7 +438,10 @@ class Actions:
         started = time.time()
         doc = None
         with tempfile.TemporaryFile() as log:
-            proc = subprocess.Popen(DAEMON, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+            try:
+                proc = subprocess.Popen(DAEMON, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+            except OSError as e:
+                return [("lines", "failed", f"could not start ai-phone: {e.strerror or e}")]
             try:
                 while True:
                     if proc.poll() is not None:
@@ -423,6 +457,22 @@ class Actions:
         if doc is None:
             return [("lines", "registering", f"ai-phone did not report its lines within {CHECK_SEC:g} seconds")]
         return _line_rows(doc)
+
+
+def _journal_target(path: Path) -> tuple[str | None, bool | None] | None:
+    """(number, brought) of the setup a journal records; None when it records none. Unreadable: ('?', None)."""
+    if not os.path.lexists(path):
+        return None
+    try:
+        if path.is_symlink():
+            raise ValueError("a symlink")
+        steps = json.loads(path.read_text())["steps"]
+        if not steps:  # Journal.open() writes an empty one; it holds nothing
+            return None
+        planned = next(s["planned"] for s in steps if s["name"] == "target")
+        return planned.get("phone_number"), bool(planned.get("brought"))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, StopIteration):
+        return "?", None
 
 
 def _fresh_state(since: float) -> dict | None:

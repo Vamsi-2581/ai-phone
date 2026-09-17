@@ -202,6 +202,16 @@ def test_endpoint_test_reports_what_the_endpoint_said_without_the_key(home):
         a.test_endpoint("https://api.example.com/v1", "qwen", key)
 
 
+def test_endpoint_test_never_sends_to_another_machine_over_plain_http(home):
+    a = endpoint(home, lambda req: pytest.fail("nothing may be sent"))
+    for key in ("sk-test-SECRET", None):
+        with pytest.raises(ActionError) as e:
+            a.test_endpoint("http://203.0.113.5/v1", "qwen", key)
+        assert str(e.value) == "a brain that is not on this machine must use https"
+    with pytest.raises(ActionError, match="must use https"):
+        a.test_endpoint("http://api.example.com:8080/v1", "qwen", "sk-test-SECRET")
+
+
 def test_endpoint_test_that_cannot_connect(home):
     def refuse(req):
         raise httpx.ConnectError("connection refused", request=req)
@@ -297,6 +307,44 @@ def test_a_pending_or_failed_number_comes_back_with_its_messages(home):
     assert "simulated crash after connection" in failed.messages[0] and "lines resume fake-2" in failed.messages[0]
 
 
+def unfinished(home, line_id, number, brought):
+    journal = Journal.open(home / "lines", line_id, "fake")
+    journal.start("target", phone_number=number, brought=brought)
+    journal.finish("target")
+
+
+def test_a_stale_journal_never_blocks_a_new_line(home):
+    """An earlier attempt that stopped part-way keeps its journal (for `lines resume` or `lines remove`); a new
+    number gets an id of its own instead of being refused."""
+    unfinished(home, "fake", "+442079460055", brought=False)
+    (home / "lines" / "fake-2.journal.json").write_text("{not json")
+    a = make(home)
+    result = a.buy_number("fake", FAKE_KEY, Number(BOUGHT, 1.0, "GBP", False, "src-0"))
+    assert (result.line_id, result.code) == ("fake-3", 0)
+    assert json.loads((home / "lines" / "fake.journal.json").read_text())["steps"][0]["planned"]["phone_number"] == "+442079460055"
+
+
+def test_an_unfinished_connection_of_the_same_number_is_picked_up(home):
+    unfinished(home, "fake", OWNED, brought=True)
+    a = make(home)
+    result = a.attach_number("fake", FAKE_KEY, a.owned_numbers("fake", FAKE_KEY)[0])
+    assert (result.line_id, result.code) == ("fake", 0)
+    assert load_config(home / "config.yaml").lines["fake"].number == OWNED
+    unfinished(home, "fake-2", "+442079460001", brought=True)  # the same number, but it was being connected, not bought
+    result = a.buy_number("fake", FAKE_KEY, Number("+442079460001", 1.0, "GBP", False, "src-1"))
+    assert (result.line_id, result.code) == ("fake-3", 0)
+
+
+def test_a_refused_number_comes_back_with_the_reason(home):
+    a = make(home)
+    n = Number(BOUGHT, 1.0, "GBP", False, "src-0")
+    assert a.buy_number("fake", FAKE_KEY, n).code == 0
+    refused = a.attach_number("fake", FAKE_KEY, n)
+    assert (refused.line_id, refused.code) == ("fake-2", 3)
+    assert refused.messages == [f"error: {BOUGHT} is already line fake"]
+    assert not (home / "lines" / "fake-2.journal.json").exists()
+
+
 def test_nothing_is_bought_into_a_config_that_does_not_load(home):
     providers = []
 
@@ -349,16 +397,27 @@ def test_lan_address(home, monkeypatch):
     assert a.lan_address() == "127.0.0.1"
 
 
-def test_add_sip_line_picks_a_free_id(home):
-    a = make(home)
+def test_add_sip_line_refuses_an_address_that_is_taken(home):
+    """Two SIP lines with one address: the endpoint gives every call to the first, so the second would never ring."""
+    a = make(home, "lines:\n  desk: {kind: trunk, number: '+15550100001', registrar: 'sip:sip.example.com', "
+                   "dial_domain: sip.example.com, user: desk1234}\n")
     assert a.add_sip_line("agent", "192.0.2.10") == "agent"
-    assert a.add_sip_line("agent", "192.0.2.10") == "agent-2"
-    cfg = load_config(home / "config.yaml")
-    assert cfg.lines["agent"].aor == "sip:agent@192.0.2.10" and cfg.lines["agent-2"].user == "agent"
     before = (home / "config.yaml").read_text()
+    with pytest.raises(ActionError) as e:
+        a.add_sip_line("agent", "192.0.2.11")
+    assert str(e.value) == "sip:agent@192.0.2.10 is already line agent; pick another name"
+    assert (home / "config.yaml").read_text() == before
+    assert a.add_sip_line("desk", "192.0.2.10") == "desk-2"  # a trunk's id is not an address: only the id moves on
+    cfg = load_config(home / "config.yaml")
+    assert cfg.lines["agent"].aor == "sip:agent@192.0.2.10" and cfg.lines["desk-2"].aor == "sip:desk@192.0.2.10"
+    (home / "config.yaml").write_text(before.replace("lines:", "lines:\n  old: {kind: sip, aor: 'sip:front@192.0.2.10', "
+                                                     "accept_invites_from: lan}"))
+    with pytest.raises(ActionError, match="^sip:front@192.0.2.10 is already line old; pick another name$"):
+        a.add_sip_line("front", "192.0.2.10")  # a line without `user` is known by its address
+    before = raw(home)
     with pytest.raises(ActionError):
         a.add_sip_line("desk", "not a host")
-    assert (home / "config.yaml").read_text() == before
+    assert raw(home) == before
 
 
 def test_add_trunk_line(home):
@@ -478,6 +537,24 @@ def test_check_lines_reads_a_running_daemon(home, monkeypatch):
         ("old", "unregistered", "0 OK")]
     (home / "state.json").unlink()
     assert make(home).check_lines() == [("lines", "failed", "ai-phone is running but has not written its status yet")]
+
+
+def test_check_lines_when_the_control_socket_is_unsafe(home, monkeypatch):
+    def unsafe():
+        raise RuntimeError("/private/tmp/ai-phone-501 is a symlink; refusing to place the control socket there")
+
+    monkeypatch.setattr(act.paths, "socket_path", unsafe)
+    monkeypatch.setattr(act.subprocess, "Popen", None)
+    assert make(home).check_lines() == [("lines", "failed", "/private/tmp/ai-phone-501 is a symlink; refusing to place "
+                                                            "the control socket there")]
+
+
+def test_check_lines_when_ai_phone_cannot_start(home, monkeypatch):
+    def missing(*a, **k):
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(act.subprocess, "Popen", missing)
+    assert make(home).check_lines() == [("lines", "failed", "could not start ai-phone: No such file or directory")]
 
 
 def test_check_lines_without_the_sip_library(home, monkeypatch):

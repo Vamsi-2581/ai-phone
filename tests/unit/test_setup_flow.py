@@ -32,9 +32,18 @@ class Seq:
         self.items = list(items)
 
 
+class ScriptError(BaseException):
+    """A script that does not match the flow. A BaseException, so flow.run's own catch-all cannot swallow it."""
+
+
+def expect(ok, message):
+    if not ok:
+        raise ScriptError(message)
+
+
 class ScriptedUI(BaseUI):
     """Answers are (question substring, answer) pairs, consumed in order. An answer is an option label (choose),
-    a list of strings (ask; "" takes the default), "<default>", "<back>" or "<quit>"."""
+    a list of strings (ask; "" takes the default), "<default>" (Enter), "<back>" or "<quit>"."""
 
     def __init__(self, answers):
         super().__init__()
@@ -53,11 +62,11 @@ class ScriptedUI(BaseUI):
     def _answer(self, page, back=True):
         self.next_question()
         self.pages.append(page)
-        assert self.answers, f"no answer left for {page.question!r}"
+        expect(self.answers, f"no answer left for {page.question!r}")
         want, answer = self.answers.pop(0)
-        assert want in page.question, f"expected a question with {want!r}, got {page.question!r}"
+        expect(want in page.question, f"expected a question with {want!r}, got {page.question!r}")
         if answer == "<back>":
-            assert back, f"{page.question!r} has no Back"
+            expect(back, f"{page.question!r} has no Back")
             raise self.back()
         if answer == "<quit>":
             raise Cancel()
@@ -67,20 +76,23 @@ class ScriptedUI(BaseUI):
         self.menus.append((page.question, options, default, back))
         answer = self._answer(page, back)
         if answer == "<default>":
+            if default == len(options):  # Enter on a menu whose default is Back
+                expect(back, f"{page.question!r} defaults to a Back it does not show")
+                raise self.back()
             return default
         labels = [o.label for o in options]
-        assert answer in labels, f"{answer!r} is not one of {labels} on {page.question!r}"
+        expect(answer in labels, f"{answer!r} is not one of {labels} on {page.question!r}")
         return labels.index(answer)
 
     def ask(self, page, fields):
         self.fields.extend(fields)
         answer = self._answer(page)
-        assert len(answer) == len(fields)
+        expect(isinstance(answer, list) and len(answer) == len(fields), f"{page.question!r} needs {len(fields)} answers")
         values = []
-        for typed, f in zip(answer, fields):
+        for typed, f in zip(answer, fields, strict=True):
             value = typed or f.default
             error = f.validate(value) if f.validate else None
-            assert error is None, f"{f.label}={value!r}: {error}"
+            expect(error is None, f"{f.label}={value!r}: {error}")
             values.append(value)
         return values
 
@@ -227,6 +239,14 @@ def page_text(page: Page) -> str:
     return repr(page)
 
 
+def drive(ui, actions):
+    """flow.run, and the whole script was used; an unexpected error (Outcome 3) fails the test with its summary."""
+    outcome = flow.run(ui, actions)
+    assert outcome.code != 3, outcome.summary
+    assert not ui.answers, f"unused answers: {ui.answers}"
+    return outcome
+
+
 @pytest.fixture(autouse=True)
 def default_home(monkeypatch):
     """The flow only shows paths (the fake actions write nothing), so the default home is safe and gives `~` paths."""
@@ -253,7 +273,7 @@ def test_new_setup_local_brain_sip_line_default_voice():
         FINISH,
     ])
     actions = FakeActions()
-    outcome = flow.run(ui, actions)
+    outcome = drive(ui, actions)
     assert outcome.code == 0 and ui.closed and not ui.answers
     assert ui.steps == [WELCOME, BRAIN, LINE, VOICE, CALLERS, CHECK, DONE]
     _question, options, default, _back = ui.menu("Which model size?")
@@ -282,7 +302,7 @@ def test_new_setup_local_brain_sip_line_default_voice():
 
 def test_welcome_shows_the_machine_checks():
     ui = ScriptedUI([("Give your AI", "Cancel")])
-    outcome = flow.run(ui, FakeActions(memory=8, sip_library=False, missing=["a/b"]))
+    outcome = drive(ui, FakeActions(memory=8, sip_library=False, missing=["a/b"]))
     assert outcome.code == 1
     assert outcome.summary == "Setup cancelled. What earlier steps saved is kept; nothing else was changed."
     page = ui.pages[0]
@@ -297,7 +317,7 @@ def test_welcome_shows_the_machine_checks():
     assert [(o.label, o.hint) for o in ui.menus[0][1]] == [("Continue", ""), ("Cancel", "exit setup, nothing is saved")]
 
     ui = ScriptedUI([("Give your AI", "Cancel")])
-    flow.run(ui, FakeActions(memory=36, exists=True))
+    drive(ui, FakeActions(memory=36, exists=True))
     assert ui.pages[0].checks == [
         Check("SIP library", "built", True),
         Check("Memory", "36 GB · 9B model recommended", True),
@@ -317,7 +337,7 @@ def test_endpoint_brain_retries_after_a_failed_test():
         ("How should people reach your agent?", "<quit>"),
     ])
     actions = FakeActions(test_endpoint=Seq(ActionError("could not reach 127.0.0.1: ConnectError"), "OK"))
-    assert flow.run(ui, actions).code == 1
+    assert drive(ui, actions).code == 1
     first, _busy, second, _busy2 = ui.questions("Your endpoint")
     assert first.error == "" and second.error == "could not reach 127.0.0.1: ConnectError"
     assert ui.labels == ["Sending one short test request to 127.0.0.1…"] * 2
@@ -339,7 +359,7 @@ def test_endpoint_brain_keeps_the_saved_key_when_left_empty():
     ])
     actions = FakeActions(exists=True)
     actions.cur.brain_kind, actions.cur.model, actions.cur.brain_key_saved = "openai_compatible", "qwen", True
-    assert flow.run(ui, actions).code == 1
+    assert drive(ui, actions).code == 1
     assert ui.menus[1][2] == 1  # the current brain is the default
     assert ui.fields[2].placeholder == "leave empty to keep the saved key"
     assert actions.args("test_endpoint") == [("https://api.example.com/v1", "qwen", None)]
@@ -347,19 +367,36 @@ def test_endpoint_brain_keeps_the_saved_key_when_left_empty():
     assert ui.labels[0] == "Sending one short test request to api.example.com…"
 
 
-def test_endpoint_brain_that_does_not_validate_is_asked_again():
+def test_endpoint_brain_that_cannot_be_saved_is_asked_again():
     ui = ScriptedUI([
         ("Give your AI", "Change the brain"),
         ("Where should your agent think?", "My own endpoint"),
-        ("Your endpoint", ["http://203.0.113.5/v1", "qwen", ""]),
-        ("Your endpoint", ["https://203.0.113.5/v1", "", ""]),
+        ("Your endpoint", ["https://203.0.113.5/v1", "qwen", ""]),
+        ("Your endpoint", ["https://203.0.113.6/v1", "", ""]),
         ("A few things need attention", "<quit>"),
     ])
-    https = "config.brain.base_url: a brain that is not on this machine must use https"
-    actions = FakeActions(exists=True, save_brain_endpoint=Seq(ActionError(https), None))
-    flow.run(ui, actions)
-    assert ui.questions("Your endpoint")[2].error == https
-    assert actions.args("save_brain_endpoint")[-1] == ("https://203.0.113.5/v1", "qwen", None)
+    broken = "config.lines.agent.aor: expected sip:user@host[:port]"
+    actions = FakeActions(exists=True, save_brain_endpoint=Seq(ActionError(broken), None))
+    drive(ui, actions)
+    assert ui.questions("Your endpoint")[2].error == broken
+    assert actions.args("save_brain_endpoint")[-1] == ("https://203.0.113.6/v1", "qwen", None)
+
+
+def test_a_config_that_does_not_load_is_shown_where_the_answer_is_saved():
+    broken = "config.lines.agent.aor: expected sip:user@host[:port]"
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "On this Mac"),
+        ("Which model size?", "Qwen 9B"),
+        ("Which model size?", "<default>"),
+        ("A few things need attention", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, save_brain_local=Seq(ActionError(broken), None))
+    drive(ui, actions)
+    first, second = ui.questions("Which model size?")
+    assert first.error == "" and second.error == broken
+    assert ui.menus[-2][2] == 1  # the size that was picked stays picked
+    assert actions.args("save_brain_local") == [("t9",), ("t9",)]
 
 
 def add_a_line(carrier="Twilio"):
@@ -376,7 +413,7 @@ def test_twilio_new_number_buys_only_after_confirmation():
     ]
     ui = ScriptedUI([
         *add_a_line(), *choose_a_number,
-        ("Buy +15550100001 for $1.15/month?", "<back>"),
+        ("Buy +15550100001 for $1.15/month?", "<default>"),  # Enter goes back: it never buys
         ("How should people reach your agent?", "A phone number"), ("Which carrier?", "Twilio"), *choose_a_number,
         ("Buy +15550100001 for $1.15/month?", "Buy +15550100001"),
         ("Also forward your own mobile to it?", "No"),
@@ -384,7 +421,7 @@ def test_twilio_new_number_buys_only_after_confirmation():
         FINISH,
     ])
     actions = FakeActions(exists=True, lines={}, check_lines=[("twilio", "registered", "")])
-    outcome = flow.run(ui, actions)
+    outcome = drive(ui, actions)
     assert outcome.code == 0
     assert ui.steps == [WELCOME, LINE, LINE, CHECK, DONE]
     assert actions.args("buy_number") == [("twilio", TWILIO, FOUND[0])]
@@ -395,12 +432,13 @@ def test_twilio_new_number_buys_only_after_confirmation():
     assert [(f.label, f.secret, f.placeholder) for f in ui.fields[:2]] == [("Account SID", True, "AC…"), ("Auth Token", True, "32 characters")]
     assert ui.questions("A new number or one")[0].checks == [Check("Twilio key", "works · 2 numbers on this account", True)]
     assert [(o.label, o.hint) for o in ui.menu("A new number or one")[1]] == [
-        ("A new number", "search and buy one"), ("One I already have", "2 on this account")]
+        ("A new number", "search and buy one"), ("One I already have", "2 not yet connected")]
     assert [(o.label, o.hint) for o in ui.menu("Pick a number")[1]] == [
         ("+15550100001", "$1.15/month"), ("+15550100002", "$1.15/month · documents required")]
     confirm = ui.questions("Buy +15550100001")[0]
     assert confirm.detail == "Twilio bills your account every month until you remove the line (ai-phone lines remove)."
     assert [(o.label, o.hint) for o in ui.menu("Buy +15550100001")[1]] == [("Buy +15550100001", "$1.15/month")]
+    assert ui.menu("Buy +15550100001")[2:] == (1, True)  # the default is Back
     assert ui.labels[-4:-2] == ["Looking for numbers…", "Buying +15550100001 and connecting it…"]
     assert ui.questions("Setting up +15550100001")
     assert all("tokSECRET" not in page_text(p) and "ACsid" not in page_text(p) for p in ui.pages)
@@ -417,7 +455,7 @@ def test_no_numbers_found_asks_for_another_area():
         ("Pick a number", "<quit>"),
     ])
     actions = FakeActions(exists=True, search_numbers=Seq([], FOUND))
-    flow.run(ui, actions)
+    drive(ui, actions)
     first, _, second, _ = ui.questions("Where should the number be?")
     assert second.error == "No numbers found there. Try another area code, or leave it empty."
     assert actions.args("search_numbers") == [("twilio", TWILIO, "GB", "999"), ("twilio", TWILIO, "GB", None)]
@@ -439,12 +477,13 @@ def test_telnyx_existing_number_and_forward():
     ])
     saved = {"TELNYX_API_KEY": "KEYsaved"}
     actions = FakeActions(exists=True, saved_keys=saved)
-    assert flow.run(ui, actions).code == 0
+    assert drive(ui, actions).code == 0
     assert not ui.questions("credentials")
     assert ui.questions("Use the saved Telnyx key?")[0].detail == "It is in ~/.ai-phone/secrets.env."
     assert actions.args("attach_number") == [("telnyx", saved, OWNED[1])]
     assert not actions.args("buy_number")
     assert [(o.label, o.hint) for o in ui.menu("Connect +15550100008")[1]] == [("Connect +15550100008", "free")]
+    assert ui.menu("Connect +15550100008")[2:] == (1, True)  # the default is Back
     assert ui.labels[:2] == ["Checking your Telnyx account…", "Connecting +15550100008…"]
     assert actions.args("forward") == [("telnyx", "+447700900123", "busy")]
     codes = ui.questions("Dial this on your mobile")[0]
@@ -466,7 +505,7 @@ def test_back_in_the_forward_questions_never_returns_to_the_purchase():
         ("Everything works", "<quit>"),
     ])
     actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"})
-    flow.run(ui, actions)
+    drive(ui, actions)
     assert len(actions.args("attach_number")) == 1 and not actions.args("forward")
     assert ui.menu("Also forward")[3] is False  # the number is connected: there is no going back to it
 
@@ -481,11 +520,12 @@ def test_no_owned_numbers_offers_to_buy_one():
         ("Pick a number", "<quit>"),
     ])
     actions = FakeActions(exists=True, owned_numbers=[])
-    flow.run(ui, actions)
+    drive(ui, actions)
     assert ui.questions("No numbers on this Telnyx account")[0].detail == \
         "Buy one instead, or add a number in the carrier's console and run setup again."
     assert ui.questions("A new number or one")[0].checks == [Check("Telnyx key", "works · 0 numbers on this account", True)]
     assert [(f.label, f.placeholder) for f in ui.fields[:1]] == [("API key", "KEY…")]
+    assert ui.menu("A new number or one")[1][1].hint == "none on this account"
 
 
 def test_numbers_already_connected_are_left_out():
@@ -499,9 +539,10 @@ def test_numbers_already_connected_are_left_out():
     ])
     actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"},
                           lines={"telnyx": {"kind": "trunk", "number": "+15550100007"}, "agent": SIP_LINE})
-    flow.run(ui, actions)
+    drive(ui, actions)
     assert [o.label for o in ui.menu("Which number?")[1]] == ["+15550100008"]
     assert ui.questions("A new number or one")[0].checks == [Check("Telnyx key", "works · 2 numbers on this account", True)]
+    assert ui.menu("A new number or one")[1][1].hint == "1 not yet connected"
 
     ui = ScriptedUI([
         *add_a_line("Telnyx"),
@@ -513,11 +554,34 @@ def test_numbers_already_connected_are_left_out():
     ])
     lines = {"telnyx": {"kind": "trunk", "number": "+15550100007"}, "telnyx-2": {"kind": "trunk", "number": "+15550100008"}}
     actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}, lines=lines)
-    flow.run(ui, actions)
+    drive(ui, actions)
     page = ui.questions("No other numbers")[0]
     assert page.detail == "Buy one instead, or add a number in the carrier's console and run setup again."
     assert [o.label for o in ui.menu("No other numbers")[1]] == ["Buy a new number"]
+    assert ui.menu("A new number or one")[1][1].hint == "none left to connect"
     assert not actions.args("attach_number")
+
+
+def test_a_forward_that_cannot_be_saved_is_asked_again():
+    broken = "config.yaml is not valid YAML; fix it or move it away, then run setup again"
+    ui = ScriptedUI([
+        *add_a_line("Telnyx"),
+        ("Use the saved Telnyx key?", "Use the saved key"),
+        ("A new number or one you already have?", "One I already have"),
+        ("Which number?", "+15550100007"),
+        ("Connect +15550100007 to ai-phone?", "Connect +15550100007"),
+        ("Also forward your own mobile to it?", "Yes"),
+        ("Your mobile number", ["+447700900123"]),
+        ("When should calls go to your agent?", "All calls"),
+        ("Also forward your own mobile to it?", "No"),
+        ("Everything works", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}, forward=ActionError(broken))
+    drive(ui, actions)
+    first, second = ui.questions("Also forward")
+    assert first.error == "" and second.error == broken
+    assert actions.args("forward") == [("telnyx", "+447700900123", "all")]
+    assert not ui.questions("Dial this")
 
 
 def test_bad_key_is_asked_again_with_the_error():
@@ -528,7 +592,7 @@ def test_bad_key_is_asked_again_with_the_error():
         ("A new number or one you already have?", "<quit>"),
     ])
     actions = FakeActions(exists=True, owned_numbers=Seq(ActionError("That key did not work: 401 Unauthorized"), OWNED))
-    assert flow.run(ui, actions).code == 1
+    assert drive(ui, actions).code == 1
     first, _busy, second, _busy2 = ui.questions("Your Telnyx credentials")
     assert first.error == "" and second.error == "That key did not work: 401 Unauthorized"
     assert actions.args("owned_numbers") == [("telnyx", {"TELNYX_API_KEY": "KEYbad"}), ("telnyx", {"TELNYX_API_KEY": "KEYgood"})]
@@ -545,7 +609,7 @@ def test_a_saved_key_that_fails_asks_for_a_new_one():
     old = {"TWILIO_ACCOUNT_SID": "ACold", "TWILIO_AUTH_TOKEN": "old"}
     actions = FakeActions(exists=True, saved_keys=old,
                           owned_numbers=Seq(ActionError("That key did not work: 401 Unauthorized"), OWNED))
-    flow.run(ui, actions)
+    drive(ui, actions)
     assert ui.questions("Your Twilio credentials")[0].error == "That key did not work: 401 Unauthorized"
     assert actions.args("owned_numbers") == [("twilio", old), ("twilio", TWILIO)]
 
@@ -558,7 +622,7 @@ def test_enter_a_different_key_asks_for_it():
         ("A new number or one you already have?", "<quit>"),
     ])
     actions = FakeActions(exists=True, saved_keys={"TWILIO_ACCOUNT_SID": "ACold", "TWILIO_AUTH_TOKEN": "old"})
-    flow.run(ui, actions)
+    drive(ui, actions)
     assert actions.args("owned_numbers") == [("twilio", TWILIO)]
 
 
@@ -577,7 +641,7 @@ def test_pending_number_shows_the_messages_and_skips_forwarding():
     ])
     actions = FakeActions(exists=True, buy_number=LineResult("twilio", 2, messages),
                           check_lines=[("twilio", "registering", "")])
-    assert flow.run(ui, actions).code == 0
+    assert drive(ui, actions).code == 0
     pending = ui.questions("The number is not ready yet")[0]
     assert pending.body == "\n".join(messages)
     assert ui.menu("The number is not ready yet")[1][0].label == "Continue"
@@ -597,7 +661,7 @@ def test_failed_number_says_something_went_wrong():
         ("A few things need attention", "<quit>"),
     ])
     actions = FakeActions(exists=True, buy_number=Seq(ActionError("could not save the key: disk full")))
-    flow.run(ui, actions)
+    drive(ui, actions)
     assert ui.questions("Something went wrong")[0].body == "could not save the key: disk full"
 
 
@@ -614,7 +678,7 @@ def test_own_trunk():
     ])
     bad = "config.lines.trunk.registrar: expected sip:host[:port][;transport=…]"
     actions = FakeActions(exists=True, add_trunk_line=Seq(ActionError(bad), "trunk"))
-    assert flow.run(ui, actions).code == 0
+    assert drive(ui, actions).code == 0
     assert actions.args("add_trunk_line") == [("sip:sip.example.com", "alex1234", "pwSECRET", "+15550100000", "tls"),
                                               ("sip:sip.example.com", "alex1234", "pwSECRET2", "+15550100000", "tls")]
     retry = ui.questions("Your SIP trunk")[1]
@@ -625,7 +689,21 @@ def test_own_trunk():
     assert all("pwSECRET" not in page_text(p) for p in ui.pages)
 
 
+def test_own_trunk_keeps_sips_and_the_password_as_typed():
+    ui = ScriptedUI([
+        ("Give your AI", "Add a line"),
+        ("How should people reach your agent?", "My own SIP trunk"),
+        ("Your SIP trunk", ["  sips:sip.example.com ", " alex1234 ", "  pw SECRET  ", " +15550100000 "]),
+        ("Which transport?", "TLS"),
+        ("Everything works", "<quit>"),
+    ])
+    actions = FakeActions(exists=True)
+    drive(ui, actions)
+    assert actions.args("add_trunk_line") == [("sips:sip.example.com", "alex1234", "  pw SECRET  ", "+15550100000", "tls")]
+
+
 def test_sip_address_name_taken_is_asked_again():
+    taken = "sip:agent@192.0.2.10 is already line agent; pick another name"
     ui = ScriptedUI([
         ("Give your AI", "Add a line"),
         ("How should people reach your agent?", "A SIP address"),
@@ -633,12 +711,26 @@ def test_sip_address_name_taken_is_asked_again():
         ("Name your SIP address", ["desk", ""]),
         ("Everything works", "<quit>"),
     ])
-    actions = FakeActions(exists=True, add_sip_line=Seq(ActionError("config.lines.agent.aor: expected sip:user@host[:port]"), "desk"))
-    flow.run(ui, actions)
+    actions = FakeActions(exists=True, add_sip_line=Seq(ActionError(taken), "desk"))
+    drive(ui, actions)
     assert actions.args("add_sip_line") == [("agent", "192.0.2.10"), ("desk", "192.0.2.10")]
-    assert ui.questions("Name your SIP address")[1].error == "config.lines.agent.aor: expected sip:user@host[:port]"
+    assert ui.questions("Name your SIP address")[1].error == taken
     assert ui.questions("Name your SIP address")[0].detail == \
         "Softphones and other agents call sip:<name>@<this Mac>. Free; no carrier."
+
+
+def test_sip_address_offers_a_free_name():
+    ui = ScriptedUI([
+        ("Give your AI", "Add a line"),
+        ("How should people reach your agent?", "A SIP address"),
+        ("Name your SIP address", ["", ""]),
+        ("Everything works", "<quit>"),
+    ])
+    lines = {"agent": SIP_LINE, "agent-2": {"kind": "trunk", "number": "+15550100001"},
+             "desk": {"kind": "sip", "aor": "sip:agent-3@192.0.2.10"}}
+    actions = FakeActions(exists=True, lines=lines)
+    drive(ui, actions)
+    assert actions.args("add_sip_line") == [("agent-4", "192.0.2.10")]
 
 
 def test_validators():
@@ -650,6 +742,11 @@ def test_validators():
     assert flow.sip_name("a.b") and flow.sip_name("x" * 33)
     assert flow.host("192.0.2.10") is None and flow.host("mac.example.com") is None and flow.host("my mac")
     assert flow.url("https://api.example.com/v1") is None and flow.url("api.example.com")
+    for local in ("http://127.0.0.1:1234/v1", "http://localhost:8080/v1", "http://[::1]:8080/v1"):
+        assert flow.url(local) is None
+    assert flow.url("http://203.0.113.5/v1") == flow.url("http://api.example.com/v1") == \
+        "Use https:// for a server that is not on this Mac."
+    assert flow.url("https://203.0.113.5/v1") is None and flow.url("http://") and flow.url("https://[bad")
     assert flow.speed("0.9") is None and flow.speed("2") is None
     assert flow.speed("2.5") == flow.speed("fast") == flow.speed("nan") == "Use a number from 0.5 to 2.0."
     assert flow.count("0") is None and flow.count("20") is None and flow.count("-1") and flow.count("1.5")
@@ -677,7 +774,7 @@ def test_back_at_the_first_question_goes_to_the_previous_step():
         ("How should your agent sound?", "<quit>"),
     ])
     actions = FakeActions()
-    assert flow.run(ui, actions).code == 1
+    assert drive(ui, actions).code == 1
     assert ui.steps == [WELCOME, BRAIN, LINE, BRAIN, LINE, VOICE]
     assert actions.args("save_brain_local") == [("t9",), ("t4",)]
     assert ui.menus[-3][2] == 1  # the size menu now defaults to what was saved
@@ -693,7 +790,7 @@ def test_back_later_in_a_step_restarts_it():
         ("How should people reach your agent?", "<quit>"),
     ])
     actions = FakeActions()
-    flow.run(ui, actions)
+    drive(ui, actions)
     assert ui.steps == [WELCOME, BRAIN, BRAIN, LINE]
     assert actions.changes() == ["save_brain_local"]
 
@@ -705,7 +802,7 @@ def test_back_from_the_first_step_returns_to_welcome():
         WELCOME_NEW,
         ("Where should your agent think?", "<quit>"),
     ])
-    assert flow.run(ui, FakeActions()).code == 1
+    assert drive(ui, FakeActions()).code == 1
     assert ui.steps == [WELCOME, BRAIN, WELCOME, BRAIN]
 
 
@@ -716,7 +813,7 @@ def test_back_from_the_only_step_of_a_change_returns_to_welcome():
         ("Give your AI", "Cancel"),
     ])
     actions = FakeActions(exists=True)
-    assert flow.run(ui, actions).code == 1
+    assert drive(ui, actions).code == 1
     assert ui.steps == [WELCOME, CALLERS, WELCOME]
     assert not actions.changes()
 
@@ -731,7 +828,7 @@ def test_cancel_keeps_finished_steps_only():
         ("How should your agent sound?", "<quit>"),
     ])
     actions = FakeActions()
-    outcome = flow.run(ui, actions)
+    outcome = drive(ui, actions)
     assert outcome.code == 1 and ui.closed
     assert "Setup cancelled" in outcome.summary
     assert actions.changes() == ["save_brain_local", "add_sip_line"]
@@ -745,7 +842,7 @@ def test_leaving_on_the_done_page_still_finishes():
         ("You're set up", "<quit>"),
     ])
     actions = FakeActions(exists=True)
-    outcome = flow.run(ui, actions)
+    outcome = drive(ui, actions)
     assert outcome.code == 0 and "uv run ai-phone run" in outcome.summary
     assert actions.args("save_callers") == [(GREETING, INSTRUCTIONS, 0)]
     assert ui.questions("A few things")[0].checks[2] == Check("Lines", "none yet · run setup again to add one", None)
@@ -761,7 +858,7 @@ def test_callers_that_do_not_validate_are_asked_again():
     ])
     too_long = "config.inbound.greeting: 1 to 500 characters"
     actions = FakeActions(exists=True, save_callers=Seq(ActionError(too_long), None))
-    flow.run(ui, actions)
+    drive(ui, actions)
     assert ui.questions("What should callers hear?")[1].error == too_long
     assert actions.args("save_callers")[-1] == ("Hello there.", "Take a message.", 5)
     assert [f.placeholder for f in ui.fields[:3]] == ["", "", "0 means no limit"]
@@ -781,7 +878,7 @@ def test_existing_config_change_the_voice_only():
     ])
     actions = FakeActions(exists=True, lines={"agent": SIP_LINE},
                           play_sample=Seq(ActionError("could not play the sample: afplay not found"), None, None))
-    assert flow.run(ui, actions).code == 0
+    assert drive(ui, actions).code == 0
     assert ui.steps == [WELCOME, VOICE, CHECK, DONE]
     assert actions.changes() == ["save_voice"]
     assert actions.args("save_voice") == [("bm_george", 0.9)]
@@ -809,7 +906,7 @@ def test_no_voices_offers_the_speech_model_download():
         ("Everything works", "<quit>"),
     ])
     actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, voices=Seq([], ["af_heart"], ["af_heart"]))
-    flow.run(ui, actions)
+    drive(ui, actions)
     first = ui.pages[1]
     assert first.detail == "The speech model is not downloaded yet, so there are no voices to pick from."
     assert [(o.label, o.hint) for o in ui.menus[1][1]] == [
@@ -826,23 +923,71 @@ def test_no_voices_keep_the_default():
         ("Everything works", "<quit>"),
     ])
     actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, voices=[])
-    flow.run(ui, actions)
+    drive(ui, actions)
     assert actions.args("save_voice") == [("af_heart", 1.0)]
     assert not actions.args("pull_voice_model")
     rows = ui.questions("Everything works")[0].checks
     assert [r.label for r in rows] == ["Models", "Config", "Line agent"]  # no speech model: no voice row
 
 
-def test_no_voices_download_failure_keeps_the_default():
+def test_no_voices_download_failure_is_shown_on_the_voice_page():
+    failed = "could not download mlx-community/Kokoro-82M-bf16: OSError"
+    broken = "config.yaml is not valid YAML; fix it or move it away, then run setup again"
     ui = ScriptedUI([
         ("Give your AI", "Change the voice"),
         ("How should your agent sound?", "Download it now"),
+        ("How should your agent sound?", "Keep the default voice"),
+        ("How should your agent sound?", "Keep the default voice"),
         ("Everything works", "<quit>"),
     ])
-    actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, voices=[],
-                          pull_voice_model=ActionError("could not download mlx-community/Kokoro-82M-bf16: OSError"))
-    flow.run(ui, actions)
-    assert actions.args("save_voice") == [("af_heart", 1.0)]
+    actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, voices=[], pull_voice_model=ActionError(failed),
+                          save_voice=Seq(ActionError(broken), None))
+    drive(ui, actions)
+    pages = [p for p in ui.pages if p.question == "How should your agent sound?"]
+    assert [p.error for p in pages] == ["", failed, broken]
+    assert actions.args("save_voice") == [("af_heart", 1.0)] * 2
+
+
+def test_no_voices_after_the_download_says_so():
+    ui = ScriptedUI([
+        ("Give your AI", "Change the voice"),
+        ("How should your agent sound?", "Download it now"),
+        ("How should your agent sound?", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, voices=[])
+    drive(ui, actions)
+    pages = [p for p in ui.pages if p.question == "How should your agent sound?"]
+    assert pages[1].error == "The speech model downloaded, but it has no voices to pick from. Try the download again."
+    assert not actions.args("save_voice")
+
+
+def test_a_voice_that_cannot_be_saved_is_asked_again():
+    broken = "config.yaml is not valid YAML; fix it or move it away, then run setup again"
+    ui = ScriptedUI([
+        ("Give your AI", "Change the voice"),
+        ("How should your agent sound?", "<default>"),
+        ("American · female", "<default>"),
+        ("Heart", "Use this voice"),
+        ("How fast should it talk?", ["1.2"]),
+        ("How fast should it talk?", [""]),
+        ("Everything works", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, save_voice=Seq(ActionError(broken), None))
+    drive(ui, actions)
+    first, second = ui.questions("How fast")
+    assert first.error == "" and second.error == broken
+    assert [f.default for f in ui.fields] == ["1.0", "1.2"]
+    assert actions.args("save_voice") == [("af_heart", 1.2)] * 2
+
+
+def test_unexpected_errors_stop_setup_without_a_traceback():
+    broken = "config.yaml is not valid YAML; fix it or move it away, then run setup again"
+    ui = ScriptedUI([("Give your AI", "Change what callers hear"), ("What should callers hear?", ["", "", ""])])
+    outcome = flow.run(ui, FakeActions(exists=True, check_config=ActionError(broken)))
+    assert (outcome.code, outcome.summary) == (3, f"Setup stopped: {broken}") and ui.closed
+    ui = ScriptedUI([("Give your AI", "Change the voice")])
+    outcome = flow.run(ui, FakeActions(exists=True, voices=KeyError("af_secret_detail")))
+    assert (outcome.code, outcome.summary) == (3, "Setup stopped: KeyError") and ui.closed
 
 
 def test_check_offers_the_download_and_reports():
@@ -860,7 +1005,7 @@ def test_check_offers_the_download_and_reports():
     failed = "could not download mlx-community/Qwen3.5-4B-MLX-4bit: ConnectError"
     actions = FakeActions(exists=True, missing=["mlx-community/Qwen3.5-4B-MLX-4bit"], lines={"agent": SIP_LINE},
                           pull_models=Seq(None, ActionError(failed)))
-    assert flow.run(ui, actions).code == 0
+    assert drive(ui, actions).code == 0
     offer = ui.questions("Download the models now?")[0]
     assert offer.detail == ("About 4.3 GB into the Hugging Face cache (~/.cache/huggingface). "
                             "ai-phone needs them to answer calls.")
@@ -888,7 +1033,7 @@ def test_endpoint_brain_check_lines_and_voice_rows():
     actions = FakeActions(exists=True, lines=lines,
                           check_lines=[("main", "registered", ""), ("office", "degraded", "403 Forbidden")])
     actions.cur.brain_kind, actions.cur.base_url, actions.cur.model = "openai_compatible", "https://api.example.com/v1", "qwen"
-    outcome = flow.run(ui, actions)
+    outcome = drive(ui, actions)
     assert "Checking your lines… (up to 20 seconds)" in ui.labels and "Playing your agent's voice…" in ui.labels
     rows = ui.questions("A few things need attention")[0].checks
     assert rows == [Check("Models", "downloaded", True), Check("Config", "loads", True),
@@ -905,7 +1050,7 @@ def test_check_skips_lines_when_the_config_does_not_load():
     ])
     actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, check_config="config.lines.agent.aor: expected sip:user@host",
                           play_sample=ActionError("could not play the sample: no audio device"))
-    flow.run(ui, actions)
+    drive(ui, actions)
     rows = ui.questions("A few things need attention")[0].checks
     assert rows == [Check("Models", "downloaded", True), Check("Config", "config.lines.agent.aor: expected sip:user@host", False),
                     Check("Voice", "could not play the sample: no audio device", False)]
@@ -920,7 +1065,7 @@ def test_check_shows_a_skipped_row_without_the_sip_library():
     ])
     actions = FakeActions(exists=True, lines={"agent": SIP_LINE},
                           check_lines=[("lines", "skipped", "SIP library not built · run ./scripts/install.sh")])
-    flow.run(ui, actions)
+    drive(ui, actions)
     assert ui.questions("A few things")[0].checks[2] == \
         Check("Lines", "skipped · SIP library not built · run ./scripts/install.sh", None)
 

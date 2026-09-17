@@ -50,10 +50,9 @@ class PlainUI(BaseUI):
             print("  b) Back")
         retry = ("Answer with a number from the list, b to go back or q to quit." if back
                  else "Answer with a number from the list or q to quit.")
+        on_enter = "b" if default == len(options) else str(default + 1)  # a confirmation defaults to Back
         while True:
-            answer = _read(input, f"Choose [{default + 1}]: ").strip().lower()
-            if not answer:
-                return default
+            answer = _read(input, f"Choose [{on_enter}]: ").strip().lower() or on_enter  # Enter answers what [ ] shows
             if answer.isdecimal() and 1 <= int(answer) <= len(options):
                 return int(answer) - 1
             if answer == "b" and back:
@@ -74,7 +73,7 @@ class PlainUI(BaseUI):
                     value = _read(getpass.getpass, f"{f.label}{hint}: ")
                 else:
                     value = _read(input, f"{f.label}{hint}: ")
-                value = value.strip() or f.default
+                value = (value if f.secret else value.strip()) or f.default  # a password may start or end with a space
                 error = f.validate(value) if f.validate else None
                 if error is None:
                     values.append(value)
