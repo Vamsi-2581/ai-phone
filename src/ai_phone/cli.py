@@ -32,8 +32,10 @@ def main(argv=None) -> int:
     st.add_argument("--plain", action="store_true", help="numbered prompts instead of the full-screen wizard")
     st.set_defaults(func=_setup)
     a = p.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if a.cmd == "run":
+        # only the daemon logs at INFO: elsewhere httpx would print a line per Hub or carrier request over the command's own
+        # output. Other commands keep Python's default (warnings only, to the current stderr, which the wizard captures).
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         import os
         from ai_phone.daemon import Daemon  # models and PJSIP load only for `run`
         from ai_phone.secrets import load_secrets

@@ -1,5 +1,9 @@
+import contextlib
 import inspect
+import os
 import subprocess
+import threading
+import time
 import types
 
 import huggingface_hub
@@ -82,6 +86,15 @@ def test_bytes_on_disk_counts_the_repo_blobs(monkeypatch, tmp_path):
     assert models._bytes_on_disk(TTS) == 10
 
 
+def wait_for(cond, timeout=5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not cond():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.001)
+    return True
+
+
 def test_pull_downloads_each_repo_and_reports(monkeypatch, tmp_path):
     on_disk = {STT: 0, TTS: 0}
     calls, seen = [], []
@@ -89,15 +102,65 @@ def test_pull_downloads_each_repo_and_reports(monkeypatch, tmp_path):
     def fake(repo):
         calls.append(repo)
         on_disk[repo] += 50
+        # stay "downloading" until the watcher has reported the bytes so far
+        assert wait_for(lambda: (sum(on_disk.values()), 100) in seen)
 
     monkeypatch.setattr(models, "download_size", lambda repos: 100)
     monkeypatch.setattr(models, "_bytes_on_disk", lambda r: on_disk[r])
     monkeypatch.setattr(models, "_hub_root", lambda: tmp_path)
     plenty_of_disk(monkeypatch)
-    models.pull([STT, TTS], report=lambda done, total: seen.append((done, total)), download=fake, poll_sec=0.01)
+    models.pull([STT, TTS], report=lambda done, total: seen.append((done, total)), download=fake, poll_sec=0.005)
     assert calls == [STT, TTS]
-    assert seen[-1] == (100, 100)
+    assert (50, 100) in seen and seen[-1] == (100, 100)
     assert all(0 <= done <= total == 100 for done, total in seen)
+
+
+def test_progress_survives_a_failing_report_and_stays_within_the_total(monkeypatch, tmp_path):
+    on_disk = {STT: 0, TTS: 0}
+    seen, threads = [], set()
+
+    def report(done, total):
+        threads.add(threading.current_thread().name)
+        seen.append((done, total))
+        if len(seen) == 1:
+            raise RuntimeError("the screen went away for a moment")
+
+    def fake(repo):
+        on_disk[repo] += 80  # the cache also holds old blobs, so the bytes on disk pass the total
+        assert wait_for(lambda: len(seen) >= 2 and seen[-1] == (min(sum(on_disk.values()), 100), 100))
+
+    monkeypatch.setattr(models, "download_size", lambda repos: 100)
+    monkeypatch.setattr(models, "_bytes_on_disk", lambda r: on_disk[r])
+    monkeypatch.setattr(models, "_hub_root", lambda: tmp_path)
+    plenty_of_disk(monkeypatch)
+    models.pull([STT, TTS], report=report, download=fake, poll_sec=0.005)
+    assert (80, 100) in seen and seen[-1] == (100, 100)
+    assert all(done <= 100 for done, _ in seen)
+    assert "models-progress" in threads  # report runs on the watcher thread
+
+
+def test_bytes_on_disk_skips_a_blob_renamed_while_counting(monkeypatch, tmp_path):
+    monkeypatch.setattr(models, "_hub_root", lambda: tmp_path)
+    blobs = tmp_path / "models--mlx-community--Kokoro-82M-bf16" / "blobs"
+    blobs.mkdir(parents=True)
+    (blobs / "a").write_bytes(b"x" * 7)
+
+    class Renamed:
+        def is_file(self):
+            return True
+
+        def stat(self):
+            raise FileNotFoundError("b.incomplete")
+
+    real = os.scandir
+
+    @contextlib.contextmanager
+    def scandir(path):
+        with real(path) as entries:
+            yield [Renamed(), *entries]
+
+    monkeypatch.setattr(models.os, "scandir", scandir)
+    assert models._bytes_on_disk(TTS) == 7
 
 
 def test_pull_refuses_when_the_disk_is_too_small(monkeypatch, tmp_path):
@@ -121,14 +184,25 @@ def test_pull_wraps_download_errors(monkeypatch, tmp_path):
         models.pull([TTS], download=fake)
 
 
-def test_pull_uses_the_hub_by_default(monkeypatch, tmp_path):
+def test_pull_uses_the_hub_by_default_without_its_progress_bars(monkeypatch, tmp_path):
+    from huggingface_hub.utils import are_progress_bars_disabled
+
+    before = are_progress_bars_disabled()
     got = []
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo, **k: got.append(repo))
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo, **k: got.append((repo, are_progress_bars_disabled())))
     monkeypatch.setattr(models, "download_size", lambda repos: 0)
     monkeypatch.setattr(models, "_hub_root", lambda: tmp_path)
     plenty_of_disk(monkeypatch)
     models.pull([STT, TTS], poll_sec=0.01)
-    assert got == [STT, TTS]
+    assert got == [(STT, True), (TTS, True)]  # its own bars would draw over our progress line and the wizard
+    assert are_progress_bars_disabled() == before
+
+    def fail(repo, **k):
+        raise OSError("boom")
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fail)
+    with pytest.raises(ModelsError):
+        models.pull([STT])
+    assert are_progress_bars_disabled() == before
 
 
 def test_constants_match_the_backends():

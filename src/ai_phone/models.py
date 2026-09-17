@@ -2,6 +2,7 @@
 Weights live in the Hugging Face cache, where the backends load them from. The daemon never downloads."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import threading
@@ -58,7 +59,17 @@ def _hub_root() -> Path:
 
 def _bytes_on_disk(repo: str) -> int:
     blobs = _hub_root() / ("models--" + repo.replace("/", "--")) / "blobs"
-    return sum(f.stat().st_size for f in blobs.iterdir() if f.is_file()) if blobs.is_dir() else 0
+    total = 0
+    try:
+        with os.scandir(blobs) as entries:
+            for e in entries:
+                try:
+                    total += e.stat().st_size if e.is_file() else 0
+                except OSError:  # a part-file renamed (finished) between the listing and the stat
+                    pass
+    except OSError:  # no blobs folder yet
+        pass
+    return total
 
 
 def download_size(repos: list[str]) -> int | None:
@@ -72,7 +83,9 @@ def download_size(repos: list[str]) -> int | None:
 
 
 def pull(repos: list[str], report: Callable[[int, int], None] | None = None, download=None, poll_sec: float = 0.5) -> None:
-    """Download each repo into the Hugging Face cache, calling report(bytes done, bytes total) while it runs."""
+    """Download each repo into the Hugging Face cache, calling report(bytes done, bytes total) while it runs.
+    report is called from a background thread (a UI must hand the update to its own thread); total is 0 when unknown."""
+    from huggingface_hub.utils import are_progress_bars_disabled, disable_progress_bars, enable_progress_bars
     if download is None:
         from huggingface_hub import snapshot_download as download
     total = download_size(repos)
@@ -87,11 +100,17 @@ def pull(repos: list[str], report: Callable[[int, int], None] | None = None, dow
 
     def watch() -> None:
         while not stop.wait(poll_sec):
-            if report:
-                report(max(sum(_bytes_on_disk(r) for r in repos) - start, 0), total or 0)
+            try:
+                done = max(sum(_bytes_on_disk(r) for r in repos) - start, 0)
+                report(done if total is None else min(done, total), total or 0)  # old blobs can push done past total
+            except Exception:  # progress is best effort: one bad tick must not end the watcher
+                pass
 
+    bars_were_off = are_progress_bars_disabled()
+    disable_progress_bars()  # Hugging Face's own bars would draw over our progress line and the wizard
     watcher = threading.Thread(target=watch, daemon=True, name="models-progress")
-    watcher.start()
+    if report:
+        watcher.start()
     try:
         for repo in repos:
             try:
@@ -100,6 +119,9 @@ def pull(repos: list[str], report: Callable[[int, int], None] | None = None, dow
                 raise ModelsError(f"could not download {repo}: {type(e).__name__}: {str(e)[:160]}") from None
     finally:
         stop.set()
-        watcher.join()
+        if report:
+            watcher.join()
+        if not bars_were_off:
+            enable_progress_bars()
     if report:
         report(total or 0, total or 0)

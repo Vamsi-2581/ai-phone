@@ -1,3 +1,5 @@
+import contextlib
+import logging
 import sys
 import types
 
@@ -88,3 +90,60 @@ def test_run_follows_the_config_tier(home, monkeypatch, argv, config, tier):
     monkeypatch.setattr(asyncio, "run", lambda coro: coro.close())
     assert main(argv + ["--fake"]) == 0
     assert FakeDaemon.tiers == [tier]
+
+
+@contextlib.contextmanager
+def fresh_logging():
+    """Logging as a new process has it (no root handlers, root at WARNING); pytest's own handlers come back after."""
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    root.handlers.clear()
+    root.setLevel(logging.WARNING)
+    try:
+        yield root
+    finally:
+        root.handlers[:] = handlers
+        root.setLevel(level)
+
+
+class Seen(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def handled(root, logger, level) -> bool:
+    seen = Seen()
+    root.addHandler(seen)
+    try:
+        logging.getLogger(logger).log(level, 'HTTP Request: GET https://huggingface.co/api/models/x "HTTP/1.1 200 OK"')
+    finally:
+        root.removeHandler(seen)
+    return bool(seen.records)
+
+
+@pytest.mark.parametrize("argv", [["models", "pull"], ["setup", "--plain"]])
+def test_request_lines_do_not_flood_the_screen(home, monkeypatch, argv):
+    monkeypatch.setattr(models, "missing", lambda tier, brain: [])
+    monkeypatch.setitem(sys.modules, "ai_phone.setup", types.SimpleNamespace(run_setup=lambda plain: 0))
+    with fresh_logging() as root:
+        assert main(argv) == 0
+        assert not handled(root, "httpx", logging.INFO)  # one per Hub or carrier request
+        assert handled(root, "httpx", logging.WARNING)
+        assert root.handlers == []  # Python's own last-resort handler writes to the current stderr, which the wizard captures
+
+
+def test_run_still_logs_at_info(home, monkeypatch):
+    import asyncio
+
+    import ai_phone.daemon
+
+    (home / "config.yaml").write_text("")
+    monkeypatch.setattr(ai_phone.daemon, "Daemon", FakeDaemon)
+    monkeypatch.setattr(asyncio, "run", lambda coro: coro.close())
+    with fresh_logging() as root:
+        assert main(["run", "--fake"]) == 0
+        assert handled(root, "ai-phone", logging.INFO)
