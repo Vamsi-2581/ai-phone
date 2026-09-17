@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import queue
+import sys
 import threading
 from typing import Callable
 
@@ -13,6 +14,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Center, Vertical
+from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Input, ProgressBar, Rule, Static
 
@@ -21,6 +23,10 @@ from ai_phone.setup.ui import UI, BaseUI, Cancel, Option, Outcome, Page
 
 _BACK, _QUIT = object(), object()
 FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+UNCHECKABLE = "That value could not be checked."
+CANCELLED = "Setup cancelled."
+DOWNLOAD_LEFT = "Setup cancelled. The download stops now and picks up where it left off next time."
+SCREEN_CLOSED = "Setup stopped: the screen closed unexpectedly."
 
 
 class PageScreen(Screen):
@@ -119,20 +125,36 @@ class PageScreen(Screen):
         if self.spinning is None:
             self.spinning = self.set_interval(0.08, self._spin)
 
+    class Progress(Message):
+        """Posted from the downloader's thread: posting never blocks it, and a closed screen just drops it."""
+
+        def __init__(self, done: int, total: int):
+            super().__init__()
+            self.done, self.total = done, total
+
+    def on_page_screen_progress(self, message: Progress) -> None:
+        self.set_progress(message.done, message.total)
+
     def set_progress(self, done: int, total: int) -> None:
         if total:
             self.label = f"{self.busy}  {done / 1e9:.1f} of {total / 1e9:.1f} GB"
             self.query_one(ProgressBar).update(total=total, progress=done)
         self.query_one("#status", Static).update(self._spinner())
 
+    def _problem(self, i: int, value: str) -> str | None:
+        check = self.fields[i].validate
+        try:
+            return check(value) if check else None
+        except Exception:  # never let it reach Textual's crash report, which prints local values (a typed secret)
+            return UNCHECKABLE
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         inputs = list(self.query(Input))
         i = inputs.index(event.input)
         last = i == len(inputs) - 1
         # Enter checks its own field; on the last one, every field must be fine before the flow gets the values
-        for j in [i, *range(len(inputs))] if last else [i]:
-            check = self.fields[j].validate
-            problem = check(inputs[j].value) if check else None
+        for j in range(len(inputs)) if last else [i]:
+            problem = self._problem(j, inputs[j].value)
             if problem:
                 inputs[j].focus()
                 self.query_one("#status", Static).update(Text(problem, style=Style(color=look.RED)))
@@ -163,9 +185,14 @@ class PageScreen(Screen):
                 m.index = (m.index - 1) % len(m.options)
             elif event.key == "enter":
                 self.send(m.index)
-            elif event.character and event.character.isdigit() and 1 <= int(event.character) <= len(m.options):
-                m.index = int(event.character) - 1
+            elif self._digit(event.character) in range(1, len(m.options) + 1):
+                m.index = self._digit(event.character) - 1
                 self.send(m.index)
+
+    @staticmethod
+    def _digit(character: str | None) -> int:
+        """The digit a key types, or 0. isdecimal, not isdigit: "²" (a key on French keyboards) fails int()."""
+        return int(character) if character and len(character) == 1 and character.isdecimal() else 0
 
 
 class TextualUI(BaseUI):
@@ -187,6 +214,8 @@ class TextualUI(BaseUI):
         q: queue.Queue = queue.Queue()
         screen.reply = q.put
         self._show(screen)
+        if self.app.quit_requested:  # ctrl+c landed after the last answer, before this screen was up
+            raise Cancel()
         answer = q.get()
         if answer is _QUIT:
             raise Cancel()
@@ -220,7 +249,12 @@ class TextualUI(BaseUI):
     def progress(self, page, label, work):
         screen = PageScreen(page, busy=label, progress=True)
         self._show(screen)
-        return work(lambda done, total: self.app.call_from_thread(screen.set_progress, done, total))
+
+        def report(done: int, total: int) -> None:
+            if not self.app.quit_requested:  # after ctrl+c the download is left behind: nothing more to draw
+                screen.post_message(PageScreen.Progress(done, total))
+
+        return work(report)
 
 
 class SetupApp(App):
@@ -232,6 +266,7 @@ class SetupApp(App):
         # Under NO_COLOR Textual drops every colour only in ANSI mode; otherwise it redraws them in grey
         super().__init__(ansi_color=True if "NO_COLOR" in os.environ else None)
         self.flow_fn, self.outcome, self.quit_requested = flow_fn, None, False
+        self.left_download = False
 
     def on_mount(self) -> None:
         self.ui = TextualUI(self)
@@ -241,7 +276,7 @@ class SetupApp(App):
         try:
             self.outcome = self.flow_fn(self.ui)
         except Cancel:
-            self.outcome = Outcome(1, "Setup cancelled.")
+            self.outcome = Outcome(1, CANCELLED)
         except Exception as e:  # the flow's own errors are ActionErrors it already handled; this is a bug
             self.outcome = Outcome(3, f"setup stopped: {type(e).__name__}")
         finally:
@@ -264,10 +299,19 @@ class SetupApp(App):
         if isinstance(self.screen, PageScreen) and self.screen.reply is not None and not self.screen.busy:
             self.screen.send(_QUIT)
         else:
+            self.left_download = isinstance(self.screen, PageScreen) and self.screen.progress
             self.exit()
 
 
 def run_tui(flow_fn: Callable[[UI], Outcome]) -> Outcome:
     app = SetupApp(flow_fn)
-    app.run()
-    return app.outcome or Outcome(1, "Setup cancelled.")
+    app.run()  # returns once the terminal is restored
+    if app.left_download:
+        # huggingface_hub's download threads are joined at interpreter exit, which would wait for the whole
+        # download; the files so far stay in the cache and the next pull resumes from them
+        print(DOWNLOAD_LEFT, flush=True)
+        sys.stderr.flush()
+        os._exit(1)
+    if app.outcome is None and app.return_code:  # the app itself failed (Textual has printed what happened)
+        return Outcome(3, SCREEN_CLOSED)
+    return app.outcome or Outcome(1, CANCELLED)

@@ -63,6 +63,14 @@ def colour_at(app, row: int, col: int) -> str | None:
     return None
 
 
+def headless(autopilot=None):
+    """SetupApp run by run_tui without a terminal, driven by `autopilot`."""
+    class Headless(SetupApp):
+        def run(self, **kw):
+            return super().run(headless=True, auto_pilot=autopilot, **kw)
+    return Headless
+
+
 def showing(app, text: str):
     """A predicate: a question screen is up and shows `text`."""
     return lambda: isinstance(app.screen, PageScreen) and app.screen.is_mounted and text in screen_text(app)
@@ -160,6 +168,44 @@ async def test_the_default_option_starts_selected():
 
 
 @pytest.mark.asyncio
+async def test_a_digit_that_is_not_1_to_9_does_nothing():
+    got = {}
+
+    def flow(ui):
+        got["answer"] = ui.choose(LINE, OPTIONS)
+        return Outcome(0)
+
+    app = SetupApp(flow)
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "[3] Back"))
+        await pilot.press("²", "0", "4")  # ² is its own key on French keyboards; "²".isdigit() is True
+        await pilot.pause(0.1)
+        assert app.return_code is None and "answer" not in got and "▸ [1]" in screen_text(app)
+        await pilot.press("2")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert got["answer"] == 1
+
+
+@pytest.mark.asyncio
+async def test_back_can_be_the_default():
+    raised = []
+
+    def flow(ui):
+        try:
+            ui.choose(LINE, OPTIONS, default=len(OPTIONS))
+        except Back as e:
+            raised.append(e)
+        return Outcome(0)
+
+    app = SetupApp(flow)
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "▸ [3] Back"))
+        await pilot.press("enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert len(raised) == 1
+
+
+@pytest.mark.asyncio
 async def test_q_cancels():
     seen = []
 
@@ -183,8 +229,13 @@ async def test_q_cancels():
 @pytest.mark.asyncio
 async def test_form_hides_secrets_and_validates():
     got = {}
-    fields = [Field("Account SID", secret=True, placeholder="AC…"),
-              Field("Name", validate=lambda v: None if v == "agent" else "Use the name agent.")]
+    checked = []
+
+    def name(value):
+        checked.append(value)
+        return None if value == "agent" else "Use the name agent."
+
+    fields = [Field("Account SID", secret=True, placeholder="AC…"), Field("Name", validate=name)]
 
     def flow(ui):
         got["values"] = ui.ask(Page(2, "Your Twilio credentials", "Saved to ~/.ai-phone/secrets.env."), fields)
@@ -220,7 +271,35 @@ async def test_form_hides_secrets_and_validates():
         await wait_for(pilot, app, lambda: app.outcome is not None)
         seen.append(screen_text(app))
     assert got["values"] == ["ACsecret123", "agent"]
+    assert checked == ["bad", "agent"]  # once per Enter, even on the last field
     assert seen and not any("ACsecret123" in t or "secret123" in t for t in seen)
+
+
+@pytest.mark.asyncio
+async def test_a_validator_that_fails_cannot_take_the_screen_down():
+    got = {}
+
+    def fragile(value):
+        if value.startswith("AC"):
+            raise ValueError(f"cannot parse {value}")  # the value would be in a traceback's locals
+        return None
+
+    def flow(ui):
+        got["values"] = ui.ask(TWILIO, [Field("Account SID", secret=True, validate=fragile)])
+        return Outcome(0)
+
+    app = SetupApp(flow)
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "Account SID"))
+        await pilot.press(*"ACsecret789", "enter")
+        await wait_for(pilot, app, lambda: "That value could not be checked." in screen_text(app))
+        assert colour_of(app, "That value could not be checked.") == look.RED
+        assert app.return_code is None and "values" not in got and isinstance(app.focused, Input)
+        assert "secret789" not in screen_text(app)
+        app.focused.clear()
+        await pilot.press(*"sk", "enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert got["values"] == ["sk"]
 
 
 @pytest.mark.asyncio
@@ -364,8 +443,8 @@ async def test_welcome_shows_the_wordmark_when_wide_and_a_title_when_narrow():
     wide = await welcome_screen(104)
     assert "▀" in wide or "█" in wide
     assert "● Welcome ←" in wide and "○ Done" in wide
-    for part in ("Give your AI a phone number", "Picks a line, a brain and a voice", "SIP library", "not downloaded yet",
-                 "✓", "✗", "○"):
+    for part in ("Give your AI a phone number", "Picks a line, a brain and a voice", "SIP library",
+                 "not downloaded yet", "✓", "✗", "○"):
         assert part in wide
     assert "esc back" not in wide and "[3]" not in wide  # no Back on Welcome
 
@@ -438,6 +517,33 @@ async def test_ctrl_c_on_a_question_cancels_and_exits(key):
 
 
 @pytest.mark.asyncio
+async def test_ctrl_c_between_an_answer_and_the_next_question_still_cancels():
+    class LateQuit(SetupApp):
+        def show(self, screen):
+            if screen.page.question == "Second":
+                self.action_request_quit()  # lands while the answered first question is still up
+            return super().show(screen)
+
+    seen = []
+
+    def flow(ui):
+        ui.choose(Page(2, "First"), OPTIONS)
+        try:
+            ui.choose(Page(2, "Second"), OPTIONS)
+        except Cancel:
+            seen.append("cancel")
+            raise
+        return Outcome(0)
+
+    app = LateQuit(flow)
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "First"))
+        await pilot.press("enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert seen == ["cancel"] and app.outcome == Outcome(1, "Setup cancelled.")
+
+
+@pytest.mark.asyncio
 async def test_ctrl_c_while_working_leaves_at_once():
     release = threading.Event()
 
@@ -469,13 +575,68 @@ async def test_run_tui_returns_the_flow_outcome():
 
 
 def test_run_tui_reports_a_crash_without_its_message(monkeypatch):
-    class Headless(SetupApp):
-        def run(self, **kw):
-            return super().run(headless=True, **kw)
-
     def crash(ui):
         raise RuntimeError("token AC123 rejected")
 
-    monkeypatch.setattr(tui, "SetupApp", Headless)
+    def broken_screen(ui):  # a screen that cannot be drawn ends the app with an error
+        ui.choose(Page(1, "Where should your agent think?", checks=[Check("Memory", None, True)]), OPTIONS)
+        return Outcome(0)
+
+    monkeypatch.setattr(tui, "SetupApp", headless())
     assert run_tui(lambda ui: Outcome(0, "done")) == Outcome(0, "done")
     assert run_tui(crash) == Outcome(3, "setup stopped: RuntimeError")
+    assert run_tui(broken_screen) == Outcome(3, "Setup stopped: the screen closed unexpectedly.")
+
+
+def test_quitting_a_download_ends_the_process_without_waiting_for_it(monkeypatch, capsys):
+    go, finished = threading.Event(), threading.Event()
+    errors = []
+
+    def download(report):
+        report(1, 4)
+        go.wait(5)
+        try:
+            report(2, 4)  # the person has quit: nothing to draw, and no error for the downloader
+        except Exception as e:
+            errors.append(e)
+        finished.set()
+
+    def flow(ui):
+        ui.progress(Page(3, "Downloading the speech model"), "Downloading…", download)
+        return Outcome(0)
+
+    async def quit_while_downloading(pilot):
+        await wait_for(pilot, pilot.app, showing(pilot.app, "Downloading…"))
+        await pilot.press("ctrl+c")
+
+    def fake_exit(code):
+        raise SystemExit(code)
+
+    monkeypatch.setattr(tui, "SetupApp", headless(quit_while_downloading))
+    monkeypatch.setattr(tui.os, "_exit", fake_exit)
+    with pytest.raises(SystemExit) as exited:
+        run_tui(flow)
+    assert exited.value.code == 1
+    out = capsys.readouterr().out
+    assert out == "Setup cancelled. The download stops now and picks up where it left off next time.\n"
+    go.set()
+    assert finished.wait(2) and errors == []
+
+
+def test_quitting_other_work_returns_as_before(monkeypatch):
+    release = threading.Event()
+    exits = []
+
+    def flow(ui):
+        ui.busy(Page(3, "Which voice?"), "Loading voices…", lambda: release.wait(5))
+        return Outcome(0)
+
+    async def quit_while_loading(pilot):
+        await wait_for(pilot, pilot.app, showing(pilot.app, "Loading voices…"))
+        await pilot.press("ctrl+c")
+
+    monkeypatch.setattr(tui, "SetupApp", headless(quit_while_loading))
+    monkeypatch.setattr(tui.os, "_exit", exits.append)
+    assert run_tui(flow) == Outcome(1, "Setup cancelled.")
+    assert exits == []
+    release.set()
