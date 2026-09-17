@@ -1,20 +1,46 @@
 """`ai-phone models pull [--tier t4|t9]`: download the models for this config (setup time only; networked)."""
 from __future__ import annotations
 
+import os
 import sys
 
 from ai_phone import models, paths
-from ai_phone.config import Config, load_config
+from ai_phone.config import Config, ConfigError, load_config
+from ai_phone.lines.config_writer import read_raw
+
+STOPPED = "Stopped. Run it again to continue where it left off."
 
 
 def _gb(n: int | None) -> str:
     return "an unknown amount" if n is None else f"{n / 1e9:.1f} GB"
 
 
+def _wanted() -> tuple[str, str]:
+    """models.tier and brain.kind from the config. One that does not load (a voice named before the speech model is
+    complete, say) must not stop the download that fixes it: its own values are used when they are valid."""
+    path = paths.config_path()
+    try:
+        cfg = load_config(path) if path.exists() else Config()
+        return cfg.models.tier, cfg.brain.kind
+    except ConfigError as e:
+        why = str(e).splitlines()[0]
+    try:
+        raw = read_raw(path)
+    except Exception:  # not YAML at all
+        raw = {}
+    raw = raw if isinstance(raw, dict) else {}
+    tier = (raw.get("models") if isinstance(raw.get("models"), dict) else {}).get("tier")
+    kind = (raw.get("brain") if isinstance(raw.get("brain"), dict) else {}).get("kind")
+    tier, kind = (tier if tier in ("auto", "t4", "t9") else None), (kind if kind in ("local", "openai_compatible") else None)
+    used = " and ".join(f"{k} {v}" for k, v in (("models.tier", tier), ("brain.kind", kind)) if v)
+    print(f"warning: the config does not load ({why}); " + (f"using {used} from it" if used else "using the defaults"))
+    return tier or Config().models.tier, kind or Config().brain.kind
+
+
 def cmd_pull(a) -> int:
-    cfg = load_config(paths.config_path()) if paths.config_path().exists() else Config()
-    tier = a.tier or models.resolve_tier(cfg.models.tier)
-    repos = models.missing(tier, cfg.brain.kind)
+    tier, kind = _wanted()
+    tier = a.tier or models.resolve_tier(tier)
+    repos = models.missing(tier, kind)
     if not repos:
         print("All models are already downloaded.")
         return 0
@@ -32,6 +58,11 @@ def cmd_pull(a) -> int:
     except models.ModelsError as e:
         print(f"\nerror: {e}")
         return 3
+    except KeyboardInterrupt:
+        # huggingface_hub joins its download threads at exit, so a normal exit would wait for the whole download
+        print(f"\n{STOPPED}", flush=True)
+        sys.stderr.flush()
+        os._exit(130)
     print("\nDone.")
     return 0
 

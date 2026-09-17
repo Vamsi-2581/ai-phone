@@ -55,6 +55,52 @@ def test_local_path_needs_config_and_weights(tmp_path, monkeypatch):
     assert models.local_path(TTS) is None
 
 
+def snapshot(tmp_path, monkeypatch):
+    """A cache whose Kokoro snapshot holds a config and one weights file."""
+    hub = tmp_path / "hub"
+    snap = hub / "models--mlx-community--Kokoro-82M-bf16" / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    (snap / "model-00001-of-00002.safetensors").write_bytes(b"x")
+    monkeypatch.setattr(models, "_hub_root", lambda: hub)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo, **k: str(snap))
+    return snap
+
+
+def test_local_path_needs_every_shard_the_index_names(tmp_path, monkeypatch):
+    snap = snapshot(tmp_path, monkeypatch)
+    assert models.local_path(TTS) == snap  # no index: one file is the whole model
+    index = snap / "model.safetensors.index.json"
+    index.write_text('{"metadata": {}, "weight_map": {"a.weight": "model-00001-of-00002.safetensors", '
+                     '"b.weight": "model-00002-of-00002.safetensors"}}')
+    assert models.local_path(TTS) is None
+    (snap / "model-00002-of-00002.safetensors").write_bytes(b"x")
+    assert models.local_path(TTS) == snap
+    index.write_text("{not json")
+    assert models.local_path(TTS) is None
+
+
+def test_an_interrupted_pull_is_not_downloaded(tmp_path, monkeypatch):
+    """Quitting a download leaves the files so far; the next check must still count the model as missing."""
+    snap = snapshot(tmp_path, monkeypatch)
+    plenty_of_disk(monkeypatch)
+    monkeypatch.setattr(models, "download_size", lambda repos: 100)
+    marker = tmp_path / "hub" / "models--mlx-community--Kokoro-82M-bf16" / ".ai-phone-downloading"
+
+    def stopped(repo):
+        assert marker.exists(), "the marker is written before the download starts"
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        models.pull([TTS], download=stopped)
+    assert marker.exists() and models.local_path(TTS) is None and models.missing("t4", "openai_compatible") == [TTS]  # (the fake cache serves STT too)
+    with pytest.raises(ModelsError):
+        models.pull([TTS], download=lambda repo: (_ for _ in ()).throw(OSError("connection reset")))
+    assert models.local_path(TTS) is None
+    models.pull([TTS], download=lambda repo: None)
+    assert not marker.exists() and models.local_path(TTS) == snap
+
+
 def test_missing_lists_absent_repos(monkeypatch, tmp_path):
     monkeypatch.setattr(models, "local_path", lambda r: tmp_path if r == STT else None)
     assert models.missing("t4", "local") == [TTS, LLM["t4"]]

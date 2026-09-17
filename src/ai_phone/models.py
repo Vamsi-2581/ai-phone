@@ -2,6 +2,7 @@
 Weights live in the Hugging Face cache, where the backends load them from. The daemon never downloads."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ STT = "mlx-community/parakeet-tdt-0.6b-v2"
 TTS = "mlx-community/Kokoro-82M-bf16"
 LLM = {"t4": "mlx-community/Qwen3.5-4B-MLX-4bit", "t9": "mlx-community/Qwen3.5-9B-MLX-4bit"}
 BIG_MEMORY_GB = 32
+DOWNLOADING = ".ai-phone-downloading"  # in a repo's cache folder while `pull` has not finished it
 
 
 class ModelsError(RuntimeError):
@@ -39,13 +41,27 @@ def needed(tier: str, brain_kind: str) -> list[str]:
 
 
 def local_path(repo: str) -> Path | None:
-    """The cached snapshot, if it holds a config and weights (a download stopped part-way may not)."""
+    """The cached snapshot, if it is complete: no `pull` of it was left unfinished, it holds a config and weights,
+    and every shard its index names is there. (The cache links each file in as it arrives, so a download stopped
+    part-way leaves a snapshot folder behind.)"""
     from huggingface_hub import snapshot_download
+    if (_repo_dir(repo) / DOWNLOADING).exists():
+        return None
     try:
         path = Path(snapshot_download(repo, local_files_only=True))
     except Exception:  # not cached (LocalEntryNotFoundError) or an unreadable cache: either way, not usable
         return None
-    return path if (path / "config.json").is_file() and any(path.glob("*.safetensors")) else None
+    if not (path / "config.json").is_file() or not any(path.glob("*.safetensors")):
+        return None
+    index = path / "model.safetensors.index.json"
+    if index.exists():
+        try:
+            shards = set(json.loads(index.read_text())["weight_map"].values())
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+        if not all((path / shard).is_file() for shard in shards):
+            return None
+    return path
 
 
 def missing(tier: str, brain_kind: str) -> list[str]:
@@ -57,8 +73,12 @@ def _hub_root() -> Path:
     return Path(constants.HF_HUB_CACHE)
 
 
+def _repo_dir(repo: str) -> Path:
+    return _hub_root() / ("models--" + repo.replace("/", "--"))
+
+
 def _bytes_on_disk(repo: str) -> int:
-    blobs = _hub_root() / ("models--" + repo.replace("/", "--")) / "blobs"
+    blobs = _repo_dir(repo) / "blobs"
     total = 0
     try:
         with os.scandir(blobs) as entries:
@@ -113,10 +133,14 @@ def pull(repos: list[str], report: Callable[[int, int], None] | None = None, dow
         watcher.start()
     try:
         for repo in repos:
+            marker = _repo_dir(repo) / DOWNLOADING  # removed only once this repo is complete: a stop leaves it
             try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.touch()
                 download(repo)
             except Exception as e:
                 raise ModelsError(f"could not download {repo}: {type(e).__name__}: {str(e)[:160]}") from None
+            marker.unlink(missing_ok=True)
     finally:
         stop.set()
         if report:

@@ -51,6 +51,49 @@ def test_pull_reports_a_download_error(home, monkeypatch, capsys):
     assert "an unknown amount" in out and "error: not enough disk space" in out
 
 
+def test_pull_works_with_a_config_that_does_not_load(home, monkeypatch, capsys):
+    """The recovery command must not crash: a voice named before the speech model is complete makes the config fail."""
+    from ai_phone import voices
+    monkeypatch.setattr(voices, "installed_voices", lambda root=None: ["af_heart"])
+    (home / "config.yaml").write_text("models: {tier: t9}\nbrain: {kind: openai_compatible, base_url: 'https://api.example.com/v1'}\n"
+                                      "tts: {voice: bf_emma}\n")
+    asked = []
+    monkeypatch.setattr(models, "missing", lambda tier, brain: asked.append((tier, brain)) or [])
+    assert main(["models", "pull"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == ("warning: the config does not load (config.tts.voice: bf_emma is not installed; installed: af_heart); "
+                      "using models.tier t9 and brain.kind openai_compatible from it")
+    assert asked == [("t9", "openai_compatible")]
+    (home / "config.yaml").write_text("models: {tier: t99}\nbrain: [not: yaml\n")
+    assert main(["models", "pull"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].startswith("warning: the config does not load (config: ") and out[0].endswith("); using the defaults")
+    assert len([ln for ln in out if ln.startswith("warning")]) == 1
+    assert asked[-1] == ("t4", "local")
+
+
+def test_pull_stopped_with_ctrl_c_exits_at_once(home, monkeypatch, capsys):
+    """huggingface_hub joins its download threads at exit, so a normal exit would wait for the whole download."""
+    import os
+
+    def interrupted(repos, report=None):
+        raise KeyboardInterrupt
+
+    exits = []
+
+    def fake_exit(code):
+        exits.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(models, "missing", lambda tier, brain: [models.TTS])
+    monkeypatch.setattr(models, "download_size", lambda repos: None)
+    monkeypatch.setattr(models, "pull", interrupted)
+    monkeypatch.setattr(os, "_exit", fake_exit)
+    assert main(["models", "pull"]) == 130
+    assert exits == [130]
+    assert capsys.readouterr().out.endswith("\nStopped. Run it again to continue where it left off.\n")
+
+
 @pytest.mark.parametrize("argv, plain", [(["setup", "--plain"], True), (["setup"], None)])
 def test_setup_calls_the_wizard(monkeypatch, argv, plain):
     seen = []
