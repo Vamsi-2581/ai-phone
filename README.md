@@ -6,7 +6,7 @@ SIP address; speech-to-text, the language model and text-to-speech run locally b
 call the daemon talks to nothing but SIP/RTP (and a brain endpoint only if you configured one).
 
 **Status: Milestone 1 (latency proof) passed; Milestone 2 (lines) code complete, its live gate pending; Milestone 3 (agent tool) code complete, its gate pending.**
-English only, one call at a time. See `PRD.md` for scope and `architecture-essentials.md` for how it works.
+English only, one call at a time. See `architecture-essentials.md` for how it works.
 
 ## Milestone 1 numbers (Apple M5 Pro, 24 GB, 4B tier, 20 LAN calls over 8 kHz PCMU)
 

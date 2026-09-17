@@ -50,3 +50,6 @@ scripts/utt/
 
 # Review records are kept locally, outside the repository
 docs/reviews/
+
+# Private planning documents are kept locally, outside the repository
+docs/private/

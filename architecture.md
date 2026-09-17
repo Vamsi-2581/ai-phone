@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| **Status** | v1.0 baseline, 2026-09-02; Milestone 2 as built in §14a (2026-09-03), Milestone 3 as built in §14b (2026-09-16). Companion to `PRD.md` and `architecture-essentials.md`. |
+| **Status** | v1.0 baseline, 2026-09-02; Milestone 2 as built in §14a (2026-09-03), Milestone 3 as built in §14b (2026-09-16). Companion to `architecture-essentials.md`. |
 | **Reading order** | `architecture-essentials.md` first. Come here when it does not answer the question. |
-| **Precedence** | Owner's decisions → this doc → PRD. Where this doc and the PRD disagree on an architectural detail, this doc wins; where they disagree on a *decision*, the decision log in §15 wins. |
+| **Precedence** | Owner's decisions → this doc. Where the text and the decision log in §15 disagree on a *decision*, the decision log wins. |
 | **Notation** | **[D]** decided; do not change without the owner. **[P]** proposed default; change if Milestone 1 measurement says so, and record the change in §15. **[V]** verified against library source, PyPI, Hugging Face, or Homebrew on 2026-09-02 by an independent reviewer. |
 
 ---
@@ -15,7 +15,7 @@ ai-phone is a single daemon that owns one or more SIP lines (each its own regist
 
 Shape in one line: **a telephony layer that knows nothing about models, a model layer that knows nothing about telephony, and an asyncio pipeline between them that owns the conversation.**
 
-Non-goals that shape the architecture (from the PRD): single-call, English-only, no web UI, no cloud fallback, no external model server required (a user may point the brain at an OpenAI-compatible endpoint, §14a.7), no SMS through launch.
+Non-goals that shape the architecture: single-call, English-only, no web UI, no cloud fallback, no external model server required (a user may point the brain at an OpenAI-compatible endpoint, §14a.7), no SMS through launch.
 
 ### 1.1 Context diagram
 
@@ -522,7 +522,7 @@ The TUI (M5) tails this file. The gate check for M1 is a script over 20 turns: `
 
 ```
 ai-phone/
-  PRD.md · architecture-essentials.md · architecture.md · README.md · LICENSE (AGPLv3)
+  architecture-essentials.md · architecture.md · README.md · LICENSE (AGPLv3)
   pyproject.toml                    # ai-phone; requires-python >=3.11,<3.14
   src/ai_phone/
     cli.py  config.py  daemon.py
