@@ -32,7 +32,7 @@ class PageScreen(Screen):
         self.options, self.default, self.back = list(options), default, back
         self.fields, self.busy, self.progress = list(fields), busy, progress
         self.answered = False
-        self.frame, self.label = 0, busy
+        self.frame, self.label, self.spinning = 0, busy, None
 
     def compose(self) -> ComposeResult:
         page, width = self.page, self.app.size.width
@@ -67,10 +67,9 @@ class PageScreen(Screen):
                         yield Input(value=field.default, placeholder=field.placeholder, password=field.secret)
                     yield Static(Text(), id="status")
             elif self.busy:
-                with Center():
+                with Center(), Vertical(id="work"):
                     yield Static(self._spinner(), id="status")
-                if self.progress:
-                    with Center():
+                    if self.progress:
                         yield ProgressBar(total=None, show_eta=False)
             with Center():
                 yield Static(look.hint(self._keys()), id="hint")
@@ -79,7 +78,7 @@ class PageScreen(Screen):
         if self.fields:
             self.query(Input).first().focus()
         if self.busy:
-            self.set_interval(0.08, self._spin)
+            self.spinning = self.set_interval(0.08, self._spin)
 
     def on_resize(self, event: events.Resize) -> None:
         width = event.size.width
@@ -93,10 +92,10 @@ class PageScreen(Screen):
         return look.wordmark()
 
     def _keys(self) -> str:
-        if self.fields:
-            return look.FORM_KEYS
         if self.busy:
             return look.BUSY_KEYS
+        if self.fields:
+            return look.FORM_KEYS
         return look.MENU_KEYS if self.back else look.MENU_KEYS.replace("esc back   ", "")
 
     def _spinner(self) -> Text:
@@ -107,6 +106,18 @@ class PageScreen(Screen):
     def _spin(self) -> None:
         self.frame += 1
         self.query_one("#status", Static).update(self._spinner())
+
+    def hold(self, label: str) -> None:
+        """Keep this answered form up while the flow works on its values: the fields turn read-only (the one that
+        had focus keeps its border) and the spinner runs in the form's status line."""
+        if self.focused is not None:
+            self.focused.add_class("held")
+        self.busy = self.label = label
+        self.query(Input).set(disabled=True)
+        self.query_one("#hint", Static).update(look.hint(self._keys()))
+        self.query_one("#status", Static).update(self._spinner())
+        if self.spinning is None:
+            self.spinning = self.set_interval(0.08, self._spin)
 
     def set_progress(self, done: int, total: int) -> None:
         if total:
@@ -161,11 +172,16 @@ class TextualUI(BaseUI):
     def __init__(self, app: SetupApp):
         super().__init__()
         self.app = app
+        self.form: PageScreen | None = None  # the form on screen whose values the flow has just been given
 
-    def _show(self, screen: PageScreen) -> None:
+    def _call(self, fn, *args):
         if self.app.quit_requested:
             raise Cancel()
-        self.app.call_from_thread(self.app.show, screen)
+        return self.app.call_from_thread(fn, *args)
+
+    def _show(self, screen: PageScreen) -> None:
+        self.form = None
+        self._call(self.app.show, screen)
 
     def _wait(self, screen: PageScreen):
         q: queue.Queue = queue.Queue()
@@ -186,13 +202,19 @@ class TextualUI(BaseUI):
 
     def ask(self, page, fields):
         self.next_question()
-        answer = self._wait(PageScreen(page, fields=fields))
+        screen = PageScreen(page, fields=fields)
+        answer = self._wait(screen)
         if answer is _BACK:
             raise self.back()
+        self.form = screen
         return answer
 
     def busy(self, page, label, work):
-        self._show(PageScreen(page, busy=label))
+        form = self.form
+        if form is not None and (form.page.step, form.page.question) == (page.step, page.question):
+            self._call(form.hold, label)  # checking what was just typed: the form stays, as in the approved look
+        else:
+            self._show(PageScreen(page, busy=label))
         return work()
 
     def progress(self, page, label, work):
@@ -204,7 +226,7 @@ class TextualUI(BaseUI):
 class SetupApp(App):
     CSS = look.CSS
     ENABLE_COMMAND_PALETTE = False
-    BINDINGS = [Binding("ctrl+c", "request_quit", "quit", priority=True)]
+    BINDINGS = [Binding("ctrl+c,ctrl+q", "request_quit", "quit", priority=True)]
 
     def __init__(self, flow_fn: Callable[[UI], Outcome]):
         # Under NO_COLOR Textual drops every colour only in ANSI mode; otherwise it redraws them in grey

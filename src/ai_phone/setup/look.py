@@ -190,13 +190,17 @@ Center {{ height: auto; }}
 .error {{ width: 100%; text-align: center; color: {RED}; margin: 0 0 1 0; }}
 Question #menu {{ margin: 2 0 0 0; }}
 #form {{ height: auto; margin: 1 0 0 0; width: 66; }}
+#work {{ height: auto; margin: 1 0 0 0; width: 66; }}
 .label {{ margin: 1 0 0 1; }}
 Input {{ background: {BG}; border: round #2a2d4a; color: {WHITE}; padding: 0 1; }}
 Input:focus {{ border: round {ACCENT}; background: {BG}; background-tint: $foreground 0%; }}
 Input > .input--placeholder {{ color: #3c4052; }}
 Input:nocolor > .input--cursor {{ text-style: reverse; }}
-#status {{ width: 66; margin: 1 0 0 1; height: 1; }}
-ProgressBar {{ width: 66; margin: 1 0 0 0; }}
+Input:disabled {{ opacity: 1; }}
+Input.held {{ border: round {ACCENT}; }}
+#status {{ margin: 1 0 0 1; height: 1; }}
+ProgressBar {{ width: 1fr; margin: 1 0 0 1; }}
+Bar {{ width: 1fr; }}
 Bar > .bar--bar {{ color: {ACCENT}; background: {LINE}; }}
 Bar > .bar--complete {{ color: {GREEN}; }}
 """

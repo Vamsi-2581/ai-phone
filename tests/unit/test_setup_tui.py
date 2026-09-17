@@ -1,5 +1,6 @@
 """The full-screen setup wizard, driven headless by Textual's pilot with small scripted flows."""
 import asyncio
+import dataclasses
 import threading
 import time
 
@@ -8,7 +9,7 @@ from rich.color import ColorType
 from textual.widgets import Input, ProgressBar
 
 from ai_phone.setup import look, tui
-from ai_phone.setup.tui import PageScreen, SetupApp, run_tui
+from ai_phone.setup.tui import FRAMES, PageScreen, SetupApp, run_tui
 from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
 
 LINE = Page(2, "How should people reach your agent?", "detail")
@@ -17,6 +18,10 @@ WELCOME = Page(0, "Give your AI a phone number", "Calls answered and placed by m
                note="Picks a line, a brain and a voice, then checks it all works.",
                checks=[Check("SIP library", "built", True), Check("Memory", "16 GB", None),
                        Check("Models", "not downloaded yet", False)])
+TWILIO = Page(2, "Your Twilio credentials",
+              "Saved to ~/.ai-phone/secrets.env, readable only by you. Never shown or sent anywhere else.")
+KEY_FIELDS = [Field("Account SID", secret=True, placeholder="AC…"),
+              Field("Auth Token", secret=True, placeholder="32 characters")]
 
 
 def screen_text(app) -> str:
@@ -44,6 +49,17 @@ def colour_of(app, text: str) -> str | None:
     for seg in segments(app):
         if text in seg.text and seg.style and seg.style.color:
             return seg.style.color.get_truecolor().hex
+    return None
+
+
+def colour_at(app, row: int, col: int) -> str | None:
+    """The foreground colour of one cell."""
+    x = 0
+    for strip in app.screen._compositor.render_full_update().strips[row]:
+        for seg in strip:
+            if x <= col < x + len(seg.text):
+                return seg.style.color.get_truecolor().hex if seg.style and seg.style.color else None
+            x += len(seg.text)
     return None
 
 
@@ -230,12 +246,74 @@ async def test_busy_spins_then_returns():
         assert app.screen.busy == "Checking your Twilio account…"
         assert "ctrl+c quit" in screen_text(app) and "esc back" not in screen_text(app)
         assert colour_of(app, "Checking your Twilio account…") == look.MID
+        row = next(l for l in screen_text(app).splitlines() if "Checking your Twilio account…" in l)
+        assert row.index("Checking") == 22  # the frame at column 20, like a form's status line
         frame = spinner(app)
         await wait_for(pilot, app, lambda: spinner(app) != frame)  # it turns
         assert "result" not in got
         release.set()
         await wait_for(pilot, app, lambda: app.outcome is not None)
     assert got["result"] == 7
+
+
+@pytest.mark.asyncio
+async def test_busy_after_a_form_keeps_the_form_on_screen():
+    checked, listed = threading.Event(), threading.Event()
+    got = {}
+
+    def check():
+        checked.wait(5)
+        raise ValueError("rejected")
+
+    def flow(ui):
+        ui.ask(TWILIO, KEY_FIELDS)
+        try:
+            ui.busy(dataclasses.replace(TWILIO), "Checking your Twilio account…", check)  # an equal page will do
+        except ValueError:
+            got["retry"] = ui.ask(dataclasses.replace(TWILIO, error="Twilio did not accept that key."), KEY_FIELDS)
+        got["numbers"] = ui.busy(Page(2, "Which number?"), "Loading your numbers…", lambda: listed.wait(5))
+        return Outcome(0)
+
+    app = SetupApp(flow)
+    async with app.run_test(size=(104, 40)) as pilot:
+        seen = []
+
+        async def press(*keys):
+            for key in keys:
+                await pilot.press(key)
+                seen.append(screen_text(app))
+
+        await wait_for(pilot, app, showing(app, "Account SID"))
+        form = app.screen
+        await press(*"ACsecret123", "enter", *"tokensecret456", "enter")
+        await wait_for(pilot, app, lambda: "Checking your Twilio account…" in screen_text(app))
+        assert app.screen is form
+        text = screen_text(app)
+        rows = text.splitlines()
+        (row,) = [r for r, line in enumerate(rows) if "Checking your Twilio account…" in line]
+        # the spinner is on the form's status line, under the fields, where the approved frame draws it
+        assert (row, rows[row].index("Checking")) == (26, 22) and rows[row][20] in FRAMES
+        assert "Account SID" in text and "Auth Token" in text and "•" * 11 in text and "•" * 14 in text
+        assert all(field.disabled for field in form.query(Input))
+        # read-only fields look as they did: not faded, and the one that had focus keeps its accent border
+        tops = [(r, line.index("╭")) for r, line in enumerate(rows) if "╭" in line]
+        assert [colour_at(app, r, c) for r, c in tops] == ["#2a2d4a", look.ACCENT]
+        assert colour_of(app, "•" * 14) == look.WHITE
+        assert "ctrl+c quit" in text and "esc back" not in text
+        await press("x", "escape", "q", "enter")  # nothing reaches the flow while it works
+        assert app.outcome is None and "retry" not in got and form.busy
+
+        checked.set()
+        await wait_for(pilot, app, showing(app, "Twilio did not accept that key."))
+        assert app.screen is not form
+        assert [(f.disabled, f.value) for f in app.screen.query(Input)] == [(False, ""), (False, "")]
+        await press(*"AC9", "enter", *"tok9", "enter")
+        await wait_for(pilot, app, lambda: "Loading your numbers…" in screen_text(app))
+        assert "Account SID" not in screen_text(app)  # another page gets a busy screen of its own
+        listed.set()
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert got == {"retry": ["AC9", "tok9"], "numbers": True}
+    assert seen and not any("secret123" in t or "secret456" in t for t in seen)
 
 
 @pytest.mark.asyncio
@@ -261,6 +339,10 @@ async def test_progress_bar_moves():
     async with app.run_test(size=(104, 40)) as pilot:
         await wait_for(pilot, app, lambda: bar(app) is not None and bar(app).progress == 10)
         assert bar(app).total == 10
+        await wait_for(pilot, app, lambda: "100%" in screen_text(app))
+        row = next(l for l in screen_text(app).splitlines() if "━" in l)
+        # the bar and its percentage fill the 66-column row, from the status line's column to the form's right edge
+        assert row.index("━") == 20 and len(row.rstrip()) == 85 and row.rstrip().endswith("100%")
         await wait_for(pilot, app, lambda: "Downloading models  0.0 of 0.0 GB" in screen_text(app))
         release.set()
         await wait_for(pilot, app, lambda: app.outcome is not None)
@@ -332,7 +414,8 @@ async def test_no_color(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ctrl_c_on_a_question_cancels_and_exits():
+@pytest.mark.parametrize("key", ["ctrl+c", "ctrl+q"])
+async def test_ctrl_c_on_a_question_cancels_and_exits(key):
     seen = []
 
     def flow(ui):
@@ -347,7 +430,7 @@ async def test_ctrl_c_on_a_question_cancels_and_exits():
     async with app.run_test(size=(104, 40)) as pilot:
         await wait_for(pilot, app, showing(app, "API key"))
         assert isinstance(app.focused, Input)  # the key reaches the app even while a field has focus
-        await pilot.press("ctrl+c")
+        await pilot.press(key)
         await wait_for(pilot, app, lambda: app.outcome is not None)
         await wait_for(pilot, app, lambda: app.return_code is not None)
     assert seen == ["cancel"]
