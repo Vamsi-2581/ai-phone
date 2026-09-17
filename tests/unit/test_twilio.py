@@ -343,6 +343,29 @@ def test_release_of_a_brought_number_restores_it_and_keeps_it(tmp_path: Path):
     assert not c.domains and not c.credlists and not c.trunks
 
 
+def _old_format(j: Journal, key: str) -> None:
+    """What e4a8c67 wrote: the brought number under the bought number's key, flagged `number_brought`."""
+    for s in j.doc["steps"]:
+        if f"brought_{key}" in s["result"]:
+            s["result"][key] = s["result"].pop(f"brought_{key}")
+    j._save()
+
+
+def test_release_of_an_old_format_brought_number_keeps_it(tmp_path: Path):
+    from ai_phone.providers.base import Number
+    c = _owned(Carrier())
+    p = _provider(c)
+    j = Journal.open(tmp_path, "main", "twilio")
+    p.attach(j, Number("+15550100001", None, None, False, "PN9"), "main", "u1234", "pw")
+    _old_format(j, "number_sid")
+    assert j.resources()["number_sid"] == "PN9" and "brought_number_sid" not in j.resources()
+    c.updates.clear()
+    assert p.release(j).ok
+    assert not [x for x in c.calls if x[0] == "DELETE" and "IncomingPhoneNumbers" in x[2]]
+    assert c.updates == [("PN9", {"VoiceUrl": "https://example.com/old", "VoiceMethod": "POST"})] and "PN9" in c.numbers
+    assert not c.domains and not c.credlists and not c.trunks
+
+
 def test_release_of_a_brought_number_that_cannot_be_restored_keeps_it_and_says_so(tmp_path: Path):
     from ai_phone.providers.base import Number
     c = _owned(Carrier())

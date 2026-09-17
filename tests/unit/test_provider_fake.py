@@ -98,6 +98,20 @@ def test_release_of_a_brought_number_keeps_it(tmp_path: Path):
     assert set(p.carrier) == {"owned"} and p.carrier["owned"]["connection"] is None
 
 
+def test_release_of_an_old_format_brought_number_keeps_it(tmp_path: Path):
+    """What e4a8c67 wrote: the brought number under `number_id`, flagged `number_brought`."""
+    p = FakeProvider()
+    p.provision(Journal.open(tmp_path, "shop", "fake"), p.search_numbers("GB", None, 1)[0], "shop", "aishop1234", "pw")
+    j = Journal.open(tmp_path, "main", "fake")
+    p.attach(j, p.owned_numbers()[0], "main", "aimain1234", "pw")
+    claim = next(s for s in j.doc["steps"] if s["name"] == "claim")
+    claim["result"]["number_id"] = claim["result"].pop("brought_number_id")
+    j._save()
+    assert p.release(j).ok
+    assert "number" in p.carrier, "the number record belongs to line shop; main's number_id is the brought one"
+    assert p.carrier["owned"]["connection"] is None
+
+
 def test_a_buy_then_a_bring_in_one_journal_releases_the_bought_number(tmp_path: Path):
     p = FakeProvider()
     j = Journal.open(tmp_path, "main", "fake")

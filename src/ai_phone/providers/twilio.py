@@ -248,6 +248,8 @@ class TwilioProvider:
 
     def release(self, journal: Journal) -> ReleaseResult:
         r = journal.resources()
+        if r.get("number_brought") and not r.get("brought_number_sid"):  # an older journal kept it under number_sid
+            r["brought_number_sid"] = r.pop("number_sid", None)
         leftover = {}
         if r.get("brought_number_sid"):
             # never delete a number ai-phone did not buy: put its voice URL back and leave it on the account

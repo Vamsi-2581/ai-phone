@@ -1,9 +1,11 @@
 """`ai-phone lines …`: buy, wire, resume, release, list, divert and verify. Carrier calls happen here, never in the daemon."""
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from ai_phone import paths
 from ai_phone.config import E164_RE, LINE_ID_RE, ConfigError, host_of, line_password_env, load_config
@@ -125,6 +127,10 @@ def _refusal(journal: Journal, config_path: Path, line_id: str, number, existing
     for lid, ln in (read_raw(config_path).get("lines") or {}).items():
         if lid != line_id and (ln or {}).get("number") == number.e164:
             return f"{number.e164} is already line {lid}"
+    for lid, setup in journal_setups().items():  # an earlier attempt under another id: that id finishes or undoes it
+        if lid != line_id and setup.number == number.e164:
+            return (f"line {lid} has an unfinished setup for {number.e164}; run `ai-phone lines resume {lid}` to finish it "
+                    f"or `ai-phone lines remove {lid}` to undo it, then try again")
     if journal.doc["steps"]:
         target = next((s["planned"] for s in journal.doc["steps"] if s["name"] == "target"), None)
         if target is None or target.get("phone_number") != number.e164 or bool(target.get("brought")) != existing:
@@ -312,6 +318,49 @@ def _journal_number(journal: Journal) -> str | None:
             or _planned(journal, "number", "name"))                          # older fake-carrier journals
 
 
+class JournalSetup(NamedTuple):
+    """What a provisioning journal records."""
+    number: str | None   # None: nothing yet (an empty journal); "?": it cannot be read, or names no number
+    brought: bool        # the number was already on the account (connected, not bought)
+    state: str
+    resumable: bool      # it has the `target` step provisioning needs to pick it up
+
+
+def journal_setups(d: Path | None = None) -> dict[str, JournalSetup]:
+    """Every provisioning journal under lines/, by line id. Read only: Journal.open() would write the file."""
+    d = Path(d) if d else paths.lines_dir()
+    if not d.is_dir():
+        return {}
+    return {p.name.removesuffix(".journal.json"): _journal_setup(p) for p in sorted(d.glob("*.journal.json"))}
+
+
+def _journal_setup(path: Path) -> JournalSetup:
+    try:
+        if path.is_symlink():
+            raise ValueError("a symlink")
+        journal = Journal(path, json.loads(path.read_text()))
+        steps = journal.doc["steps"]
+        number = (_journal_number(journal) or "?") if steps else None
+        return JournalSetup(number, bool(_planned(journal, "target", "brought")), str(journal.doc.get("state")),
+                            any(s["name"] == "target" for s in steps))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return JournalSetup("?", False, "?", False)
+
+
+def _number_in_use(journal: Journal, line_id: str, raw: dict) -> tuple[str, str] | None:
+    """(why, other line) when the number this journal would release belongs to another line or another setup."""
+    number = _journal_number(journal)
+    if not number or _planned(journal, "target", "brought"):  # a brought number is only disconnected, never deleted
+        return None
+    for lid, ln in (raw.get("lines") or {}).items():
+        if lid != line_id and isinstance(ln, dict) and ln.get("number") == number:
+            return f"{number} is also line {lid}", lid
+    for lid, setup in journal_setups().items():
+        if lid != line_id and setup.number == number:
+            return f"{number} is also claimed by the unfinished setup of line {lid}", lid
+    return None
+
+
 def cmd_resume(a) -> int:
     """Re-runs provisioning from the journal: finished steps are skipped, half-done ones reconciled, a pending order polled."""
     pname, ln = _journal_for(a.line_id, a)
@@ -346,9 +395,20 @@ def _recorded_resources(ln: dict) -> dict:
 BROUGHT_KEYS = ("brought_number_sid", "brought_number_id")  # a number the person already had: kept, never released
 
 
+def _brought_keys(res: dict) -> dict:
+    """An older journal (e4a8c67) flagged `number_brought` and kept the brought number under number_sid/number_id."""
+    res = dict(res)
+    if res.get("number_brought") and not any(res.get(k) for k in BROUGHT_KEYS):
+        for key, brought in (("number_sid", "brought_number_sid"), ("number_id", "brought_number_id")):
+            if res.get(key):
+                res[brought] = res.pop(key)
+    return res
+
+
 def _carrier_ids(res: dict) -> tuple[dict, str | None]:
     """The ids of what ai-phone created, and the id of a brought number. Journal flags and `previous_*` values are
     never shown: they are not ids, and a previous voice URL can carry credentials. A shared profile is the account's."""
+    res = _brought_keys(res)
     ids = {k: v for k, v in res.items() if isinstance(v, str) and v and k.endswith(("_id", "_sid"))
            and not k.startswith("previous_") and k not in BROUGHT_KEYS}
     if res.get("profile_shared"):
@@ -388,6 +448,13 @@ def cmd_remove(a) -> int:
                  f"so releasing here would leave carrier resources live.\n"
                  f"Release them on your {pname} account first ({_ids(ids, ln, a.line_id)}), "
                  f"then run `ai-phone lines remove {a.line_id} --local-only`." + (f"\n{note}" if note else ""))
+            return EXIT_ERROR
+        clash = _number_in_use(journal, a.line_id, read_raw(config_path))
+        if clash:
+            why, other = clash
+            _say(f"error: {why}, so releasing line {a.line_id} would delete the number that line uses. Remove line {other} "
+                 f"first, or run `ai-phone lines remove {a.line_id} --local-only` to remove only line {a.line_id} and keep "
+                 f"its carrier resources.")
             return EXIT_ERROR
         if not a.key_env:
             _say(f"line {a.line_id} was provisioned on {pname}. Pass --key-env (and --secret-env for twilio) to release its carrier resources, "

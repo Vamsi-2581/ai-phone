@@ -342,6 +342,23 @@ def test_release_of_a_brought_number_reconnects_it_and_keeps_it(tmp_path: Path):
                      ("DELETE", "/v2/outbound_voice_profiles/p1")], "the number leaves the connection before it is deleted"
 
 
+def test_release_of_an_old_format_brought_number_keeps_it(tmp_path: Path):
+    """What e4a8c67 wrote: the brought number under `number_id`, flagged `number_brought`."""
+    carrier = _owned(Carrier(), connection_id="old-conn")
+    p = _provider(carrier)
+    j = Journal.open(tmp_path, "main", "telnyx")
+    p.attach(j, Number("+15550100001", None, None, False, "n9"), "main", "aimain1234", "pw")
+    for s in j.doc["steps"]:
+        if "brought_number_id" in s["result"]:
+            s["result"]["number_id"] = s["result"].pop("brought_number_id")
+    j._save()
+    assert j.resources()["number_id"] == "n9" and j.resources()["number_brought"] is True
+    assert p.release(j).ok
+    assert ("DELETE", "/v2/phone_numbers/n9") not in carrier.calls and "n9" in carrier.numbers
+    assert carrier.numbers["n9"]["connection_id"] == "old-conn"
+    assert not carrier.connections and not carrier.profiles
+
+
 def test_release_of_a_brought_number_with_no_previous_connection_sends_null(tmp_path: Path):
     carrier = _owned(Carrier())
     p = _provider(carrier)

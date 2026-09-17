@@ -9,7 +9,6 @@ import atexit
 import contextlib
 import copy
 import functools
-import json
 import os
 import signal
 import socket
@@ -21,7 +20,7 @@ import warnings
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable
 from urllib.parse import urlsplit
 
 import httpx
@@ -29,7 +28,7 @@ import yaml
 
 import ai_phone
 from ai_phone import models, paths, voices
-from ai_phone.cli_lines import manual_line, next_line_id, provision_flow, write_line
+from ai_phone.cli_lines import journal_setups, manual_line, next_line_id, provision_flow, write_line
 from ai_phone.config import Config, ConfigError, line_password_env, load_config
 from ai_phone.control.client import probe
 from ai_phone.lines.config_writer import read_raw, write_raw
@@ -82,14 +81,6 @@ class LineResult:
 
 class ActionError(RuntimeError):
     pass
-
-
-class Unfinished(NamedTuple):
-    """What a provisioning journal records."""
-    number: str | None   # None: no setup recorded yet (an empty journal); "?": the journal cannot be read
-    brought: bool        # the number was already on the account (connected, not bought)
-    state: str
-    resumable: bool      # it has the `target` step provision_flow needs to pick it up
 
 
 def sip_library_built() -> bool:
@@ -282,14 +273,14 @@ class Actions:
             lines = _section(self._read(), "lines")
         except ActionError:
             lines = {}
-        return {j.number for line_id, j in _journals().items() if line_id not in lines and j.number not in (None, "?")}
+        return {j.number for line_id, j in journal_setups().items() if line_id not in lines and j.number not in (None, "?")}
 
     def _line_id(self, raw: dict, carrier: str, number, existing: bool) -> str:
         """The id for setting up `number`. An earlier attempt at this number (a journal with no line, under any id) is
         picked up where it stopped when it was set up the same way (bought, or brought); otherwise the person is told how
         to finish or undo it. A second id for one number would let `lines remove` of the first release the number the
         second depends on. Anything else gets twilio, twilio-2, …: the first id with neither a line nor a journal."""
-        lines, journals = _section(raw, "lines"), _journals()
+        lines, journals = _section(raw, "lines"), journal_setups()
         for line_id, j in journals.items():
             if line_id in lines or j.number != number.e164:
                 continue
@@ -494,32 +485,6 @@ class Actions:
         if doc is None:
             return [("lines", "registering", f"ai-phone did not report its lines within {CHECK_SEC:g} seconds")]
         return _line_rows(doc)
-
-
-def _journals() -> dict[str, Unfinished]:
-    """Every provisioning journal under lines/, by line id. Read only: Journal.open() would write the file."""
-    d = paths.lines_dir()
-    return {path.name.removesuffix(".journal.json"): _journal(path) for path in sorted(d.glob("*.journal.json"))} \
-        if d.is_dir() else {}
-
-
-def _journal(path: Path) -> Unfinished:
-    try:
-        if path.is_symlink():
-            raise ValueError("a symlink")
-        doc = json.loads(path.read_text())
-        steps = doc["steps"]
-
-        def planned(step: str, key: str):
-            return next((s["planned"].get(key) for s in steps if s["name"] == step), None)
-
-        number = (planned("target", "phone_number") or planned("order", "phone_number")  # this version, older Telnyx
-                  or planned("number", "phone_number") or planned("number", "name"))    # older Twilio, older fake
-        resumable = any(s["name"] == "target" for s in steps)
-        number = (number or "?") if steps else None  # steps but no number: not ours to pick up or to reuse
-        return Unfinished(number, bool(planned("target", "brought")), str(doc.get("state")), resumable)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return Unfinished("?", False, "?", False)
 
 
 def _fresh_state(since: float) -> dict | None:

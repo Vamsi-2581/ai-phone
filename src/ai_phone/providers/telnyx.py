@@ -228,6 +228,8 @@ class TelnyxProvider:
 
     def release(self, journal: Journal) -> ReleaseResult:
         r = journal.resources()
+        if r.get("number_brought") and not r.get("brought_number_id"):  # an older journal kept it under number_id
+            r["brought_number_id"] = r.pop("number_id", None)
         leftover = {}
         if r.get("brought_number_id"):
             # never delete a number ai-phone did not buy: move it back to the connection it had (or none)

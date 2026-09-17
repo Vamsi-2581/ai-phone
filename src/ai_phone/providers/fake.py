@@ -100,6 +100,8 @@ class FakeProvider:
 
     def release(self, journal: Journal) -> ReleaseResult:
         res = journal.resources()
+        if res.get("number_brought") and not res.get("brought_number_id"):  # an older journal kept it under number_id
+            res["brought_number_id"] = res.pop("number_id", None)
         brought = res.get("brought_number_id")
         for step in reversed(STEPS):
             if step == "number" and brought and not res.get("number_id"):  # a brought number is only disconnected, never released

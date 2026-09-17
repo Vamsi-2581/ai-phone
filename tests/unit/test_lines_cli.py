@@ -504,3 +504,84 @@ def test_remove_after_a_refused_claim_asks_the_disconnect_question_with_the_numb
     assert asked == ["Disconnect +442079460001 from ai-phone and delete what ai-phone created on your fake account? "
                      "The number stays on your account. [y/N] "]
     assert not (home / "lines" / "main.journal.json").exists()
+
+
+def test_an_unfinished_setup_under_another_id_blocks_the_same_number(home: Path, monkeypatch, capsys):
+    """One number, two line ids: `lines remove` of the first would delete (or re-route) the number the second uses."""
+    monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "connection")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "shop", "--existing", "+442079460099", "--yes"]) == 3
+    monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "number")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "desk", "--number", "+442079460001", "--yes"]) == 3
+    monkeypatch.delenv("AI_PHONE_FAKE_CRASH_AFTER")
+    capsys.readouterr()
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--existing", "+442079460099", "--yes"]) == 3
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--number", "+442079460001", "--yes"]) == 3
+    out = capsys.readouterr().out
+    assert ("error: line shop has an unfinished setup for +442079460099; run `ai-phone lines resume shop` to finish it "
+            "or `ai-phone lines remove shop` to undo it, then try again") in out
+    assert "error: line desk has an unfinished setup for +442079460001" in out
+    assert not (home / "lines" / "main.journal.json").exists() and "main" not in load_config(home / "config.yaml").lines
+    assert main(["lines", "resume", "shop", "--key-env", "FAKE_KEY"]) == 0  # the way forward still works
+
+
+def test_journal_setups_reads_every_journal_without_writing(home: Path):
+    from ai_phone.cli_lines import JournalSetup, journal_setups
+    assert journal_setups() == {}
+    j = Journal.open(home / "lines", "shop", "fake")
+    j.start("target", phone_number="+442079460099", brought=True)
+    Journal.open(home / "lines", "empty", "fake")
+    early = Journal.open(home / "lines", "early", "fake")
+    early.start("profile", name="ai-phone:early")
+    old = Journal.open(home / "lines", "old", "fake")
+    old.start("number", name="+442079460002")
+    old.set_state("rollback_failed")
+    (home / "lines" / "broken.journal.json").write_text("{not json")
+    before = {p.name: p.stat().st_mtime_ns for p in (home / "lines").iterdir()}
+    assert journal_setups() == {
+        "broken": JournalSetup("?", False, "?", False),
+        "early": JournalSetup("?", False, "pending", False),
+        "empty": JournalSetup(None, False, "pending", False),
+        "old": JournalSetup("+442079460002", False, "rollback_failed", False),
+        "shop": JournalSetup("+442079460099", True, "pending", True),
+    }
+    assert {p.name: p.stat().st_mtime_ns for p in (home / "lines").iterdir()} == before
+
+
+def test_remove_refuses_to_release_a_number_another_line_uses(home: Path, monkeypatch, capsys):
+    monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "number")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "shop", "--yes"]) == 3  # bought, then stopped
+    monkeypatch.delenv("AI_PHONE_FAKE_CRASH_AFTER")
+    assert main(["lines", "add", "trunk", "--id", "main", "--number", "+442079460000", "--registrar", "sip:sip.example.com",
+                 "--user", "main1234", "--password-env", "MAIN_PW"]) == 0  # the same number, typed in by hand
+    capsys.readouterr()
+    assert main(["lines", "remove", "shop", "--key-env", "FAKE_KEY", "--yes"]) == 3
+    out = capsys.readouterr().out
+    assert ("error: +442079460000 is also line main, so releasing line shop would delete the number that line uses. "
+            "Remove line main first, or run `ai-phone lines remove shop --local-only` to remove only line shop "
+            "and keep its carrier resources.") in out
+    assert "number" in _fake_carrier(home)["carrier"] and (home / "lines" / "shop.journal.json").exists()
+
+    assert main(["lines", "remove", "main"]) == 0
+    other = Journal.open(home / "lines", "other", "fake")  # an unfinished setup elsewhere that names the number
+    other.start("target", phone_number="+442079460000", brought=True)
+    capsys.readouterr()
+    assert main(["lines", "remove", "shop", "--key-env", "FAKE_KEY", "--yes"]) == 3
+    assert "error: +442079460000 is also claimed by the unfinished setup of line other" in capsys.readouterr().out
+    assert "number" in _fake_carrier(home)["carrier"]
+    assert main(["lines", "remove", "shop", "--local-only"]) == 0  # keeping everything is still allowed
+    other.delete()
+
+
+def test_remove_releases_a_bought_number_nobody_else_uses(home: Path, monkeypatch, capsys):
+    monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "number")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "shop", "--yes"]) == 3
+    monkeypatch.delenv("AI_PHONE_FAKE_CRASH_AFTER")
+    assert main(["lines", "add", "sip", "--id", "agent", "--user", "agent", "--host", "192.0.2.10"]) == 0
+    assert main(["lines", "remove", "shop", "--key-env", "FAKE_KEY", "--yes"]) == 0
+    assert "number" not in _fake_carrier(home)["carrier"]
+
+
+def test_an_old_format_brought_number_is_never_listed_to_release(home: Path, capsys):
+    from ai_phone.cli_lines import _carrier_ids
+    assert _carrier_ids({"number_id": "owned-1", "number_brought": True, "connection_id": "c1"}) == ({"connection_id": "c1"}, "owned-1")
+    assert _carrier_ids({"number_sid": "PN2", "brought_number_sid": "PN9", "number_brought": True}) == ({"number_sid": "PN2"}, "PN9")
