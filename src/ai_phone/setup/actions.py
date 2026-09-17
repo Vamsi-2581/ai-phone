@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import warnings
 import wave
@@ -166,14 +167,17 @@ class Actions:
             raw["models"] = {**_section(raw, "models"), "tier": tier}
         self._edit(change)
 
-    def _brain_key_env(self) -> str | None:
-        """The key variable the current endpoint brain uses, if any."""
+    def _brain_key_env(self, url: str) -> str | None:
+        """The key variable the current endpoint brain uses, when `url` is on that same host: a key saved for one
+        server is never sent to another."""
         try:
             brain = _section(self._read(), "brain")
         except ActionError:
             return None
         env = brain.get("api_key_env")
-        return env if brain.get("kind") == "openai_compatible" and isinstance(env, str) else None
+        if brain.get("kind") != "openai_compatible" or not isinstance(env, str):
+            return None
+        return env if _host(url) is not None and _host(brain.get("base_url")) == _host(url) else None
 
     def test_endpoint(self, url: str, model: str, key: str | None) -> str:
         try:
@@ -184,7 +188,7 @@ class Actions:
         if parts is not None and parts.scheme == "http" and parts.hostname not in LOOPBACK:
             raise ActionError("a brain that is not on this machine must use https")  # before a key can cross the network
         if key is None:
-            env = self._brain_key_env()
+            env = self._brain_key_env(url)
             key = _saved().get(env) if env else None
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         body = {"model": model, "messages": [{"role": "user", "content": "Say OK."}], "max_tokens": 5}
@@ -205,7 +209,7 @@ class Actions:
             raise ActionError(f"{host} answered, but not like an OpenAI chat API (is the URL right? it usually ends in /v1)") from None
 
     def save_brain_endpoint(self, url: str, model: str, key: str | None) -> None:
-        env = BRAIN_KEY_ENV if key else self._brain_key_env()
+        env = BRAIN_KEY_ENV if key else self._brain_key_env(url)
         previous = _saved().get(BRAIN_KEY_ENV)
 
         def change(raw: dict) -> None:
@@ -302,6 +306,7 @@ class Actions:
     def _connect(self, carrier: str, creds: dict[str, str], number, existing: bool) -> LineResult:
         provider = self._provider(carrier, creds)
         messages: list[str] = []
+        line_id = ""
         try:
             for name, value in creds.items():
                 write_secret(name, value)
@@ -313,7 +318,12 @@ class Actions:
                 journal = Journal.open(paths.lines_dir(), line_id, provider.name)
                 code = provision_flow(provider, journal, self.config_path, line_id, number, existing=existing, say=messages.append)
         except (RuntimeError, ValueError, OSError) as e:  # ConfigError, SecretsError, ProviderError, a journal problem
-            raise ActionError(redact(str(e), creds.values())) from None
+            error = ActionError(redact(str(e), creds.values()))
+            if line_id and (paths.lines_dir() / f"{line_id}.journal.json").exists():  # carrier work may have begun
+                error = ActionError(f"{error}\nThe journal is kept: run `ai-phone lines resume {line_id}` to finish it, "
+                                    f"or `ai-phone lines remove {line_id}` to undo it.")
+                error.line_id = line_id
+            raise error from None
         return LineResult(line_id, code, [redact(m, creds.values()) for m in messages])
 
     def buy_number(self, carrier: str, creds: dict[str, str], number) -> LineResult:
@@ -532,8 +542,20 @@ def _last_line(log) -> str:
     return redact(text, _saved().values())[:160]
 
 
+def _host(url) -> str | None:
+    try:
+        return urlsplit(str(url)).hostname or None
+    except ValueError:
+        return None
+
+
 @contextlib.contextmanager
 def _quiet():
+    """Silence what mlx-audio prints, in plain mode. Off the main thread (the flow under the full-screen app) the
+    process-wide streams belong to Textual, which captures prints itself; swapping them there could lose its own."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
     with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink), \
             warnings.catch_warnings():
         warnings.simplefilter("ignore")

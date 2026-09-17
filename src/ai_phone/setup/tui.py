@@ -38,6 +38,8 @@ class PageScreen(Screen):
         super().__init__(classes="dense" if len(page.body.splitlines()) > DENSE_BODY_LINES else None)
         self.page, self.reply = page, reply
         self.options, self.default, self.back = list(options), default, back
+        # a menu whose default is its Back row is a confirmation (a purchase): only Enter answers it
+        self.confirming = back and default == len(self.options) - 1
         self.fields, self.busy, self.progress = list(fields), busy, progress
         self.answered = False
         self.frame, self.label, self.spinning = 0, busy, None
@@ -62,7 +64,7 @@ class PageScreen(Screen):
                     yield Static(look.checks_text(page.checks), id="checks")
             if page.body:
                 with Center():
-                    yield Static(Text(page.body, style=Style(color=look.WHITE), no_wrap=True), id="body")
+                    yield Static(Text(page.body, style=Style(color=look.WHITE)), id="body")  # wraps when narrow
             if page.error:
                 yield Static(Text(page.error), classes="error")
             if self.options:
@@ -130,7 +132,8 @@ class PageScreen(Screen):
     def stopping(self) -> None:
         """ctrl+c while a step runs: say so, and keep spinning until the step is done."""
         self.label = STOPPING
-        self.query_one("#status", Static).update(self._spinner())
+        for status in self.query("#status"):  # none on a menu, and none yet on a screen still being mounted
+            status.update(self._spinner())
 
     class Progress(Message):
         """Posted from the downloader's thread: posting never blocks it, and a closed screen just drops it."""
@@ -194,7 +197,8 @@ class PageScreen(Screen):
                 self.send(m.index)
             elif self._digit(event.character) in range(1, len(m.options) + 1):
                 m.index = self._digit(event.character) - 1
-                self.send(m.index)
+                if not self.confirming:  # a held or double-tapped digit must not buy: there, only Enter answers
+                    self.send(m.index)
 
     @staticmethod
     def _digit(character: str | None) -> int:
@@ -318,15 +322,19 @@ class SetupApp(App):
             self.exit()
 
 
-def run_tui(flow_fn: Callable[[UI], Outcome]) -> Outcome:
+def run_tui(flow_fn: Callable[[UI], Outcome], summary: Callable[[], str] | None = None) -> Outcome:
+    """Run the flow full-screen. `summary` says what the run did when the app has to leave before the flow returns
+    (a second ctrl+c while a step works, a download left behind, a screen that failed)."""
     app = SetupApp(flow_fn)
     app.run()  # returns once the terminal is restored
     if app.left_download:
         # huggingface_hub's download threads are joined at interpreter exit, which would wait for the whole
         # download; the files so far stay in the cache and the next pull resumes from them
-        print(DOWNLOAD_LEFT, flush=True)
+        print(summary() if summary else DOWNLOAD_LEFT, flush=True)
         sys.stderr.flush()
         os._exit(1)
-    if app.outcome is None and app.return_code:  # the app itself failed (Textual has printed what happened)
-        return Outcome(3, SCREEN_CLOSED)
-    return app.outcome or Outcome(1, CANCELLED)
+    if app.outcome is not None:
+        return app.outcome
+    if app.return_code:  # the app itself failed (Textual has printed what happened)
+        return Outcome(3, f"{SCREEN_CLOSED}\n{summary()}" if summary else SCREEN_CLOSED)
+    return Outcome(1, summary() if summary else CANCELLED)

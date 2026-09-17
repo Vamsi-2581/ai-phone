@@ -9,7 +9,7 @@ import pytest
 from ai_phone.setup import flow, run_setup
 from ai_phone.setup.plain import PlainUI
 from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
-from tests.unit.test_setup_flow import FakeActions
+from tests.unit.test_setup_flow import FakeActions, ScriptedUI
 
 LINE_PAGE = Page(2, "How should people reach your agent?", "You can add more lines later by running setup again.",
                  checks=[Check("Twilio key", "works · 2 numbers on this account", True)])
@@ -257,7 +257,7 @@ def test_run_setup_without_a_terminal_uses_plain_prompts(typed, capsys, monkeypa
     assert run_setup() == 1
     out = capsys.readouterr().out
     assert "ai-phone setup" in out
-    assert out.endswith("Setup cancelled. What earlier steps saved is kept; nothing else was changed.\n")
+    assert out.endswith("Setup cancelled. Nothing was changed.\n")
 
 
 class Terminal:
@@ -273,13 +273,59 @@ def test_run_setup_in_a_terminal_runs_the_full_screen_app(capsys, monkeypatch, t
     actions = FakeActions()
     monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
     monkeypatch.setattr("ai_phone.setup.sys", types.SimpleNamespace(stdin=Terminal(True), stdout=Terminal(True)))
-    seen = []
+    seen = {}
 
-    def run_tui(flow_fn):
-        seen.append(flow_fn)
+    def run_tui(flow_fn, summary=None):
+        seen["flow"] = flow_fn(ScriptedUI([("Give your AI", "Continue"), ("Where should your agent think?", "On this Mac"),
+                                           ("Which model size?", "<default>"), ("How should people reach", "<quit>")]))
+        seen["summary"] = summary()  # what a run the app had to leave early says: the same session
         return Outcome(0, "Saved\n  summary")
 
     monkeypatch.setitem(sys.modules, "ai_phone.setup.tui", types.SimpleNamespace(run_tui=run_tui))
     assert run_setup() == 0
-    assert len(seen) == 1 and callable(seen[0])
+    assert seen["flow"].code == 1 and actions.changes() == ["save_brain_local"]
+    assert seen["summary"] == "Setup cancelled. Saved in this run: the brain. Nothing else was changed."
     assert capsys.readouterr().out == "Saved\n  summary\n"
+
+
+def test_ctrl_c_in_plain_mode_ends_with_the_summary(typed, capsys, monkeypatch, tmp_path):
+    """ctrl+c outside a prompt (here, while a line is saved) never ends in a traceback."""
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
+    actions = FakeActions(add_sip_line=KeyboardInterrupt())
+    typed.answers += ["", "", "", "2", "", ""]
+    assert run_setup(plain=True) == 1
+    assert capsys.readouterr().out.endswith("\nSetup cancelled. Saved in this run: the brain. Nothing else was changed.\n")
+
+
+def test_quitting_after_a_purchase_in_plain_mode_names_it(typed, capsys, monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    actions = FakeActions(exists=True, saved_keys={"TWILIO_ACCOUNT_SID": "ACsid", "TWILIO_AUTH_TOKEN": "tok"})
+    monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
+    # Add a line, A phone number, Twilio, the saved key, A new number, US, any area, the first number, Buy, then EOF
+    typed.answers += ["1", "1", "1", "1", "1", "", "", "1", "1", EOFError()]
+    assert run_setup(plain=True) == 1
+    assert len(actions.args("buy_number")) == 1
+    assert capsys.readouterr().out.endswith("Setup cancelled. Saved in this run: line twilio (+15550100001, a Twilio "
+                                            "number billed monthly). Nothing else was changed.\n")
+
+
+def test_ctrl_c_during_a_download_in_plain_mode_exits_at_once(typed, capsys, monkeypatch, tmp_path):
+    """huggingface_hub joins its download threads at exit: a normal exit would wait for the whole download."""
+    import os
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    actions = FakeActions(exists=True, missing=["mlx-community/Qwen3.5-4B-MLX-4bit"], pull_models=KeyboardInterrupt())
+    monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
+    exits = []
+
+    def fake_exit(code):
+        exits.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(os, "_exit", fake_exit)
+    typed.answers += ["4", "", "", "", ""]  # Change what callers hear, three defaults, Download now
+    with pytest.raises(SystemExit):
+        run_setup(plain=True)
+    assert exits == [1]
+    assert capsys.readouterr().out.endswith("Downloading…\n\nSetup cancelled. The download stops now and picks up where it "
+                                            "left off next time. Saved in this run: what callers hear.\n")

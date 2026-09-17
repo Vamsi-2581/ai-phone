@@ -751,3 +751,165 @@ def test_quitting_other_work_returns_as_before(monkeypatch):
     monkeypatch.setattr(tui.os, "_exit", exits.append)
     assert run_tui(flow) == Outcome(1, "Setup cancelled.")
     assert exits == []
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_digit_never_confirms_a_purchase():
+    """A double tap or a held key: the digit that picked the number lands again on "Buy …?". There a digit only moves
+    the highlight; Enter confirms."""
+    got = {}
+
+    def flow(ui):
+        got["pick"] = ui.choose(Page(2, "Pick a number"), [Option("+15550100001", "$1.15/month"), Option("+15550100002")])
+        try:
+            got["confirm"] = ui.choose(Page(2, "Buy +15550100001 for $1.15/month?"), [Option("Buy +15550100001")], default=1)
+        except Back:
+            got["confirm"] = "back"
+        return Outcome(0)
+
+    app = SetupApp(flow)
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "Pick a number"))
+        await pilot.press("1", "1")
+        await wait_for(pilot, app, showing(app, "Buy +15550100001 for"))
+        await pilot.press("1", "1")
+        await pilot.pause(0.1)
+        assert got == {"pick": 0} and "▸ [1] Buy +15550100001" in screen_text(app)
+        await pilot.press("2")
+        await pilot.pause(0.05)
+        assert got == {"pick": 0} and "▸ [2] Back" in screen_text(app)
+        await pilot.press("enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert got == {"pick": 0, "confirm": "back"}
+
+    got.clear()
+    app = SetupApp(flow)
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "Pick a number"))
+        await pilot.press("enter")
+        await wait_for(pilot, app, showing(app, "Buy +15550100001 for"))
+        await pilot.press("1", "enter")  # two separate keys: a choice, then a confirmation
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert got == {"pick": 0, "confirm": 0}
+
+
+@pytest.mark.asyncio
+async def test_stopping_before_a_status_line_exists_is_harmless():
+    app = SetupApp(lambda ui: Outcome(ui.choose(LINE, OPTIONS)))
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "[3] Back"))
+        waiting = PageScreen(Page(2, "Setting up +15550100001"), busy="Buying…")  # not mounted yet: no status line
+        waiting.stopping()
+        assert waiting.label == "Stopping after this step…"
+        app.screen.stopping()  # a menu has no status line either
+        await pilot.press("enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert app.outcome == Outcome(0)
+
+
+def body_lines(app) -> list[str]:
+    body = app.screen.query_one("#body")
+    return [body.render_line(y).text for y in range(body.size.height)]
+
+
+@pytest.mark.asyncio
+async def test_a_wide_body_wraps_on_a_narrow_terminal():
+    from ai_phone.setup import flow
+    from tests.unit.test_setup_flow import NUMBER_LINE, SIP_LINE, FakeActions
+    summary = flow.done_text(FakeActions(exists=True, lines={"twilio": NUMBER_LINE, "agent": SIP_LINE}), flow.Session())
+    done = Page(6, "You're set up", "Everything is saved. Here's how to use it.", body=summary)
+    app = SetupApp(lambda ui: Outcome(ui.choose(done, [Option("Finish")], back=False)))
+    async with app.run_test(size=(70, 30)) as pilot:
+        await wait_for(pilot, app, lambda: isinstance(app.screen, PageScreen) and app.screen.is_mounted
+                       and app.screen.query_one("#body").size.height > 0)
+        await pilot.pause(0.05)
+        lines = body_lines(app)
+        assert max(len(line.rstrip()) for line in lines) <= 64  # the page's 70 columns less its padding
+        assert " ".join(" ".join(lines).split()) == " ".join(summary.split())  # every word is there, none cut
+        assert app.screen.query_one("#body").region.right <= 67
+        await pilot.press("enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+
+
+def test_a_second_ctrl_c_ends_with_what_the_run_did(monkeypatch, capsys):
+    release = threading.Event()
+
+    def flow(ui):
+        ui.busy(Page(2, "Setting up +15550100001"), "Buying +15550100001 and connecting it…", lambda: release.wait(5))
+        return Outcome(0)
+
+    async def quit_twice(pilot):
+        await wait_for(pilot, pilot.app, showing(pilot.app, "Buying +15550100001"))
+        await pilot.press("ctrl+c")
+        await wait_for(pilot, pilot.app, lambda: "Stopping after this step…" in screen_text(pilot.app))
+        await pilot.press("ctrl+c")
+
+    monkeypatch.setattr(tui, "SetupApp", headless(quit_twice))
+    assert run_tui(flow, summary=lambda: "what this run did") == Outcome(1, "what this run did")
+    release.set()
+
+    go = threading.Event()
+
+    def download(ui):
+        ui.progress(Page(5, "Downloading the models"), "Downloading…", lambda report: go.wait(5))
+        return Outcome(0)
+
+    async def quit_download(pilot):
+        await wait_for(pilot, pilot.app, showing(pilot.app, "Downloading…"))
+        await pilot.press("ctrl+c")
+
+    def fake_exit(code):
+        raise SystemExit(code)
+
+    monkeypatch.setattr(tui, "SetupApp", headless(quit_download))
+    monkeypatch.setattr(tui.os, "_exit", fake_exit)
+    with pytest.raises(SystemExit):
+        run_tui(download, summary=lambda: "the download and what this run did")
+    assert capsys.readouterr().out == "the download and what this run did\n"
+    go.set()
+
+
+def test_run_setup_names_a_purchase_that_a_second_ctrl_c_left(monkeypatch, capsys, tmp_path):
+    import types
+
+    from ai_phone.setup import run_setup
+    from tests.unit.test_setup_flow import FakeActions
+    from tests.unit.test_setup_plain import Terminal
+
+    release = threading.Event()
+
+    class SlowCarrier(FakeActions):
+        def buy_number(self, carrier, creds, number):
+            release.wait(5)
+            return super().buy_number(carrier, creds, number)
+
+    actions = SlowCarrier(exists=True, saved_keys={"TWILIO_ACCOUNT_SID": "ACsid", "TWILIO_AUTH_TOKEN": "tok"})
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
+    monkeypatch.setattr("ai_phone.setup.sys", types.SimpleNamespace(stdin=Terminal(True), stdout=Terminal(True)))
+
+    async def buy_then_quit_twice(pilot):
+        app = pilot.app
+        # Add a line, A phone number, Twilio, the saved key, A new number
+        for question in ("Give your AI", "How should people reach", "Which carrier?", "Use the saved Twilio key?",
+                         "A new number or one"):
+            await wait_for(pilot, app, showing(app, question))
+            await pilot.press("enter")
+        await wait_for(pilot, app, showing(app, "Where should the number be?"))
+        await pilot.press("enter", "enter")
+        await wait_for(pilot, app, showing(app, "Pick a number"))
+        await pilot.press("enter")
+        await wait_for(pilot, app, showing(app, "Buy +15550100001"))
+        await pilot.press("1", "enter")
+        await wait_for(pilot, app, lambda: "Buying +15550100001 and connecting it…" in screen_text(app))
+        await pilot.press("ctrl+c")
+        await wait_for(pilot, app, lambda: "Stopping after this step…" in screen_text(app))
+        await pilot.press("ctrl+c")
+
+    monkeypatch.setattr(tui, "SetupApp", headless(buy_then_quit_twice))
+    assert run_setup() == 1
+    assert capsys.readouterr().out == (
+        "Setup stopped during: Buying +15550100001 and connecting it…\n"
+        "That carrier step may be half done. See your lines with: uv run ai-phone lines list\n"
+        "then finish one with: uv run ai-phone lines resume <line>, or undo it with: uv run ai-phone lines remove <line>\n")
+    release.set()

@@ -14,7 +14,7 @@ from ai_phone.providers.base import Number
 from ai_phone.setup import flow
 from ai_phone.setup.actions import ActionError, Current, LineResult, Machine
 from ai_phone.setup.flow import BRAIN, CALLERS, CHECK, DONE, LINE, VOICE, WELCOME
-from ai_phone.setup.ui import BaseUI, Cancel, Check, Page
+from ai_phone.setup.ui import BaseUI, Cancel, Check, Outcome, Page
 
 GREETING, INSTRUCTIONS = InboundConfig().greeting, InboundConfig().instructions
 VOICES = ["af_bella", "af_heart", "am_adam", "bf_emma", "bm_george"]
@@ -307,7 +307,7 @@ def test_welcome_shows_the_machine_checks():
     ui = ScriptedUI([("Give your AI", "Cancel")])
     outcome = drive(ui, FakeActions(memory=8, sip_library=False, missing=["a/b"]))
     assert outcome.code == 1
-    assert outcome.summary == "Setup cancelled. What earlier steps saved is kept; nothing else was changed."
+    assert outcome.summary == "Setup cancelled. Nothing was changed."
     page = ui.pages[0]
     assert page.detail == "Calls answered and placed by models running on this Mac."
     assert page.note == "Picks a line, a brain and a voice, then checks it all works."
@@ -364,7 +364,7 @@ def test_endpoint_brain_keeps_the_saved_key_when_left_empty():
     actions.cur.brain_kind, actions.cur.model, actions.cur.brain_key_saved = "openai_compatible", "qwen", True
     assert drive(ui, actions).code == 1
     assert ui.menus[1][2] == 1  # the current brain is the default
-    assert ui.fields[2].placeholder == "leave empty to keep the saved key"
+    assert ui.fields[2].placeholder == "leave empty to keep the saved key (same server)"
     assert actions.args("test_endpoint") == [("https://api.example.com/v1", "qwen", None)]
     assert actions.args("save_brain_endpoint") == [("https://api.example.com/v1", "qwen", None)]
     assert ui.labels[0] == "Sending one short test request to api.example.com…"
@@ -674,6 +674,8 @@ def test_enter_a_different_key_asks_for_it():
     actions = FakeActions(exists=True, saved_keys={"TWILIO_ACCOUNT_SID": "ACold", "TWILIO_AUTH_TOKEN": "old"})
     drive(ui, actions)
     assert actions.args("owned_numbers") == [("twilio", TWILIO)]
+    assert [(o.label, o.hint) for o in ui.menu("Use the saved Twilio key?")[1]] == [
+        ("Use the saved key", ""), ("Enter a different key", "replaces the saved key")]
 
 
 def test_pending_number_shows_the_messages_and_skips_forwarding():
@@ -880,8 +882,126 @@ def test_cancel_keeps_finished_steps_only():
     actions = FakeActions()
     outcome = drive(ui, actions)
     assert outcome.code == 1 and ui.closed
-    assert "Setup cancelled" in outcome.summary
+    assert outcome.summary == ("Setup cancelled. Saved in this run: the brain, line agent (sip:agent@192.0.2.10). "
+                               "Nothing else was changed.")
     assert actions.changes() == ["save_brain_local", "add_sip_line"]
+
+
+def buy_then(*after):
+    return ScriptedUI([
+        *add_a_line(),
+        ("Your Twilio credentials", ["ACsid", "tokSECRET"]),
+        ("A new number or one you already have?", "A new number"),
+        ("Where should the number be?", ["", ""]),
+        ("Pick a number", "+15550100001"),
+        ("Buy +15550100001 for $1.15/month?", "Buy +15550100001"),
+        *after,
+    ])
+
+
+def test_a_cancel_after_a_purchase_names_the_number():
+    """People who read "nothing changed" do not go looking for a monthly charge."""
+    outcome = drive(buy_then(("Also forward your own mobile to it?", "<quit>")), FakeActions(exists=True))
+    assert outcome == Outcome(1, "Setup cancelled. Saved in this run: line twilio (+15550100001, a Twilio number billed "
+                                 "monthly). Nothing else was changed.")
+    messages = ["order pending"]
+    actions = FakeActions(exists=True, buy_number=LineResult("twilio", 2, messages))
+    outcome = drive(buy_then(("The number is not ready yet", "<quit>")), actions)
+    assert outcome.summary == ("Setup cancelled. Saved in this run: line twilio (+15550100001, not finished: "
+                               "uv run ai-phone lines resume twilio, or uv run ai-phone lines remove twilio). "
+                               "Nothing else was changed.")
+    ui = ScriptedUI([
+        *add_a_line("Telnyx"),
+        ("Use the saved Telnyx key?", "Use the saved key"),
+        ("A new number or one you already have?", "One I already have"),
+        ("Which number?", "+15550100007"),
+        ("Connect +15550100007 to ai-phone?", "Connect +15550100007"),
+        ("Also forward your own mobile to it?", "Yes"),
+        ("Your mobile number", ["+447700900123"]),
+        ("When should calls go to your agent?", "All calls"),
+        ("Dial this on your mobile", "Done"),
+        ("Everything works", "<quit>"),
+    ])
+    outcome = drive(ui, FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}))
+    assert outcome.summary == ("Setup cancelled. Saved in this run: line telnyx (+15550100007), call forwarding from "
+                               "+447700900123 to line telnyx. Nothing else was changed.")
+
+
+def test_a_failed_purchase_keeps_its_line_id_for_the_summary():
+    error = ActionError("disk full\nThe journal is kept: run `ai-phone lines resume twilio` to finish it, or "
+                        "`ai-phone lines remove twilio` to undo it.")
+    error.line_id = "twilio"
+    outcome = drive(buy_then(("Something went wrong", "<quit>")), FakeActions(exists=True, buy_number=Seq(error)))
+    assert outcome.summary == ("Setup cancelled. Saved in this run: line twilio (+15550100001, not finished: "
+                               "uv run ai-phone lines resume twilio, or uv run ai-phone lines remove twilio). "
+                               "Nothing else was changed.")
+
+
+def test_ctrl_c_during_a_purchase_says_it_may_be_half_done():
+    """Plain mode: ctrl+c lands inside the carrier requests."""
+    session = flow.Session()
+    ui = buy_then()
+    outcome = flow.run(ui, FakeActions(exists=True, save_brain_local=None, buy_number=Seq(KeyboardInterrupt())), session)
+    assert outcome == Outcome(1, "\n".join([
+        "Setup stopped during: Buying +15550100001 and connecting it…",
+        "That carrier step may be half done. See your lines with: uv run ai-phone lines list",
+        "then finish one with: uv run ai-phone lines resume <line>, or undo it with: uv run ai-phone lines remove <line>",
+    ]))
+    assert ui.closed and not ui.answers and not session.left_download
+    ui = ScriptedUI([
+        WELCOME_NEW,
+        ("Where should your agent think?", "On this Mac"),
+        ("Which model size?", "<default>"),
+        ("How should people reach your agent?", "A SIP address"),
+        ("Name your SIP address", ["", ""]),
+        ("How should your agent sound?", "American · female"),
+        ("American · female", "Heart"),
+        ("Heart", "Hear it"),
+    ])
+    outcome = flow.run(ui, FakeActions(play_sample=KeyboardInterrupt()))
+    assert outcome == Outcome(1, "Setup stopped during: Playing…\nSaved in this run: the brain, line agent "
+                                 "(sip:agent@192.0.2.10). Nothing else was changed.")
+
+
+def test_ctrl_c_during_a_download_says_it_resumes():
+    session = flow.Session()
+    ui = ScriptedUI([
+        ("Give your AI", "Change what callers hear"),
+        ("What should callers hear?", ["", "", ""]),
+        ("Download the models now?", "Download now"),
+    ])
+    actions = FakeActions(exists=True, missing=["mlx-community/Qwen3.5-4B-MLX-4bit"], pull_models=KeyboardInterrupt())
+    outcome = flow.run(ui, actions, session)
+    assert outcome == Outcome(1, "Setup cancelled. The download stops now and picks up where it left off next time. "
+                                 "Saved in this run: what callers hear.")
+    assert session.left_download and flow.cancel_text(session) == outcome.summary
+    ui = ScriptedUI([("Give your AI", "Change the voice"), ("How should your agent sound?", "Download it now")])
+    session = flow.Session()
+    outcome = flow.run(ui, FakeActions(exists=True, voices=[], pull_voice_model=KeyboardInterrupt()), session)
+    assert outcome == Outcome(1, "Setup cancelled. The download stops now and picks up where it left off next time.")
+    assert session.left_download
+
+
+def test_a_finished_or_failed_step_is_no_longer_the_one_running():
+    session = flow.Session()
+    ui = ScriptedUI([
+        ("Give your AI", "Change what callers hear"),
+        ("What should callers hear?", ["", "", ""]),
+        ("Download the models now?", "Download now"),
+        ("A few things need attention", "Continue"),
+        ("You're set up", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, missing=["m"], lines={"agent": SIP_LINE}, pull_models=ActionError("could not download m"))
+    assert flow.run(ui, actions, session).code == 0
+    assert session.working is None and not session.left_download
+    assert session.saved == ["what callers hear"]
+    ui = ScriptedUI([("Give your AI", "Change what callers hear"), ("What should callers hear?", ["", "", ""]),
+                     ("Download the models now?", "Download now"), ("Everything works", "<quit>")])
+    session = flow.Session()
+    flow.run(ui, FakeActions(exists=True, missing=["m"], lines={"agent": SIP_LINE}), session)
+    assert session.saved == ["what callers hear", "the downloaded models"]
+    assert flow.cancel_text(session) == ("Setup cancelled. Saved in this run: what callers hear, the downloaded models. "
+                                         "Nothing else was changed.")
 
 
 def test_leaving_on_the_done_page_still_finishes():
@@ -1034,10 +1154,11 @@ def test_unexpected_errors_stop_setup_without_a_traceback():
     broken = "config.yaml is not valid YAML; fix it or move it away, then run setup again"
     ui = ScriptedUI([("Give your AI", "Change what callers hear"), ("What should callers hear?", ["", "", ""])])
     outcome = flow.run(ui, FakeActions(exists=True, check_config=ActionError(broken)))
-    assert (outcome.code, outcome.summary) == (3, f"Setup stopped: {broken}") and ui.closed
+    assert (outcome.code, outcome.summary) == (3, f"Setup stopped: {broken}\nSaved in this run: what callers hear. "
+                                                  "Nothing else was changed.") and ui.closed
     ui = ScriptedUI([("Give your AI", "Change the voice")])
     outcome = flow.run(ui, FakeActions(exists=True, voices=KeyError("af_secret_detail")))
-    assert (outcome.code, outcome.summary) == (3, "Setup stopped: KeyError") and ui.closed
+    assert (outcome.code, outcome.summary) == (3, "Setup stopped: KeyError\nNothing was changed.") and ui.closed
 
 
 def test_check_offers_the_download_and_reports():

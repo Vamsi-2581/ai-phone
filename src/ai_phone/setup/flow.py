@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -25,15 +25,45 @@ CARRIERS = (("twilio", "Twilio"), ("telnyx", "Telnyx"))
 VOICE_GROUPS = (("af", "American · female"), ("am", "American · male"), ("bf", "British · female"), ("bm", "British · male"))
 FORWARD_WHEN = ("no-answer", "busy", "unreachable", "all")
 TRANSPORTS = ("udp", "tcp", "tls")
+DOWNLOAD_LEFT = "Setup cancelled. The download stops now and picks up where it left off next time."
+HALF_DONE = ("That carrier step may be half done. See your lines with: uv run ai-phone lines list\n"
+             "then finish one with: uv run ai-phone lines resume <line>, or undo it with: uv run ai-phone lines remove <line>")
 
 
 @dataclass
 class Session:
+    """What this run did, so a run that stops early can say so. The full-screen app reads it from another thread."""
     summary: str = ""
+    saved: list[str] = field(default_factory=list)  # in words: "the brain", "line twilio (+1555…, …)"
+    working: tuple[str, str] | None = None  # the step running now: (its label, "carrier" | "download" | "")
+
+    def note(self, what: str) -> None:
+        if what not in self.saved:
+            self.saved.append(what)
+
+    @property
+    def left_download(self) -> bool:
+        return self.working is not None and self.working[1] == "download"
 
 
-def run(ui, actions) -> Outcome:
-    session = Session()
+def saved_text(session: Session) -> str:
+    done = ", ".join(session.saved)
+    return f"Saved in this run: {done}. Nothing else was changed." if done else "Nothing was changed."
+
+
+def cancel_text(session: Session) -> str:
+    """What a run that stopped early tells the person: what it saved, and what the step it stopped in may have left."""
+    label, kind = session.working or ("", "")
+    done = ", ".join(session.saved)
+    if kind == "carrier":
+        return "\n".join([f"Setup stopped during: {label}", HALF_DONE] + ([f"Saved in this run before that: {done}."] if done else []))
+    if kind == "download":
+        return DOWNLOAD_LEFT + (f" Saved in this run: {done}." if done else "")
+    return (f"Setup stopped during: {label}\n" if label else "Setup cancelled. ") + saved_text(session)
+
+
+def run(ui, actions, session: Session | None = None) -> Outcome:
+    session = Session() if session is None else session
     try:
         plan = welcome(ui, actions)
         i = 0
@@ -50,14 +80,34 @@ def run(ui, actions) -> Outcome:
                 else:
                     i -= 1
         return Outcome(0, session.summary or done_text(actions, session))
-    except Cancel:
-        return Outcome(1, "Setup cancelled. What earlier steps saved is kept; nothing else was changed.")
+    except (Cancel, KeyboardInterrupt):  # ctrl+c reaches plain mode as KeyboardInterrupt, wherever the flow is
+        return Outcome(1, cancel_text(session))
     except ActionError as e:  # every step shows its own; this is one no step expected (a config that broke meanwhile)
-        return Outcome(3, f"Setup stopped: {e}")
+        return Outcome(3, f"Setup stopped: {e}\n{saved_text(session)}")
     except Exception as e:  # a bug: say so without a traceback (or a message that might hold more than it should)
-        return Outcome(3, f"Setup stopped: {type(e).__name__}")
+        return Outcome(3, f"Setup stopped: {type(e).__name__}\n{saved_text(session)}")
     finally:
         ui.close()
+
+
+def busy(ui, session: Session, page: Page, label: str, work, kind: str = ""):
+    """ui.busy, with the step noted as running while its work runs (a stop in the middle then names it)."""
+    return ui.busy(page, label, lambda: _running(session, label, kind, work))
+
+
+def progress(ui, session: Session, page: Page, label: str, work):
+    return ui.progress(page, label, lambda report: _running(session, label, "download", work, report))
+
+
+def _running(session: Session, label: str, kind: str, work, *args):
+    session.working = (label, kind)
+    try:
+        result = work(*args)
+    except ActionError:  # the step ended, and the flow carries on
+        session.working = None
+        raise
+    session.working = None  # a stop (Cancel, KeyboardInterrupt) or a bug leaves it noted
+    return result
 
 
 def ask(ui, page: Page, fields: list[Field]) -> list[str]:
@@ -198,7 +248,7 @@ def brain(ui, actions, session: Session) -> None:
                        Option("My own endpoint", "any OpenAI-compatible URL: LM Studio, llama.cpp, a hosted API")],
                       default=0 if cur.brain_kind == "local" else 1)
     if where == 1:
-        return brain_endpoint(ui, actions, cur)
+        return brain_endpoint(ui, actions, session, cur)
     mem = actions.machine().memory_gb
     recommended = "t9" if mem >= 32 else "t4"
     tiers = [t for t, _ in TIERS]
@@ -211,14 +261,15 @@ def brain(ui, actions, session: Session) -> None:
                              Option("Qwen 9B", "smarter · needs 32 GB or more")], default=default)
         try:
             actions.save_brain_local(tiers[default])
+            session.note("the brain")
             return
         except ActionError as e:
             error = str(e)
 
 
-def brain_endpoint(ui, actions, cur) -> None:
+def brain_endpoint(ui, actions, session: Session, cur) -> None:
     base_url, model, error = cur.base_url, cur.model, ""
-    keep = "leave empty to keep the saved key" if cur.brain_key_saved else "leave empty for none"
+    keep = "leave empty to keep the saved key (same server)" if cur.brain_key_saved else "leave empty for none"
     while True:
         page = Page(BRAIN, "Your endpoint", "Any server that speaks the OpenAI chat API. The key is optional and is saved "
                     f"to {home_dir()}/secrets.env.", error=error)
@@ -233,9 +284,10 @@ def brain_endpoint(ui, actions, cur) -> None:
         except ValueError:
             where = base_url
         try:
-            ui.busy(replace(page, error=""), f"Sending one short test request to {where}…",
-                    lambda: actions.test_endpoint(base_url, model, key or None))
+            busy(ui, session, replace(page, error=""), f"Sending one short test request to {where}…",
+                 lambda: actions.test_endpoint(base_url, model, key or None))
             actions.save_brain_endpoint(base_url, model, key or None)
+            session.note("the brain")
             return
         except ActionError as e:
             error = str(e)
@@ -264,7 +316,7 @@ def phone_number(ui, actions, session: Session) -> None:
         [Option("Twilio", "Account SID + Auth Token"), Option("Telnyx", "API key")])]
     creds = actions.saved_keys(carrier)
     page = Page(LINE, f"Use the saved {name} key?", f"It is in {home_dir()}/secrets.env.")
-    if creds and ui.choose(page, [Option("Use the saved key"), Option("Enter a different key")]) == 1:
+    if creds and ui.choose(page, [Option("Use the saved key"), Option("Enter a different key", "replaces the saved key")]) == 1:
         creds = None
     owned, error = None, ""
     while owned is None:
@@ -275,7 +327,7 @@ def phone_number(ui, actions, session: Session) -> None:
             creds = dict(zip(CARRIER_KEYS[carrier], typed, strict=True))
             page = replace(page, error="")
         try:
-            owned = ui.busy(page, f"Checking your {name} account…", lambda: actions.owned_numbers(carrier, creds))
+            owned = busy(ui, session, page, f"Checking your {name} account…", lambda: actions.owned_numbers(carrier, creds))
         except ActionError as e:
             creds, error = None, str(e)
     # a number that is already a line is not offered (connecting it again would overwrite its routing), nor one an
@@ -291,12 +343,25 @@ def phone_number(ui, actions, session: Session) -> None:
                        "Buy one instead, or add a number in the carrier's console and run setup again."),
                   [Option("Buy a new number")])
         new = True
-    result = buy_number(ui, actions, carrier, name, creds) if new else attach_number(ui, actions, carrier, name, creds, free)
+    if new:
+        result, n = buy_number(ui, actions, session, carrier, name, creds)
+    else:
+        result, n = attach_number(ui, actions, session, carrier, name, creds, free)
+    if result.line_id:  # written, or at least journaled: a stop from here on must name it
+        session.note(line_note(result, n.e164, name, bought=new))
     if result.code != 0:
         ui.choose(Page(LINE, "The number is not ready yet" if result.code == 2 else "Something went wrong",
                        body="\n".join(result.messages)), [Option("Continue")], back=False)
         return
-    forward(ui, actions, result.line_id)
+    forward(ui, actions, session, result.line_id)
+
+
+def line_note(result: LineResult, number: str, carrier: str, bought: bool) -> str:
+    line_id = result.line_id
+    if result.code != 0:
+        return (f"line {line_id} ({number}, not finished: uv run ai-phone lines resume {line_id}, "
+                f"or uv run ai-phone lines remove {line_id})")
+    return f"line {line_id} ({number}, a {carrier} number billed monthly)" if bought else f"line {line_id} ({number})"
 
 
 def credential_fields(carrier: str) -> list[Field]:
@@ -306,7 +371,7 @@ def credential_fields(carrier: str) -> list[Field]:
     return [Field("API key", secret=True, placeholder="KEY…", validate=required)]
 
 
-def buy_number(ui, actions, carrier: str, name: str, creds: dict):
+def buy_number(ui, actions, session: Session, carrier: str, name: str, creds: dict):
     where, found, error = "US", [], ""
     while not found:
         page = Page(LINE, "Where should the number be?", "A two-letter country code, and an area code if you want one.", error=error)
@@ -316,8 +381,8 @@ def buy_number(ui, actions, carrier: str, name: str, creds: dict):
         ])
         where = where.upper()
         try:
-            found = ui.busy(replace(page, error=""), "Looking for numbers…",
-                            lambda: actions.search_numbers(carrier, creds, where, code or None))
+            found = busy(ui, session, replace(page, error=""), "Looking for numbers…",
+                         lambda: actions.search_numbers(carrier, creds, where, code or None))
             error = "" if found else "No numbers found there. Try another area code, or leave it empty."
         except ActionError as e:
             error = str(e)
@@ -327,29 +392,29 @@ def buy_number(ui, actions, carrier: str, name: str, creds: dict):
                       f"{name} bills your account every month until you remove the line (ai-phone lines remove)."),
                  [Option(f"Buy {n.e164}", price(n))], default=1) != 0:  # Enter means Back: only choosing Buy buys
         raise Back()
-    return run_line_action(ui, Page(LINE, f"Setting up {n.e164}"), f"Buying {n.e164} and connecting it…",
-                           lambda: actions.buy_number(carrier, creds, n))
+    return run_line_action(ui, session, Page(LINE, f"Setting up {n.e164}"), f"Buying {n.e164} and connecting it…",
+                           lambda: actions.buy_number(carrier, creds, n)), n
 
 
-def attach_number(ui, actions, carrier: str, name: str, creds: dict, owned: list):
+def attach_number(ui, actions, session: Session, carrier: str, name: str, creds: dict, owned: list):
     shown = owned[:20]
     n = shown[ui.choose(Page(LINE, "Which number?", f"The numbers on your {name} account."), [Option(n.e164) for n in shown])]
     if ui.choose(Page(LINE, f"Connect {n.e164} to ai-phone?", "Its incoming calls will ring ai-phone. Nothing is bought. "
                       "Removing the line later disconnects it and keeps the number."),
                  [Option(f"Connect {n.e164}", "free")], default=1) != 0:  # Enter means Back
         raise Back()
-    return run_line_action(ui, Page(LINE, f"Setting up {n.e164}"), f"Connecting {n.e164}…",
-                           lambda: actions.attach_number(carrier, creds, n))
+    return run_line_action(ui, session, Page(LINE, f"Setting up {n.e164}"), f"Connecting {n.e164}…",
+                           lambda: actions.attach_number(carrier, creds, n)), n
 
 
-def run_line_action(ui, page: Page, label: str, work) -> LineResult:
+def run_line_action(ui, session: Session, page: Page, label: str, work) -> LineResult:
     try:
-        return ui.busy(page, label, work)
-    except ActionError as e:
-        return LineResult("", 3, [str(e)])
+        return busy(ui, session, page, label, work, kind="carrier")
+    except ActionError as e:  # the line id, when one was chosen and its journal kept
+        return LineResult(getattr(e, "line_id", ""), 3, [str(e)])
 
 
-def forward(ui, actions, line_id: str) -> None:
+def forward(ui, actions, session: Session, line_id: str) -> None:
     """The line exists now, so Back inside these questions (or a forward that cannot be saved) returns to the first
     one, never to the purchase."""
     error = ""
@@ -366,6 +431,7 @@ def forward(ui, actions, line_id: str) -> None:
                                           [Option("When I don't answer"), Option("When I'm busy"),
                                            Option("When my phone is off"), Option("All calls")])]
             codes = actions.forward(line_id, mobile, when)
+            session.note(f"call forwarding from {mobile} to line {line_id}")
             break
         except Back:
             error = ""
@@ -398,7 +464,7 @@ def sip_address(ui, actions, session: Session) -> None:
                                      "Free; no carrier.", error=error),
                             [Field("Name", name, validate=sip_name), Field("This Mac's address", address, validate=host)])
         try:
-            actions.add_sip_line(name, address)
+            session.note(f"line {actions.add_sip_line(name, address)} (sip:{name}@{address})")
             return
         except ActionError as e:
             error = str(e)
@@ -417,7 +483,7 @@ def own_trunk(ui, actions, session: Session) -> None:
                                          [Option("UDP"), Option("TCP"), Option("TLS", "encrypted signalling")])]
         uri = registrar if registrar.startswith(("sip:", "sips:")) else f"sip:{registrar}"
         try:
-            actions.add_trunk_line(uri, user, password, number, transport)
+            session.note(f"line {actions.add_trunk_line(uri, user, password, number, transport)} ({number})")
             return
         except ActionError as e:
             error = str(e)
@@ -439,8 +505,10 @@ def voice(ui, actions, session: Session) -> None:
         try:
             if i == 1:
                 actions.save_voice(voices.DEFAULT, 1.0)
+                session.note("the voice")
                 return
-            ui.progress(Page(VOICE, "Downloading the speech model"), "Downloading…", actions.pull_voice_model)
+            progress(ui, session, Page(VOICE, "Downloading the speech model"), "Downloading…", actions.pull_voice_model)
+            session.note("the downloaded speech model")
             names = english_voices(actions)
             error = "" if names else "The speech model downloaded, but it has no voices to pick from. Try the download again."
         except ActionError as e:
@@ -460,7 +528,7 @@ def voice(ui, actions, session: Session) -> None:
         if ui.choose(page, [Option("Use this voice"), Option("Hear it", "plays a short sample on this Mac's speakers")]) == 0:
             break
         try:
-            ui.busy(replace(page, error=""), "Playing…", lambda: actions.play_sample(v, cur.speed, SAMPLE))
+            busy(ui, session, replace(page, error=""), "Playing…", lambda: actions.play_sample(v, cur.speed, SAMPLE))
             error = ""
         except ActionError as e:
             error = str(e)
@@ -470,6 +538,7 @@ def voice(ui, actions, session: Session) -> None:
                                 error=error), [Field("Speed", value, validate=speed)])
         try:
             actions.save_voice(v, float(value))
+            session.note("the voice")
             return
         except ActionError as e:
             error = str(e)
@@ -489,6 +558,7 @@ def callers(ui, actions, session: Session) -> None:
                                             Field("Outbound calls per day", limit, placeholder="0 means no limit", validate=count)])
         try:
             actions.save_callers(greeting, instructions, int(limit))
+            session.note("what callers hear")
             return
         except ActionError as e:
             error = str(e)
@@ -499,15 +569,16 @@ def callers(ui, actions, session: Session) -> None:
 def check(ui, actions, session: Session) -> None:
     while True:
         rows: list[Check] = []
-        rows.append(check_models(ui, actions, checking(rows)))
+        rows.append(check_models(ui, actions, session, checking(rows)))
         error = actions.check_config()
         rows.append(Check("Config", "loads", True) if error is None else Check("Config", error, False))
         cur = actions.current()
         if error is None:
-            rows.extend(check_lines(ui, actions, checking(rows), cur))
+            rows.extend(check_lines(ui, actions, session, checking(rows), cur))
         if actions.voices():  # the speech model is here
             try:
-                ui.busy(checking(rows), "Playing your agent's voice…", lambda: actions.play_sample(cur.voice, cur.speed, DISCLOSURE))
+                busy(ui, session, checking(rows), "Playing your agent's voice…",
+                     lambda: actions.play_sample(cur.voice, cur.speed, DISCLOSURE))
                 rows.append(Check("Voice", f"{voices.title(cur.voice)} · played", True))
             except ActionError as e:
                 rows.append(Check("Voice", str(e), False))
@@ -522,25 +593,26 @@ def checking(rows: list[Check]) -> Page:
     return Page(CHECK, "Checking that it all works", checks=list(rows))
 
 
-def check_models(ui, actions, page: Page) -> Check:
+def check_models(ui, actions, session: Session, page: Page) -> Check:
     if not actions.missing_models():
         return Check("Models", "downloaded", True)
-    size = ui.busy(page, "Checking the download size…", actions.download_size)
+    size = busy(ui, session, page, "Checking the download size…", actions.download_size)
     later = ui.choose(Page(CHECK, "Download the models now?", f"About {gb(size)}, saved in the Hugging Face cache. "
                            "ai-phone needs them to answer calls."),
                       [Option("Download now", gb(size)), Option("Later", "run: uv run ai-phone models pull")]) == 1
     if later:
         return Check("Models", "not downloaded yet · uv run ai-phone models pull", None)
     try:
-        ui.progress(Page(CHECK, "Downloading the models", "You can leave this running. It picks up where it stopped if interrupted."),
-                    "Downloading…", actions.pull_models)
+        progress(ui, session, Page(CHECK, "Downloading the models", "You can leave this running. It picks up where it "
+                                   "stopped if interrupted."), "Downloading…", actions.pull_models)
+        session.note("the downloaded models")
         return Check("Models", "downloaded", True)
     except ActionError as e:
         return Check("Models", str(e), False)
 
 
-def check_lines(ui, actions, page: Page, cur) -> list[Check]:
-    found = ui.busy(page, "Checking your lines… (up to 20 seconds)", actions.check_lines) if cur.lines else []
+def check_lines(ui, actions, session: Session, page: Page, cur) -> list[Check]:
+    found = busy(ui, session, page, "Checking your lines… (up to 20 seconds)", actions.check_lines) if cur.lines else []
     if not found:
         return [Check("Lines", "none yet · run setup again to add one", None)]
     ok = {"registered": True, "ready": True, "registering": None, "skipped": None}

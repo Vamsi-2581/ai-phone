@@ -138,8 +138,8 @@ def test_save_brain_endpoint_saves_the_key_and_rolls_back(home):
     assert "https" in str(e.value) and "SECRET" not in str(e.value)
     assert (home / "config.yaml").read_text() == before
     assert load_secrets()[BRAIN_KEY_ENV] == "sk-new-SECRET"  # the key that worked is put back
-    a.save_brain_endpoint("http://127.0.0.1:8080/v1", "local-model", None)  # no key typed: keep the saved one
-    assert raw(home)["brain"] == {"kind": "openai_compatible", "base_url": "http://127.0.0.1:8080/v1", "model": "local-model",
+    a.save_brain_endpoint("https://api.example.com/v2", "local-model", None)  # no key typed, same server: keep the saved one
+    assert raw(home)["brain"] == {"kind": "openai_compatible", "base_url": "https://api.example.com/v2", "model": "local-model",
                                   "api_key_env": BRAIN_KEY_ENV}
     assert raw(home)["inbound"] == {"greeting": "Hi"}
 
@@ -185,6 +185,29 @@ def test_endpoint_test_sends_one_short_request(home):
     (home / "config.yaml").write_text(f"brain: {{kind: openai_compatible, base_url: 'http://127.0.0.1:1234/v1', api_key_env: {BRAIN_KEY_ENV}}}\n")
     a.test_endpoint("http://127.0.0.1:1234/v1", "qwen", None)
     assert seen[2].headers["authorization"] == "Bearer sk-saved-SECRET"
+
+
+def test_a_saved_key_goes_only_to_the_server_it_was_saved_for(home):
+    seen = []
+
+    def handler(req):
+        seen.append(req)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]})
+
+    write_secret(BRAIN_KEY_ENV, "sk-saved-SECRET")
+    a = endpoint(home, handler)
+    (home / "config.yaml").write_text(f"brain: {{kind: openai_compatible, base_url: 'https://API.example.com/v1', "
+                                      f"model: qwen, api_key_env: {BRAIN_KEY_ENV}}}\n")
+    a.test_endpoint("https://api.example.com:443/v2", "qwen", None)  # the same host: the saved key
+    a.test_endpoint("https://other.example.org/v1", "qwen", None)  # another host: no key
+    assert seen[0].headers["authorization"] == "Bearer sk-saved-SECRET" and "authorization" not in seen[1].headers
+    a.save_brain_endpoint("https://other.example.org/v1", "qwen", None)
+    assert raw(home)["brain"] == {"kind": "openai_compatible", "base_url": "https://other.example.org/v1", "model": "qwen"}
+    assert not a.current().brain_key_saved
+    (home / "config.yaml").write_text(f"brain: {{kind: openai_compatible, base_url: 'https://api.example.com/v1', "
+                                      f"model: qwen, api_key_env: {BRAIN_KEY_ENV}}}\n")
+    a.save_brain_endpoint("https://api.example.com/v2", "qwen-2", None)
+    assert raw(home)["brain"]["api_key_env"] == BRAIN_KEY_ENV
 
 
 def test_endpoint_test_reports_what_the_endpoint_said_without_the_key(home):
@@ -385,6 +408,21 @@ def test_a_refused_number_comes_back_with_the_reason(home):
     assert (refused.line_id, refused.code) == ("fake-2", 3)
     assert refused.messages == [f"error: {BOUGHT} is already line fake"]
     assert not (home / "lines" / "fake-2.journal.json").exists()
+
+
+def test_a_purchase_that_breaks_after_its_journal_says_how_to_finish_it(home, monkeypatch):
+    import ai_phone.setup.actions as actions_module
+
+    def full(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(actions_module, "provision_flow", full)
+    a = make(home)
+    with pytest.raises(ActionError) as e:
+        a.buy_number("fake", FAKE_KEY, Number(BOUGHT, 1.0, "GBP", False, "src-0"))
+    assert str(e.value) == ("[Errno 28] No space left on device\nThe journal is kept: run `ai-phone lines resume fake` to "
+                            "finish it, or `ai-phone lines remove fake` to undo it.")
+    assert e.value.line_id == "fake"
 
 
 def test_nothing_is_bought_into_a_config_that_does_not_load(home):
@@ -783,6 +821,26 @@ def test_kokoro_player_writes_a_wav_and_plays_it(tmp_path, monkeypatch, capsys, 
     assert kokoro.calls[0] == {"text": "Hello.", "voice": str(snapshot / "voices" / "bf_emma.safetensors"), "speed": 1.1,
                                "lang_code": "b"}
     assert len(played) == 4 and not any(Path(p).exists() for p in played[1::2])  # the temporary files are gone
+
+
+def test_quiet_leaves_the_streams_alone_off_the_main_thread(capsys):
+    """Under the full-screen app the flow runs in its own thread, and Textual owns the process-wide streams."""
+    import threading
+    seen = {}
+
+    def worker():
+        before = sys.stdout
+        with act._quiet():
+            seen["same"] = sys.stdout is before
+            print("from the flow thread")
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    assert seen["same"] and "from the flow thread" in capsys.readouterr().out
+    with act._quiet():
+        print("from the main thread")
+    assert capsys.readouterr().out == ""
 
 
 def test_kokoro_player_needs_the_model_and_the_voice(tmp_path, monkeypatch):

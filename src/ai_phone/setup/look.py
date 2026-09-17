@@ -180,7 +180,7 @@ Screen {{ background: {BG}; align: center top; }}
 .centre {{ width: 100%; text-align: center; }}
 #note {{ width: 100%; text-align: center; }}
 #checks {{ width: auto; margin: 2 0 1 0; }}
-#body {{ width: auto; margin: 1 0 0 0; }}
+#body {{ width: auto; max-width: 100%; margin: 1 0 0 0; }}
 .dense #body {{ margin: 0; }}
 Center {{ height: auto; }}
 #menu {{ width: auto; margin: 2 0 0 0; }}
