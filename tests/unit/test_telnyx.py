@@ -16,6 +16,7 @@ class Carrier:
         self.profiles, self.connections, self.orders, self.numbers, self.verified = {}, {}, {}, {}, {}
         self.order_status, self.crash_on = order_status, crash_on
         self.calls = []
+        self.patches = []  # (number id, body) of every PATCH to a number
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         self.calls.append((req.method, req.url.path))
@@ -52,7 +53,15 @@ class Carrier:
             oid = p.rsplit("/", 1)[1]
             return httpx.Response(200, json={"data": {"id": oid, **self.orders[oid]}})
         if m == "GET" and p == "/v2/phone_numbers":
-            return httpx.Response(200, json={"data": [{"id": k, **v} for k, v in self.numbers.items() if v["phone_number"] == req.url.params.get("filter[phone_number]")]})
+            want = req.url.params.get("filter[phone_number]")  # no filter: every number on the account
+            return httpx.Response(200, json={"data": [{"id": k, **v} for k, v in self.numbers.items() if want is None or v["phone_number"] == want]})
+        if m == "PATCH" and p.startswith("/v2/phone_numbers/"):
+            nid = p.rsplit("/", 1)[1]
+            if nid not in self.numbers:
+                return httpx.Response(404, json={"errors": [{"detail": "Resource not found"}]})
+            self.patches.append((nid, body))
+            self.numbers[nid].update(body)
+            return httpx.Response(200, json={"data": {"id": nid, **self.numbers[nid]}})
         if m == "DELETE":
             kind, rid = p.rsplit("/", 2)[1:]
             store = {"phone_numbers": self.numbers, "credential_connections": self.connections, "outbound_voice_profiles": self.profiles}[kind]
@@ -198,9 +207,8 @@ def test_errors_never_leak_the_key_the_password_or_the_body(tmp_path: Path):
     assert "Passw0rd" not in str(e2.value) and "<html>" not in str(e2.value) and "non-JSON" in str(e2.value)
 
 
-def test_profile_cap_shares_the_accounts_profile_and_release_keeps_it(tmp_path: Path):
+def _capped(carrier: Carrier) -> TelnyxProvider:
     """Telnyx: 'You may only have 1 Outbound Voice Profile(s) at your account level' (seen on a freshly paid account)."""
-    carrier = Carrier()
     carrier.profiles["p0"] = {"name": "default", "traffic_type": "conversational"}
     inner = carrier.__call__
 
@@ -210,11 +218,17 @@ def test_profile_cap_shares_the_accounts_profile_and_release_keeps_it(tmp_path: 
             return httpx.Response(403, json={"errors": [{"detail": "You may only have 1 Outbound Voice Profile(s) at your account level."}]})
         return inner(req)
 
-    p = TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(capped), base_url=TELNYX_API))
+    return TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(capped), base_url=TELNYX_API))
+
+
+def test_profile_cap_shares_the_accounts_profile_and_release_keeps_it(tmp_path: Path):
+    carrier = Carrier()
+    p = _capped(carrier)
     j = Journal.open(tmp_path, "gate", "telnyx")
     r = p.provision(j, p.search_numbers("GB", None, 1)[0], "gate", "aigate1234", "Passw0rdPassw0rdPassw0rd")
     assert r.state == "ready"
-    assert r.line["provider"]["resources"]["outbound_voice_profile_id"] == "p0" and r.line["provider"]["resources"]["profile_shared"] is True
+    assert r.line["provider"]["resources"]["outbound_voice_profile_id"] == "p0" and "profile_shared" not in r.line["provider"]["resources"]
+    assert j.resources()["profile_shared"] is True  # the journal keeps the flag `release` reads
     assert carrier.connections["c1"]["outbound"]["outbound_voice_profile_id"] == "p0"
     rel = p.release(j)
     assert rel.ok and "p0" in carrier.profiles, "the account's own profile must survive `lines remove`"
@@ -234,3 +248,115 @@ def test_profile_cap_without_any_profile_is_an_error(tmp_path: Path):
     j = Journal.open(tmp_path, "gate", "telnyx")
     with pytest.raises(ProviderError, match="no outbound voice profile to share"):
         p.provision(j, p.search_numbers("GB", None, 1)[0], "gate", "aigate1234", "Passw0rdPassw0rdPassw0rd")
+
+
+def test_shared_profile_line_loads(tmp_path: Path, monkeypatch):
+    """The config's provider.resources holds strings only: a journal flag copied into it made the line unloadable."""
+    from ai_phone.config import load_config
+    from ai_phone.lines.config_writer import add_line
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("inbound:\n  greeting: Hi\n")
+    p = _capped(Carrier())
+    r = p.provision(Journal.open(tmp_path / "lines", "gate", "telnyx"), p.search_numbers("GB", None, 1)[0], "gate", "aigate1234",
+                    "Passw0rdPassw0rdPassw0rd")
+    assert "profile_shared" not in r.line["provider"]["resources"]
+    add_line(cfg, "gate", r.line)
+    ln = load_config(cfg).lines["gate"]
+    assert ln.provider.resources["outbound_voice_profile_id"] == "p0" and ln.number == "+442079460000"
+
+
+# ---- a number the person already has ------------------------------------------------------------
+
+def _owned(carrier: Carrier, **number) -> Carrier:
+    carrier.numbers["n9"] = {"phone_number": "+15550100001", **number}
+    return carrier
+
+
+def test_owned_numbers_lists_the_account_numbers():
+    carrier = _owned(Carrier(), connection_id="old-conn")
+    p = _provider(carrier)
+    assert [(n.e164, n.source_id) for n in p.owned_numbers()] == [("+15550100001", "n9")]
+    assert [c[0] for c in carrier.calls] == ["GET"]
+
+
+def test_attach_connects_an_owned_number_without_ordering(tmp_path: Path):
+    carrier = _owned(Carrier(), connection_id="old-conn")
+    p = _provider(carrier)
+    j = Journal.open(tmp_path, "main", "telnyx")
+    r = p.attach(j, Number("+15550100001", None, None, False, "n9"), "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
+    assert ("POST", "/v2/number_orders") not in carrier.calls and not carrier.orders
+    assert carrier.numbers["n9"]["connection_id"] == "c1" and carrier.connections["c1"]["connection_name"] == "ai-phone:main"
+    assert carrier.patches == [("n9", {"connection_id": "c1"})]
+    assert r.state == "ready" and j.state == "ready" and r.line["number"] == "+15550100001" and r.line["user"] == "aimain1234"
+    assert r.line["provider"]["resources"] == {"outbound_voice_profile_id": "p1", "connection_id": "c1", "number_id": "n9"}
+    res = j.resources()
+    assert res["number_brought"] is True and res["previous_connection_id"] == "old-conn"
+    assert [s["name"] for s in j.doc["steps"]] == ["claim", "profile", "connection", "route"]
+    assert p.poll(j).line["number"] == "+15550100001"
+
+
+def test_attach_refuses_a_number_not_on_the_account(tmp_path: Path):
+    carrier = Carrier()
+    p = _provider(carrier)
+    with pytest.raises(ProviderError, match="not on this Telnyx account"):
+        p.attach(Journal.open(tmp_path, "main", "telnyx"), Number("+15550100001", None, None, False, "n9"), "main", "aimain1234", "pw")
+    assert carrier.profiles == {} and carrier.connections == {}
+
+
+def test_attach_resumes_after_a_lost_route_response(tmp_path: Path):
+    carrier = _owned(Carrier(), connection_id="old-conn")
+    lost = {"armed": True}
+
+    def handler(req):
+        r = carrier(req)
+        if lost["armed"] and req.method == "PATCH":
+            lost["armed"] = False
+            raise httpx.ConnectError("lost")
+        return r
+
+    p = TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(handler), base_url=TELNYX_API))
+    n = Number("+15550100001", None, None, False, "n9")
+    with pytest.raises(ProviderError):
+        p.attach(Journal.open(tmp_path, "main", "telnyx"), n, "main", "aimain1234", "pw")
+    j = Journal.open(tmp_path, "main")
+    r = p.attach(j, n, "main", "aimain1234", "pw")
+    assert r.state == "ready" and len(carrier.profiles) == 1 and len(carrier.connections) == 1
+    assert j.resources()["previous_connection_id"] == "old-conn"  # the claim was not re-read after the move
+
+
+def test_release_of_a_brought_number_reconnects_it_and_keeps_it(tmp_path: Path):
+    carrier = _owned(Carrier(), connection_id="old-conn")
+    p = _provider(carrier)
+    j = Journal.open(tmp_path, "main", "telnyx")
+    p.attach(j, Number("+15550100001", None, None, False, "n9"), "main", "aimain1234", "pw")
+    before = len(carrier.calls)
+    assert p.release(j).ok
+    assert ("DELETE", "/v2/phone_numbers/n9") not in carrier.calls and "n9" in carrier.numbers
+    assert carrier.numbers["n9"]["connection_id"] == "old-conn"
+    assert not carrier.connections and not carrier.profiles
+    order = [c for c in carrier.calls[before:] if c[0] in ("PATCH", "DELETE")]
+    assert order == [("PATCH", "/v2/phone_numbers/n9"), ("DELETE", "/v2/credential_connections/c1"),
+                     ("DELETE", "/v2/outbound_voice_profiles/p1")], "the number leaves the connection before it is deleted"
+
+
+def test_release_of_a_brought_number_with_no_previous_connection_sends_null(tmp_path: Path):
+    carrier = _owned(Carrier())
+    p = _provider(carrier)
+    j = Journal.open(tmp_path, "main", "telnyx")
+    p.attach(j, Number("+15550100001", None, None, False, "n9"), "main", "aimain1234", "pw")
+    assert j.resources()["previous_connection_id"] == ""
+    assert p.release(j).ok
+    assert carrier.patches[-1] == ("n9", {"connection_id": None}) and "n9" in carrier.numbers
+
+
+def test_release_of_a_brought_number_that_cannot_be_moved_still_deletes_the_rest(tmp_path: Path):
+    carrier = _owned(Carrier(), connection_id="old-conn")
+    p = _provider(carrier)
+    j = Journal.open(tmp_path, "main", "telnyx")
+    p.attach(j, Number("+15550100001", None, None, False, "n9"), "main", "aimain1234", "pw")
+    del carrier.numbers["n9"]  # the move back is refused (404)
+    res = p.release(j)
+    assert not res.ok and "stays on your account" in res.leftover["number_id"] and j.state == "rollback_failed"
+    assert not [c for c in carrier.calls if c == ("DELETE", "/v2/phone_numbers/n9")]
+    assert not carrier.connections and not carrier.profiles

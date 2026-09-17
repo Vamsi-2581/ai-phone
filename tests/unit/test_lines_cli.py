@@ -254,3 +254,145 @@ def test_missing_config_is_one_line(home: Path, capsys):
     assert rc != 0
     out = capsys.readouterr()
     assert "does not exist" in out.out + out.err
+
+
+# ---- a number the person already has ------------------------------------------------------------
+
+def _fake_carrier(home: Path) -> dict:
+    return json.loads((home / "fake-carrier.json").read_text())
+
+
+def test_add_existing_connects_without_buying(home: Path, monkeypatch, capsys):
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or "y")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--existing", "+442079460099"]) == 0
+    assert "Connect +442079460099 on your fake account to ai-phone?" in asked[0] and "Nothing is bought" in asked[0]
+    ln = load_config(home / "config.yaml").lines["main"]
+    assert ln.number == "+442079460099" and ln.provider.state == "ready" and ln.password_env == "AI_PHONE_LINE_MAIN_PASSWORD"
+    carrier = _fake_carrier(home)
+    assert carrier["carrier"]["owned"]["name"] == "+442079460099" and "number" not in carrier["carrier"] and "number" not in carrier["created"]
+    assert "Line main is ready: +442079460099" in capsys.readouterr().out
+    assert Journal.open(home / "lines", "main").doc["steps"][0]["planned"] == {"phone_number": "+442079460099", "brought": True}
+
+
+def test_add_existing_stops_when_the_answer_is_no(home: Path, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--existing", "+442079460099"]) == 3
+    assert "main" not in load_config(home / "config.yaml").lines
+    assert not (home / "lines" / "main.journal.json").exists() and not (home / "fake-carrier.json").exists()
+
+
+def test_add_existing_refuses_a_number_not_on_the_account(home: Path, capsys):
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--existing", "+442079460001", "--yes"]) == 3
+    assert "is not on your fake account" in capsys.readouterr().out
+    assert not (home / "lines" / "main.journal.json").exists()
+
+
+def test_add_existing_checks_its_arguments(home: Path, capsys):
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--existing", "+442079460099", "--number", "+442079460000", "--yes"]) == 3
+    assert "--existing cannot be combined with --number or --area" in capsys.readouterr().out
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--existing", "+442079460099", "--area", "20", "--yes"]) == 3
+    assert "--existing cannot be combined with --number or --area" in capsys.readouterr().out
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--existing", "02079460099", "--yes"]) == 3
+    assert "--existing must be E.164, like +15550100000" in capsys.readouterr().out
+    assert load_config(home / "config.yaml").lines == {}
+
+
+def test_remove_keeps_a_brought_number(home: Path, monkeypatch):
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--existing", "+442079460099", "--yes"]) == 0
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or "y")
+    assert main(["lines", "remove", "main", "--key-env", "FAKE_KEY"]) == 0
+    assert asked == ["Disconnect +442079460099 from ai-phone and delete what ai-phone created on your fake account? "
+                     "The number stays on your account. [y/N] "]
+    carrier = _fake_carrier(home)["carrier"]
+    assert carrier["owned"]["name"] == "+442079460099" and carrier["owned"]["connection"] is None
+    assert load_config(home / "config.yaml").lines == {}
+
+
+def test_remove_of_a_bought_number_still_warns_it_is_released(home: Path, monkeypatch):
+    main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"])
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or "n")
+    assert main(["lines", "remove", "main", "--key-env", "FAKE_KEY"]) == 3
+    assert asked == ["Release +442079460000 from your fake account? This cannot be undone. [y/N] "]
+
+
+def test_resume_of_a_brought_number_attaches_again(home: Path, monkeypatch):
+    monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "connection")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--existing", "+442079460099", "--yes"]) == 3
+    assert "main" not in load_config(home / "config.yaml").lines
+    monkeypatch.delenv("AI_PHONE_FAKE_CRASH_AFTER")
+    assert main(["lines", "resume", "main", "--key-env", "FAKE_KEY"]) == 0
+    ln = load_config(home / "config.yaml").lines["main"]
+    assert ln.provider.state == "ready" and ln.number == "+442079460099"
+    carrier = _fake_carrier(home)
+    assert "number" not in carrier["carrier"] and "number" not in carrier["created"] and carrier["created"]["connection"] == 1
+
+
+def test_key_env_is_read_from_secrets_env(home: Path, monkeypatch, capsys):
+    from ai_phone.secrets import write_secret
+    monkeypatch.delenv("FAKE_KEY2", raising=False)
+    write_secret("FAKE_KEY2", "k", home / "secrets.env")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY2", "--id", "main", "--yes"]) == 0
+    assert load_config(home / "config.yaml").lines["main"].provider.state == "ready"
+    monkeypatch.delenv("FAKE_KEY3", raising=False)
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY3", "--id", "other", "--yes"]) == 2
+    err = capsys.readouterr().err
+    assert f"--key-env: FAKE_KEY3 is not set in the environment or in {home / 'secrets.env'}" in err
+
+
+def test_provision_flow_sends_messages_to_say(home: Path, capsys):
+    from ai_phone import paths
+    from ai_phone.cli_lines import EXIT_ERROR, EXIT_OK, provision_flow
+    from ai_phone.providers.fake import FakeProvider
+    p = FakeProvider()
+    msgs = []
+    rc = provision_flow(p, Journal.open(paths.lines_dir(), "main", "fake"), home / "config.yaml", "main",
+                        p.search_numbers("GB", None, 1)[0], say=msgs.append)
+    assert rc == EXIT_OK and msgs == ["Line main is ready: +442079460000. Run `ai-phone run`; it will register."]
+    msgs.clear()
+    rc = provision_flow(p, Journal.open(paths.lines_dir(), "home", "fake"), home / "config.yaml", "home",
+                        p.owned_numbers()[0], existing=True, say=msgs.append)
+    assert rc == EXIT_OK and msgs == ["Line home is ready: +442079460099. Run `ai-phone run`; it will register."]
+    msgs.clear()
+    broken = FakeProvider(crash_after="profile")
+    rc = provision_flow(broken, Journal.open(paths.lines_dir(), "work", "fake"), home / "config.yaml", "work",
+                        broken.owned_numbers()[0], existing=True, say=msgs.append)
+    assert rc == EXIT_ERROR and len(msgs) == 1 and msgs[0].startswith("error: simulated crash after profile")
+    assert capsys.readouterr().out == ""
+
+
+def test_next_line_id_keeps_its_old_name():
+    from ai_phone import cli_lines
+    assert cli_lines.next_line_id({"lines": {"fake": {}, "fake-2": {}}}, "fake") == "fake-3"
+    assert cli_lines.next_line_id({}, "fake") == "fake" and cli_lines._next_id is cli_lines.next_line_id
+
+
+def test_manual_line_and_write_line(home: Path):
+    from ai_phone.cli_lines import manual_line, write_line
+    from ai_phone.config import ConfigError
+    from ai_phone.lines.config_writer import read_raw
+    cfg = home / "config.yaml"
+    write_line(cfg, "alex", manual_line("sip", user="alex", host="192.0.2.10"))
+    ln = load_config(cfg).lines["alex"]
+    assert ln.kind == "sip" and ln.aor == "sip:alex@192.0.2.10" and ln.accept_invites_from == "lan"
+    trunk = manual_line("trunk", number="+442079460000", registrar="sip:sip.example.com:5061;transport=tls", user="sam1",
+                        password_env="SAM_PW", transport="tls", trusted_cidrs=["203.0.113.0/24"])
+    assert trunk["dial_domain"] == "sip.example.com" and trunk["caller_id"] == "+442079460000" and "outbound_proxy" not in trunk
+    assert trunk["trusted_cidrs"] == ["203.0.113.0/24"] and trunk["accept_invites_from"] == "registered_trunk"
+    with pytest.raises(ValueError, match="the number must be E.164, like \\+442079460000"):
+        manual_line("trunk", number="02079460000", registrar="sip:sip.example.com", user="sam1", password_env="SAM_PW")
+    with pytest.raises(ValueError, match="a trunk line needs a registrar, a user and a password"):
+        manual_line("trunk", number="+442079460000", registrar="sip:sip.example.com", user="sam1")
+    with pytest.raises(ValueError, match="a sip line needs a user and a host"):
+        manual_line("sip", user="alex")
+    before = read_raw(cfg)
+    with pytest.raises(ConfigError):
+        write_line(cfg, "byo", manual_line("trunk", number="+442079460000", registrar="nonsense", user="abcd", password_env="X_PW"))
+    assert read_raw(cfg) == before
+    with pytest.raises(ValueError, match="already exists"):
+        write_line(cfg, "alex", manual_line("sip", user="sam", host="192.0.2.11"))
+    with pytest.raises(ValueError, match="line ids must match"):
+        write_line(cfg, "Not Valid", manual_line("sip", user="sam", host="192.0.2.11"))
+    assert read_raw(cfg) == before

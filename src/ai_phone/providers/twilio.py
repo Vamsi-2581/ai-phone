@@ -77,10 +77,49 @@ class TwilioProvider:
             pass
         return [Number(n["phone_number"], price, currency, False, n["phone_number"]) for n in found]
 
+    def owned_numbers(self) -> list[Number]:
+        """The voice numbers already on the account. Read-only: this is also the free key check."""
+        recs = self._call("GET", self._acct("/IncomingPhoneNumbers.json"), params={"PageSize": "100"}).get("incoming_phone_numbers", [])
+        return [Number(r["phone_number"], None, None, False, r["sid"]) for r in recs if (r.get("capabilities") or {}).get("voice", True)]
+
     # ---- provisioning -------------------------------------------------------------------------
     def provision(self, journal: Journal, number: Number, line_id: str, sip_user: str, sip_password: str) -> ProvisionResult:
         """One journal step per carrier request, so a crash between any request and its `done` is reconciled by name."""
         self._sensitive = getattr(self, "_sensitive", []) + [sip_password]
+        domain_name = self._sip_domain(journal, line_id, sip_user, sip_password)
+        st, planned = journal.start("number", phone_number=number.e164)
+        if st != "done":
+            rec = (self._find_number(number.e164) if st == "started" else None) or self._call(
+                "POST", self._acct("/IncomingPhoneNumbers.json"),
+                data={"PhoneNumber": number.e164, "FriendlyName": f"ai-phone:{line_id}", "VoiceUrl": _twiml_url(sip_user, domain_name), "VoiceMethod": "GET"})
+            journal.finish("number", number_sid=rec["sid"])
+        return self._trunk(journal, line_id, number.e164)
+
+    def attach(self, journal: Journal, number: Number, line_id: str, sip_user: str, sip_password: str) -> ProvisionResult:
+        """`provision` for a number already on the account: nothing is bought. The number's voice URL is pointed at the
+        SIP domain; what it was before is journaled so `release` can put it back."""
+        self._sensitive = getattr(self, "_sensitive", []) + [sip_password]
+        st, planned = journal.start("claim", phone_number=number.e164)
+        if st != "done":  # a read-only lookup, before anything is created
+            rec = self._find_number(number.e164)
+            if rec is None:
+                raise ProviderError(f"{number.e164} is not on this Twilio account")
+            if rec.get("trunk_sid") or rec.get("voice_application_sid"):
+                raise ProviderError(f"{number.e164} is routed by a SIP trunk or a TwiML app on your Twilio account; "
+                                    "remove that in the Twilio console first, then try again")
+            journal.finish("claim", number_sid=rec["sid"], number_brought=True,
+                           previous_voice_url=rec.get("voice_url") or "", previous_voice_method=rec.get("voice_method") or "POST")
+        number_sid = journal.resources()["number_sid"]
+        domain_name = self._sip_domain(journal, line_id, sip_user, sip_password)
+        st, planned = journal.start("route", number_sid=number_sid)
+        if st != "done":  # setting a voice URL is idempotent, so a half-done step is simply repeated
+            self._call("POST", self._acct(f"/IncomingPhoneNumbers/{number_sid}.json"),
+                       data={"VoiceUrl": _twiml_url(sip_user, domain_name), "VoiceMethod": "GET"})
+            journal.finish("route", routed=True)
+        return self._trunk(journal, line_id, number.e164)
+
+    def _sip_domain(self, journal: Journal, line_id: str, sip_user: str, sip_password: str) -> str:
+        """The credential list, its credential, the registration domain and their mapping; returns the domain name."""
         name = f"ai-phone:{line_id}"
         st, planned = journal.start("credential_list", name=name)
         if st != "done":
@@ -121,14 +160,12 @@ class TwilioProvider:
             if not (st == "started" and self._domain_has_mapping(domain_sid, cl_sid)):
                 self._call("POST", self._acct(f"/SIP/Domains/{domain_sid}/Auth/Registrations/CredentialListMappings.json"), data={"CredentialListSid": cl_sid})
             journal.finish("domain_mapping", mapped=True)
+        return domain_name
 
-        st, planned = journal.start("number", phone_number=number.e164)
-        if st != "done":
-            rec = (self._find_number(number.e164) if st == "started" else None) or self._call(
-                "POST", self._acct("/IncomingPhoneNumbers.json"),
-                data={"PhoneNumber": number.e164, "FriendlyName": name, "VoiceUrl": _twiml_url(sip_user, domain_name), "VoiceMethod": "GET"})
-            journal.finish("number", number_sid=rec["sid"])
-
+    def _trunk(self, journal: Journal, line_id: str, e164: str) -> ProvisionResult:
+        """The outbound trunk and its credential list; an account without trunking gets an inbound-only line."""
+        name = f"ai-phone:{line_id}"
+        cl_sid = journal.resources()["credential_list_sid"]
         st, planned = journal.start("trunk", trunk_domain=f"ai-phone-{line_id}-{secrets.token_hex(3)}.pstn.twilio.com", name=name)
         # a resumed inbound-only line has a done trunk step with no domain: plan a fresh one for the retry below
         trunk_domain = planned.get("trunk_domain") or f"ai-phone-{line_id}-{secrets.token_hex(3)}.pstn.twilio.com"
@@ -145,7 +182,7 @@ class TwilioProvider:
                         raise
                     journal.finish("trunk", trunk_sid=None, trunk_domain=None, outbound_unavailable=str(e))
                     journal.set_state("ready")
-                    return self._result(journal, number.e164)
+                    return self._result(journal, e164)
             journal.finish("trunk", trunk_sid=rec["sid"], trunk_domain=rec.get("domain_name", trunk_domain))
         trunk_sid = journal.resources()["trunk_sid"]
         if not trunk_sid:  # a resumed inbound-only line: try trunking again (the account may have been upgraded since)
@@ -155,7 +192,7 @@ class TwilioProvider:
                 if e.status not in (401, 403):
                     raise
                 journal.set_state("ready")
-                return self._result(journal, number.e164)
+                return self._result(journal, e164)
             journal.finish("trunk", trunk_sid=rec["sid"], trunk_domain=rec.get("domain_name", trunk_domain))
             trunk_sid = rec["sid"]
 
@@ -165,10 +202,10 @@ class TwilioProvider:
                 self._call("POST", f"{TRUNKING}/Trunks/{trunk_sid}/CredentialLists", data={"CredentialListSid": cl_sid})
             journal.finish("trunk_credential_list", attached=True)
         journal.set_state("ready")
-        return self._result(journal, number.e164)
+        return self._result(journal, e164)
 
     def poll(self, journal: Journal) -> ProvisionResult:
-        e164 = next(s["planned"]["phone_number"] for s in journal.doc["steps"] if s["name"] == "number")
+        e164 = next(s["planned"]["phone_number"] for s in journal.doc["steps"] if s["name"] in ("number", "claim"))
         journal.set_state("ready")
         return self._result(journal, e164)
 
@@ -210,10 +247,17 @@ class TwilioProvider:
     def release(self, journal: Journal) -> ReleaseResult:
         r = journal.resources()
         leftover = {}
+        if r.get("number_brought") and r.get("number_sid"):
+            # never delete a number ai-phone did not buy: put its voice URL back and leave it on the account
+            try:
+                self._call("POST", self._acct(f"/IncomingPhoneNumbers/{r['number_sid']}.json"),
+                           data={"VoiceUrl": r.get("previous_voice_url", ""), "VoiceMethod": r.get("previous_voice_method") or "POST"})
+            except ProviderError as e:
+                leftover["number_sid"] = f"{r['number_sid']}: {e} (the number stays on your account; reset its voice URL in the Twilio console)"
         for key, url in (("trunk_sid", lambda s: f"{TRUNKING}/Trunks/{s}"), ("number_sid", lambda s: self._acct(f"/IncomingPhoneNumbers/{s}.json")),
                          ("domain_sid", lambda s: self._acct(f"/SIP/Domains/{s}.json")), ("credential_list_sid", lambda s: self._acct(f"/SIP/CredentialLists/{s}.json"))):
             sid = r.get(key)
-            if not sid:
+            if not sid or (key == "number_sid" and r.get("number_brought")):
                 continue
             try:
                 self._call("DELETE", url(sid))

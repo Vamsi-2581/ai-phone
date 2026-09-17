@@ -75,6 +75,10 @@ class TelnyxProvider:
                               bool(n.get("requirements")), n["phone_number"], country=country))
         return out
 
+    def owned_numbers(self) -> list[Number]:
+        """The numbers already on the account. Read-only: this is also the free key check."""
+        return [Number(n["phone_number"], None, None, False, n["id"]) for n in self._call("GET", "/phone_numbers", params={"page[size]": "100"}) or []]
+
     def _exact_number(self, e164: str) -> None:
         """Telnyx only orders numbers returned by a recent search: search this exact number right before ordering."""
         if not any(n["phone_number"] == e164 for n in self._call("GET", "/available_phone_numbers", params={"filter[phone_number][starts_with]": e164, "filter[limit]": "5"}) or []):
@@ -83,6 +87,51 @@ class TelnyxProvider:
     # ---- provisioning -------------------------------------------------------------------------
     def provision(self, journal: Journal, number: Number, line_id: str, sip_user: str, sip_password: str) -> ProvisionResult:
         self._sensitive.append(sip_password)
+        connection_id = self._profile_and_connection(journal, number, line_id, sip_user, sip_password)
+
+        ref = f"ai-phone:{line_id}"
+        st, data = journal.start("order", phone_number=number.e164, customer_reference=ref)
+        if st != "done":
+            existing = None
+            if st == "started":  # the POST may have gone through: find the order by our customer_reference, or the delivered number
+                for o in self._call("GET", "/number_orders", params={"filter[customer_reference]": ref}) or []:
+                    if any(p.get("phone_number") == number.e164 for p in o.get("phone_numbers", [])):
+                        existing = {"id": o["id"], "status": o.get("status", "pending")}
+                        break
+                if existing is None:
+                    owned = self._call("GET", "/phone_numbers", params={"filter[phone_number]": number.e164}) or []
+                    if owned:
+                        existing = {"id": "reconciled", "status": "success"}
+            if existing is None:
+                self._exact_number(number.e164)
+                rec = self._call("POST", "/number_orders", json={"phone_numbers": [{"phone_number": number.e164}], "connection_id": connection_id, "customer_reference": ref})
+                journal.finish("order", order_id=rec["id"], order_status=rec.get("status", "pending"))
+            else:
+                journal.finish("order", order_id=existing["id"], order_status=existing["status"])
+        return self.poll(journal)
+
+    def attach(self, journal: Journal, number: Number, line_id: str, sip_user: str, sip_password: str) -> ProvisionResult:
+        """`provision` for a number already on the account: no order. The number is moved onto the new connection;
+        the connection it had before is journaled so `release` can move it back."""
+        self._sensitive.append(sip_password)
+        st, data = journal.start("claim", phone_number=number.e164)
+        if st != "done":  # a read-only lookup, before anything is created
+            owned = [n for n in self._call("GET", "/phone_numbers", params={"filter[phone_number]": number.e164}) or []
+                     if n.get("phone_number") == number.e164]
+            if not owned:
+                raise ProviderError(f"{number.e164} is not on this Telnyx account")
+            journal.finish("claim", number_id=owned[0]["id"], number_brought=True, previous_connection_id=owned[0].get("connection_id") or "")
+        number_id = journal.resources()["number_id"]
+        connection_id = self._profile_and_connection(journal, number, line_id, sip_user, sip_password)
+        st, data = journal.start("route", number_id=number_id, connection_id=connection_id)
+        if st != "done":  # assigning a connection is idempotent, so a half-done step is simply repeated
+            self._call("PATCH", f"/phone_numbers/{number_id}", json={"connection_id": connection_id})
+            journal.finish("route", routed=True)
+        journal.set_state("ready")
+        return ProvisionResult("ready", f"{number.e164} is connected", self._line(journal, number.e164, "ready"))
+
+    def _profile_and_connection(self, journal: Journal, number: Number, line_id: str, sip_user: str, sip_password: str) -> str:
+        """The outbound voice profile (or the account's own, when it may hold only one) and the credential connection."""
         name = f"ai-phone:{line_id}"
         st, data = journal.start("profile", name=name)
         if st != "done":
@@ -118,31 +167,11 @@ class TelnyxProvider:
             rec = existing or self._call("POST", "/credential_connections", json=body)
             journal.finish("connection", connection_id=rec["id"])
         connection_id = journal.resources()["connection_id"]
-
-        ref = f"ai-phone:{line_id}"
-        st, data = journal.start("order", phone_number=number.e164, customer_reference=ref)
-        if st != "done":
-            existing = None
-            if st == "started":  # the POST may have gone through: find the order by our customer_reference, or the delivered number
-                for o in self._call("GET", "/number_orders", params={"filter[customer_reference]": ref}) or []:
-                    if any(p.get("phone_number") == number.e164 for p in o.get("phone_numbers", [])):
-                        existing = {"id": o["id"], "status": o.get("status", "pending")}
-                        break
-                if existing is None:
-                    owned = self._call("GET", "/phone_numbers", params={"filter[phone_number]": number.e164}) or []
-                    if owned:
-                        existing = {"id": "reconciled", "status": "success"}
-            if existing is None:
-                self._exact_number(number.e164)
-                rec = self._call("POST", "/number_orders", json={"phone_numbers": [{"phone_number": number.e164}], "connection_id": connection_id, "customer_reference": ref})
-                journal.finish("order", order_id=rec["id"], order_status=rec.get("status", "pending"))
-            else:
-                journal.finish("order", order_id=existing["id"], order_status=existing["status"])
-        return self.poll(journal)
+        return connection_id
 
     def poll(self, journal: Journal) -> ProvisionResult:
         res = journal.resources()
-        e164 = next((s["planned"]["phone_number"] for s in journal.doc["steps"] if s["name"] == "order"), None)
+        e164 = next((s["planned"]["phone_number"] for s in journal.doc["steps"] if s["name"] in ("order", "claim")), None)
         status = res.get("order_status")
         if res.get("order_id") not in (None, "reconciled") and status != "success":
             order = self._call("GET", f"/number_orders/{res['order_id']}")
@@ -171,7 +200,7 @@ class TelnyxProvider:
         line = {"kind": "trunk", "number": e164, "caller_id": e164, "registrar": REGISTRAR, "dial_domain": DIAL_DOMAIN,
                 "register_via_proxy": True, "transport": "udp", "trusted_cidrs": list(SIGNALLING_CIDRS),
                 "provider": {"name": self.name, "state": state,
-                             "resources": {k: r[k] for k in ("outbound_voice_profile_id", "profile_shared", "connection_id", "order_id", "number_id") if r.get(k)}}}
+                             "resources": {k: r[k] for k in ("outbound_voice_profile_id", "connection_id", "order_id", "number_id") if r.get(k)}}}
         if sip_user:
             line["user"] = sip_user
         return line
@@ -179,10 +208,20 @@ class TelnyxProvider:
     def release(self, journal: Journal) -> ReleaseResult:
         r = journal.resources()
         leftover = {}
+        if r.get("number_brought") and r.get("number_id"):
+            # never delete a number ai-phone did not buy: move it back to the connection it had (or none)
+            try:
+                self._call("PATCH", f"/phone_numbers/{r['number_id']}", json={"connection_id": r.get("previous_connection_id") or None})
+            except ProviderError as e:
+                leftover["number_id"] = f"{r['number_id']}: {e} (the number stays on your account; reassign it in the Telnyx portal)"
+        # when that move failed the deletes below are still tried: the carrier may refuse the connection while the
+        # number is on it, and that lands in `leftover` too
         for kind, key, path in (("number", "number_id", "/phone_numbers/"), ("connection", "connection_id", "/credential_connections/"),
                                 ("profile", "outbound_voice_profile_id", "/outbound_voice_profiles/")):
             rid = r.get(key)
             if not rid or (kind == "profile" and r.get("profile_shared")):  # a shared profile is the account's, not ours
+                continue
+            if kind == "number" and r.get("number_brought"):  # the person's own number, handled above
                 continue
             try:
                 self._call("DELETE", f"{path}{rid}")

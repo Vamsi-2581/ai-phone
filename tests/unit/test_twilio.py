@@ -16,6 +16,7 @@ class Carrier:
     def __init__(self, trial: bool = False):
         self.credlists, self.creds, self.domains, self.mappings, self.numbers, self.trunks, self.trunk_cls, self.callerids = {}, {}, {}, {}, {}, {}, {}, {}
         self.calls = []
+        self.updates = []  # (number sid, form) of every POST that changes an existing number
         self.trial = trial  # trial accounts get no Elastic SIP Trunking
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
@@ -47,8 +48,19 @@ class Carrier:
         if m == "POST" and p.endswith("/IncomingPhoneNumbers.json"):
             sid = f"PN{len(self.numbers) + 1}"; self.numbers[sid] = form; return httpx.Response(201, json={"sid": sid, **form})
         if m == "GET" and p.endswith("/IncomingPhoneNumbers.json"):
-            want = req.url.params.get("PhoneNumber")
-            return httpx.Response(200, json={"incoming_phone_numbers": [{"sid": k, "phone_number": v["PhoneNumber"]} for k, v in self.numbers.items() if v["PhoneNumber"] == want]})
+            want = req.url.params.get("PhoneNumber")  # no filter: every number on the account
+            return httpx.Response(200, json={"incoming_phone_numbers": [
+                {"sid": k, "phone_number": v["PhoneNumber"], "voice_url": v.get("VoiceUrl"), "voice_method": v.get("VoiceMethod"),
+                 "trunk_sid": v.get("TrunkSid"), "voice_application_sid": v.get("VoiceApplicationSid"),
+                 "capabilities": v.get("Capabilities", {"voice": True, "sms": True})}
+                for k, v in self.numbers.items() if want is None or v["PhoneNumber"] == want]})
+        if m == "POST" and "/IncomingPhoneNumbers/" in p:
+            sid = p.rsplit("/", 1)[1].removesuffix(".json")
+            if sid not in self.numbers:
+                return httpx.Response(404, json={"message": f"no number {sid}"})
+            self.updates.append((sid, form))
+            self.numbers[sid].update(form)
+            return httpx.Response(200, json={"sid": sid, **self.numbers[sid]})
         if host == "trunking.twilio.com" and m == "POST" and p == "/v1/Trunks":
             if self.trial:
                 return httpx.Response(403, json={"code": 20003, "message": "SIP trunking is only available after you upgrade your account"})
@@ -243,3 +255,123 @@ def test_trial_account_gets_an_inbound_only_line_and_resume_adds_outbound_after_
     assert list(carrier.trunk_cls.values()) == [r2.line["provider"]["resources"]["credential_list_sid"]]
     rel = p.release(j)
     assert rel.ok and not carrier.trunks and not carrier.numbers and not carrier.domains and not carrier.credlists
+
+
+# ---- a number the person already has ------------------------------------------------------------
+
+def _owned(c: Carrier, **extra) -> Carrier:
+    c.numbers["PN9"] = {"PhoneNumber": "+15550100001", "VoiceUrl": "https://example.com/old", "VoiceMethod": "POST", **extra}
+    return c
+
+
+def _number_posts(c: Carrier, path_end: str) -> list:
+    return [x for x in c.calls if x[0] == "POST" and x[2].endswith(path_end)]
+
+
+def test_owned_numbers_lists_voice_numbers():
+    c = _owned(Carrier())
+    c.numbers["PN8"] = {"PhoneNumber": "+15550100002"}
+    c.numbers["PN7"] = {"PhoneNumber": "+15550100003", "Capabilities": {"voice": False, "sms": True}}  # texts only
+    p = _provider(c)
+    owned = p.owned_numbers()
+    assert [n.e164 for n in owned] == ["+15550100001", "+15550100002"]
+    assert [n.source_id for n in owned] == ["PN9", "PN8"]
+    assert not [x for x in c.calls if x[0] == "POST"]
+
+
+def test_attach_routes_an_owned_number_without_buying(tmp_path: Path):
+    from ai_phone.providers.base import Number
+    from ai_phone.providers.twilio import _twiml_url
+    c = _owned(Carrier())
+    p = _provider(c)
+    j = Journal.open(tmp_path, "main", "twilio")
+    r = p.attach(j, Number("+15550100001", None, None, False, "PN9"), "main", "u1234", "pw")
+    assert not _number_posts(c, "/IncomingPhoneNumbers.json"), "nothing may be bought"
+    assert len(_number_posts(c, "/IncomingPhoneNumbers/PN9.json")) == 1
+    domain = next(iter(c.domains.values()))["DomainName"]
+    assert c.updates == [("PN9", {"VoiceUrl": _twiml_url("u1234", domain), "VoiceMethod": "GET"})]
+    assert r.state == "ready" and r.line["number"] == "+15550100001" and r.line["caller_id"] == "+15550100001"
+    assert r.line["provider"]["resources"]["number_sid"] == "PN9" and r.line["registrar"] == f"sip:{domain}"
+    assert set(r.line["provider"]["resources"].values()) <= {"PN9", "SD1", "CL1", "TK1"}  # carrier ids only, no journal flags
+    res = j.resources()
+    assert res["number_brought"] is True and res["previous_voice_url"] == "https://example.com/old" and res["previous_voice_method"] == "POST"
+    assert [s["name"] for s in j.doc["steps"]] == ["claim", "credential_list", "credential", "domain", "domain_mapping", "route",
+                                                  "trunk", "trunk_credential_list"]
+    assert list(c.numbers) == ["PN9"]
+
+
+def test_attach_refuses_a_number_not_on_the_account(tmp_path: Path):
+    from ai_phone.providers.base import Number
+    c = Carrier()
+    p = _provider(c)
+    with pytest.raises(ProviderError, match="not on this Twilio account"):
+        p.attach(Journal.open(tmp_path, "main", "twilio"), Number("+15550100001", None, None, False, "PN9"), "main", "u1234", "pw")
+    assert c.credlists == {} and c.domains == {} and c.numbers == {}
+
+
+def test_attach_refuses_a_number_routed_by_a_trunk(tmp_path: Path):
+    from ai_phone.providers.base import Number
+    c = _owned(Carrier(), TrunkSid="TK77")
+    p = _provider(c)
+    with pytest.raises(ProviderError, match="SIP trunk or a TwiML app") as ei:
+        p.attach(Journal.open(tmp_path, "main", "twilio"), Number("+15550100001", None, None, False, "PN9"), "main", "u1234", "pw")
+    assert "+15550100001" in str(ei.value) and "Twilio console" in str(ei.value)
+    assert c.credlists == {} and c.domains == {} and c.trunks == {} and c.updates == []
+
+
+def test_attach_refuses_a_number_routed_by_a_twiml_app(tmp_path: Path):
+    from ai_phone.providers.base import Number
+    c = _owned(Carrier(), VoiceApplicationSid="AP1")
+    with pytest.raises(ProviderError, match="SIP trunk or a TwiML app"):
+        _provider(c).attach(Journal.open(tmp_path, "main", "twilio"), Number("+15550100001", None, None, False, "PN9"), "main", "u1234", "pw")
+    assert c.credlists == {} and c.updates == []
+
+
+def test_release_of_a_brought_number_restores_it_and_keeps_it(tmp_path: Path):
+    from ai_phone.providers.base import Number
+    c = _owned(Carrier())
+    p = _provider(c)
+    j = Journal.open(tmp_path, "main", "twilio")
+    p.attach(j, Number("+15550100001", None, None, False, "PN9"), "main", "u1234", "pw")
+    c.updates.clear()
+    assert p.release(j).ok
+    assert not [x for x in c.calls if x[0] == "DELETE" and x[2].endswith("/IncomingPhoneNumbers/PN9.json")]
+    assert c.updates == [("PN9", {"VoiceUrl": "https://example.com/old", "VoiceMethod": "POST"})]
+    assert c.numbers["PN9"]["VoiceUrl"] == "https://example.com/old" and c.numbers["PN9"]["VoiceMethod"] == "POST"
+    assert not c.domains and not c.credlists and not c.trunks
+
+
+def test_release_of_a_brought_number_that_cannot_be_restored_keeps_it_and_says_so(tmp_path: Path):
+    from ai_phone.providers.base import Number
+    c = _owned(Carrier())
+    p = _provider(c)
+    j = Journal.open(tmp_path, "main", "twilio")
+    p.attach(j, Number("+15550100001", None, None, False, "PN9"), "main", "u1234", "pw")
+    del c.numbers["PN9"]  # the restore is refused (404); nothing may be deleted in its place
+    res = p.release(j)
+    assert not res.ok and "stays on your account" in res.leftover["number_sid"] and j.state == "rollback_failed"
+    assert not [x for x in c.calls if x[0] == "DELETE" and "IncomingPhoneNumbers" in x[2]]
+    assert not c.domains and not c.credlists and not c.trunks
+
+
+def test_attach_resumes_after_a_crash_in_route(tmp_path: Path):
+    from ai_phone.providers.base import Number
+    c = _owned(Carrier())
+    crash = {"armed": True}
+
+    def handler(req):
+        if crash["armed"] and req.method == "POST" and req.url.path.endswith("/IncomingPhoneNumbers/PN9.json"):
+            crash["armed"] = False
+            raise httpx.ConnectError("lost")
+        return c(req)
+
+    p = TwilioProvider(key=SID, secret="tok", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    n = Number("+15550100001", None, None, False, "PN9")
+    with pytest.raises(ProviderError):
+        p.attach(Journal.open(tmp_path, "main", "twilio"), n, "main", "u1234", "pw")
+    j = Journal.open(tmp_path, "main")
+    r = p.attach(j, n, "main", "u1234", "pw")
+    assert r.state == "ready" and len(c.credlists) == 1 and len(c.domains) == 1 and len(c.creds) == 1 and len(c.trunks) == 1
+    assert "twimlets.com/echo" in c.numbers["PN9"]["VoiceUrl"] and c.numbers["PN9"]["VoiceMethod"] == "GET"
+    assert j.resources()["previous_voice_url"] == "https://example.com/old"  # the claim was not re-read after routing
+    assert p.poll(j).line["number"] == "+15550100001"

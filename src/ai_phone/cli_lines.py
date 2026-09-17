@@ -6,11 +6,11 @@ import time
 from pathlib import Path
 
 from ai_phone import paths
-from ai_phone.config import E164_RE, LINE_ID_RE, ConfigError, line_password_env, load_config
+from ai_phone.config import E164_RE, LINE_ID_RE, ConfigError, host_of, line_password_env, load_config
 from ai_phone.lines.config_writer import add_line, read_raw, remove_line, update_line, write_raw
 from ai_phone.lines.credentials import generate_sip_password, generate_sip_user
 from ai_phone.lines.forward import WHEN, divert_codes
-from ai_phone.lines.journal import Journal
+from ai_phone.lines.journal import Journal, line_lock
 from ai_phone.secrets import SecretsError, load_secrets, remove_secret, write_secret
 
 EXIT_OK, EXIT_PENDING, EXIT_ERROR = 0, 2, 3
@@ -29,9 +29,9 @@ def _ask(prompt: str, yes: bool) -> bool:
 def _env(name: str | None, what: str) -> str | None:
     if not name:
         return None
-    v = os.environ.get(name)
+    v = os.environ.get(name) or load_secrets(paths.secrets_path()).get(name)
     if not v:
-        raise SystemExit(f"{what}: environment variable {name} is not set")
+        raise SystemExit(f"{what}: {name} is not set in the environment or in {paths.secrets_path()}")
     return v
 
 
@@ -51,7 +51,7 @@ def _config_path(a) -> Path:
     return Path(a.config).expanduser() if getattr(a, "config", None) else paths.config_path()
 
 
-def _next_id(raw: dict, base: str) -> str:
+def next_line_id(raw: dict, base: str) -> str:
     lines = raw.get("lines") or {}
     if base not in lines:
         return base
@@ -59,6 +59,9 @@ def _next_id(raw: dict, base: str) -> str:
     while f"{base}-{n}" in lines:
         n += 1
     return f"{base}-{n}"
+
+
+_next_id = next_line_id
 
 
 # ---- add <provider> ----------------------------------------------------------------------------
@@ -86,8 +89,11 @@ def _fail(msg: str):
     raise SystemExit(EXIT_ERROR)
 
 
-def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, number) -> int:
-    journal.start("target", phone_number=number.e164)  # first thing in the journal, so resume always knows the number
+def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, number, existing: bool = False, say=_say) -> int:
+    """Everything after the person said yes: the line's SIP password, then `provision` (buy and wire the number) or,
+    for a number already on the account, `attach` (wire it only), then the config. Every message goes through `say`."""
+    # first thing in the journal, so resume always knows the number and whether it was bought or brought
+    journal.start("target", phone_number=number.e164, brought=existing)
     journal.finish("target")
     env_name = line_password_env(line_id)
     pw_step, planned = journal.start("credentials", user=generate_sip_user(line_id), password_env=env_name)
@@ -97,15 +103,16 @@ def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, 
     creds = journal.resources() if pw_step == "done" else planned
     password = load_secrets(paths.secrets_path())[env_name]
     from ai_phone.providers.base import ProviderError
+    run = provider.attach if existing else provider.provision
     try:
-        result = provider.provision(journal, number, line_id, creds["user"], password)
+        result = run(journal, number, line_id, creds["user"], password)
     except ProviderError as e:
-        _say(f"error: {e}\nThe journal is kept at {journal.path}; run `ai-phone lines resume {line_id}` to continue or `ai-phone lines remove {line_id}` to clean up.")
+        say(f"error: {e}\nThe journal is kept at {journal.path}; run `ai-phone lines resume {line_id}` to continue or `ai-phone lines remove {line_id}` to clean up.")
         return EXIT_ERROR
-    return _commit(journal, config_path, line_id, result, env_name)
+    return _commit(journal, config_path, line_id, result, env_name, say=say)
 
 
-def _commit(journal: Journal, config_path: Path, line_id: str, result, env_name: str) -> int:
+def _commit(journal: Journal, config_path: Path, line_id: str, result, env_name: str, say=_say) -> int:
     if result.state == "failed":
         raw = read_raw(config_path)
         existing = (raw.get("lines") or {}).get(line_id)
@@ -113,10 +120,10 @@ def _commit(journal: Journal, config_path: Path, line_id: str, result, env_name:
             provider = dict(existing.get("provider") or {"name": journal.doc["provider"], "resources": {}})
             provider["state"] = "failed"
             update_line(config_path, line_id, provider=provider)
-        _say(f"error: {result.message}\nRun `ai-phone lines remove {line_id} --key-env <NAME>` to release what was created.")
+        say(f"error: {result.message}\nRun `ai-phone lines remove {line_id} --key-env <NAME>` to release what was created.")
         return EXIT_ERROR
     if not result.line:  # nothing loadable to write yet; the journal keeps the state
-        _say(f"{result.message}\nResume with: ai-phone lines resume {line_id} --key-env <NAME>")
+        say(f"{result.message}\nResume with: ai-phone lines resume {line_id} --key-env <NAME>")
         return EXIT_PENDING
     if result.state == "ready":
         journal.start("carrier_ready")
@@ -140,30 +147,37 @@ def _commit(journal: Journal, config_path: Path, line_id: str, result, env_name:
             write_raw(config_path, raw2)
         else:
             remove_line(config_path, line_id)
-        _say(f"error: the provisioned line does not validate ({e}); the config was restored. The carrier resources exist: "
+        say(f"error: the provisioned line does not validate ({e}); the config was restored. The carrier resources exist: "
              f"fix the cause, then `ai-phone lines resume {line_id}`, or `ai-phone lines remove {line_id}` to release them.")
         return EXIT_ERROR
     if result.state == "ready":
         journal.start("local_committed")
         journal.finish("local_committed")  # the step's own timestamp records when; no result keys, so resources() stays carrier ids
     if result.state == "pending":
-        _say(f"{result.message}\nLine {line_id} is written but pending. Resume with: ai-phone lines resume {line_id} --key-env <NAME>")
+        say(f"{result.message}\nLine {line_id} is written but pending. Resume with: ai-phone lines resume {line_id} --key-env <NAME>")
         return EXIT_PENDING
     number = line.get("number", line_id)
     if paths.socket_path().exists():
-        _say(f"Line {line_id} is ready: {number}. Restart ai-phone to bring it live.")
+        say(f"Line {line_id} is ready: {number}. Restart ai-phone to bring it live.")
     else:
-        _say(f"Line {line_id} is ready: {number}. Run `ai-phone run`; it will register.")
+        say(f"Line {line_id} is ready: {number}. Run `ai-phone run`; it will register.")
     return EXIT_OK
 
 
 def cmd_add(a) -> int:
     config_path = _config_path(a)
     if a.provider in ("trunk", "sip"):
+        if a.existing:
+            _fail("--existing works with a carrier: telnyx or twilio")
         return _add_manual(a, config_path)
+    if a.existing:
+        if a.number or a.area:
+            _fail("--existing cannot be combined with --number or --area")
+        if not E164_RE.fullmatch(a.existing):
+            _fail("--existing must be E.164, like +15550100000")
     provider = _provider(a)
     raw = read_raw(config_path)
-    line_id = a.id or _next_id(raw, a.provider)
+    line_id = a.id or next_line_id(raw, a.provider)
     if not LINE_ID_RE.fullmatch(line_id):
         _fail(f"--id must match {LINE_ID_RE.pattern}")
     if line_id in (raw.get("lines") or {}):
@@ -172,12 +186,61 @@ def cmd_add(a) -> int:
     # the config the finished line is written into must load now, before a single carrier request spends money
     if config_path.exists():
         load_config(config_path)
+    if a.existing:
+        number = next((n for n in provider.owned_numbers() if n.e164 == a.existing), None) or \
+            _fail(f"{a.existing} is not on your {provider.name} account")
+        if not _ask(f"Connect {number.e164} on your {provider.name} account to ai-phone? Its incoming calls will ring ai-phone. "
+                    "Nothing is bought; `ai-phone lines remove` disconnects it and keeps the number.", a.yes):
+            return EXIT_ERROR
+        journal = Journal.open(paths.lines_dir(), line_id, provider.name)
+        return provision_flow(provider, journal, config_path, line_id, number, existing=True)
     number = _pick_number(provider, a)
     cost = f"{number.monthly_cost:.2f} {number.currency}/month" if number.monthly_cost is not None else "the carrier's monthly price"
     if not _ask(f"Buy {number.e164} for {cost} on your {provider.name} account?", a.yes):
         return EXIT_ERROR
     journal = Journal.open(paths.lines_dir(), line_id, provider.name)
     return provision_flow(provider, journal, config_path, line_id, number)
+
+
+def manual_line(kind: str, *, number: str | None = None, registrar: str | None = None, user: str | None = None,
+                password_env: str | None = None, transport: str = "udp", caller_id: str | None = None, dial_domain: str | None = None,
+                outbound_proxy: str | None = None, trusted_cidrs=(), host: str | None = None, trusted=()) -> dict:
+    """The config entry for a line typed in by hand: a SIP trunk (`trunk`) or a SIP address (`sip`).
+    Raises ValueError for what is missing; `write_line` checks everything else by loading the config."""
+    if kind == "trunk":
+        if not E164_RE.fullmatch(number or ""):
+            raise ValueError("the number must be E.164, like +442079460000")
+        if not registrar or not user or not password_env:
+            raise ValueError("a trunk line needs a registrar, a user and a password")
+        # host_of needs a well-formed URI; a malformed registrar is left for the config check to reject
+        line = {"kind": "trunk", "number": number, "caller_id": caller_id or number, "registrar": registrar,
+                "dial_domain": dial_domain or (host_of(registrar) if ":" in registrar else registrar), "user": user,
+                "password_env": password_env, "transport": transport, "accept_invites_from": "registered_trunk",
+                "trusted_cidrs": list(trusted_cidrs or [])}
+        if outbound_proxy:
+            line["outbound_proxy"] = outbound_proxy
+        return line
+    if kind == "sip":
+        if not user or not host:
+            raise ValueError("a sip line needs a user and a host")
+        return {"kind": "sip", "user": user, "aor": f"sip:{user}@{host}", "caller_id": f"sip:{user}@{host}",
+                "display_name": user, "transport": transport,
+                "accept_invites_from": "trusted" if trusted else "lan", "trusted_peers": list(trusted or [])}
+    raise ValueError(f"a line added by hand is a trunk or a sip line, not {kind!r}")
+
+
+def write_line(config_path: Path, line_id: str, line: dict) -> None:
+    """Add a line and prove the config still loads; if it does not, remove the line again and re-raise the ConfigError.
+    A bad or taken line id is a ValueError."""
+    if not LINE_ID_RE.fullmatch(line_id):
+        raise ValueError(f"line ids must match {LINE_ID_RE.pattern}")
+    with line_lock(paths.lines_dir()):
+        add_line(config_path, line_id, line)
+        try:
+            load_config(config_path)
+        except ConfigError:
+            remove_line(config_path, line_id)  # only undo what this call wrote
+            raise
 
 
 def _add_manual(a, config_path: Path) -> int:
@@ -191,24 +254,14 @@ def _add_manual(a, config_path: Path) -> int:
             _fail("--number must be E.164, like +442079460000")
         if not a.registrar or not a.user or not a.password_env:
             _fail("--registrar, --user and --password-env are required for a trunk line")
-        from ai_phone.config import host_of
-        line = {"kind": "trunk", "number": a.number, "caller_id": a.caller_id or a.number, "registrar": a.registrar,
-                "dial_domain": a.dial_domain or host_of(a.registrar), "user": a.user, "password_env": a.password_env,
-                "transport": a.transport, "accept_invites_from": "registered_trunk", "trusted_cidrs": list(a.trusted_cidr or [])}
-        if a.outbound_proxy:
-            line["outbound_proxy"] = a.outbound_proxy
-    else:
-        line = {"kind": "sip", "user": a.user, "aor": f"sip:{a.user}@{a.host}", "caller_id": f"sip:{a.user}@{a.host}",
-                "display_name": a.user, "transport": a.transport,
-                "accept_invites_from": "trusted" if a.trusted else "lan", "trusted_peers": list(a.trusted or [])}
-    added = False
+    elif not a.user or not a.host:
+        _fail("--user and --host are required for a sip line")
     try:
-        add_line(config_path, a.id, line)
-        added = True
-        load_config(config_path)  # validate what we just wrote
-    except (ValueError, ConfigError) as e:
-        if added:  # only undo what this command wrote
-            remove_line(config_path, a.id)
+        write_line(config_path, a.id, manual_line(
+            a.provider, number=a.number, registrar=a.registrar, user=a.user, password_env=a.password_env, transport=a.transport,
+            caller_id=a.caller_id, dial_domain=a.dial_domain, outbound_proxy=a.outbound_proxy,
+            trusted_cidrs=a.trusted_cidr or (), host=a.host, trusted=a.trusted or ()))
+    except ValueError as e:  # a ConfigError is a ValueError too
         _fail(str(e))
     _say(f"Line {a.id} added. Restart ai-phone (or start it) to bring it up.")
     return EXIT_OK
@@ -250,8 +303,9 @@ def cmd_resume(a) -> int:
     if not password:
         _fail(f"{env_name} is missing from {paths.secrets_path()}; run `ai-phone lines remove {a.line_id} --local-only` and add the line again")
     from ai_phone.providers.base import Number, ProviderError
+    run = provider.attach if _planned(journal, "target", "brought") else provider.provision
     try:
-        result = provider.provision(journal, Number(e164, None, None, False, e164), a.line_id, user, password)
+        result = run(journal, Number(e164, None, None, False, e164), a.line_id, user, password)
     except ProviderError as e:
         _say(f"error: {e}")
         return EXIT_ERROR
@@ -294,7 +348,12 @@ def cmd_remove(a) -> int:
         a.provider = pname
         provider = _provider(a)
         number = ln.get("number", a.line_id)
-        if not _ask(f"Release {number} from your {pname} account? This cannot be undone.", a.yes):
+        if journal.resources().get("number_brought"):
+            question = (f"Disconnect {number} from ai-phone and delete what ai-phone created on your {pname} account? "
+                        "The number stays on your account.")
+        else:
+            question = f"Release {number} from your {pname} account? This cannot be undone."
+        if not _ask(question, a.yes):
             return EXIT_ERROR
         res = provider.release(journal)
         if not res.ok:
@@ -384,7 +443,6 @@ def _guarded(fn):
     """Every lines command runs under the lines lock for its whole duration (config, secrets and journal writes
     included, so two commands never interleave), and provider/secrets failures are reported, never traced (exit 3)."""
     def run(a) -> int:
-        from ai_phone.lines.journal import line_lock
         from ai_phone.providers.base import ProviderError
         try:
             with line_lock(paths.lines_dir()):
@@ -408,6 +466,7 @@ def register(sub) -> None:
     add.add_argument("--yes", action="store_true")
     add.add_argument("--key-env"); add.add_argument("--secret-env")
     add.add_argument("--country", default="GB"); add.add_argument("--area"); add.add_argument("--number")
+    add.add_argument("--existing", metavar="E164", help="connect a number already on your carrier account instead of buying one")
     add.add_argument("--registrar"); add.add_argument("--outbound-proxy"); add.add_argument("--dial-domain")
     add.add_argument("--user"); add.add_argument("--password-env"); add.add_argument("--caller-id")
     add.add_argument("--transport", choices=["udp", "tcp", "tls"], default="udp")

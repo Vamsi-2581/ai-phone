@@ -51,3 +51,48 @@ def test_caller_id_verification():
     assert step.kind == "enter_code_in_cli"
     assert p.complete_caller_id_verification(step, "000000") is False
     assert p.complete_caller_id_verification(step, "123456") is True
+
+
+def test_owned_numbers():
+    from ai_phone.providers.fake import OWNED
+    assert [(n.e164, n.source_id) for n in FakeProvider().owned_numbers()] == [(OWNED, "owned-1")]
+
+
+def test_attach_connects_the_owned_number_and_buys_nothing(tmp_path: Path):
+    p = FakeProvider()
+    n = p.owned_numbers()[0]
+    j = Journal.open(tmp_path, "main", "fake")
+    r = p.attach(j, n, "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
+    assert r.state == "ready" and j.state == "ready" and r.line["number"] == n.e164 and r.line["caller_id"] == n.e164
+    assert r.line["user"] == "aimain1234" and r.line["provider"]["resources"] == {"number_id": "owned-1", "profile_id": "profile-1",
+                                                                                  "connection_id": "connection-1"}
+    assert "number" not in p.carrier and "number" not in p.created
+    assert p.carrier["owned"] == {"id": "owned-1", "name": n.e164, "connection": "connection-1"}
+    assert j.resources()["number_brought"] is True and j.steps_done() == ["claim", "profile", "connection"]
+    assert p.poll(j).line["number"] == n.e164
+
+
+def test_attach_refuses_a_number_not_on_the_account(tmp_path: Path):
+    from ai_phone.providers.base import Number
+    p = FakeProvider()
+    with pytest.raises(ProviderError, match="not on this fake account"):
+        p.attach(Journal.open(tmp_path, "main", "fake"), Number("+442079460001", None, None, False, "x"), "main", "aimain1234", "pw")
+    assert p.carrier == {} and p.created == {}
+
+
+def test_attach_crash_is_reconciled(tmp_path: Path):
+    p = FakeProvider(crash_after="connection")
+    n = p.owned_numbers()[0]
+    with pytest.raises(ProviderError, match="crash"):
+        p.attach(Journal.open(tmp_path, "main", "fake"), n, "main", "aimain1234", "pw")
+    p.crash_after = None
+    assert p.attach(Journal.open(tmp_path, "main"), n, "main", "aimain1234", "pw").state == "ready"
+    assert p.created == {"profile": 1, "connection": 1}
+
+
+def test_release_of_a_brought_number_keeps_it(tmp_path: Path):
+    p = FakeProvider()
+    j = Journal.open(tmp_path, "main", "fake")
+    p.attach(j, p.owned_numbers()[0], "main", "aimain1234", "pw")
+    assert p.release(j).ok
+    assert set(p.carrier) == {"owned"} and p.carrier["owned"]["connection"] is None
