@@ -72,7 +72,7 @@ class FakeProvider:
         if st != "done":
             if number.e164 != OWNED:
                 raise ProviderError(f"{number.e164} is not on this fake account")
-            journal.finish("claim", number_id="owned-1", number_brought=True)
+            journal.finish("claim", brought_number_id="owned-1", number_brought=True)  # never `number_id`: release pops that
         for step in ("profile", "connection"):
             self._step(journal, step, f"ai-phone:{line_id}")
         self.carrier["owned"] = {"id": "owned-1", "name": number.e164, "connection": journal.resources()["connection_id"]}
@@ -99,10 +99,12 @@ class FakeProvider:
         return d
 
     def release(self, journal: Journal) -> ReleaseResult:
-        brought = journal.resources().get("number_brought")
+        res = journal.resources()
+        brought = res.get("brought_number_id")
         for step in reversed(STEPS):
-            if step != "number" or not brought:  # a brought number is only disconnected, never released
-                self.carrier.pop(step, None)
+            if step == "number" and brought and not res.get("number_id"):  # a brought number is only disconnected, never released
+                continue
+            self.carrier.pop(step, None)
         if brought and "owned" in self.carrier:
             self.carrier["owned"]["connection"] = None
         self._persist()

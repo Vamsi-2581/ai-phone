@@ -107,11 +107,12 @@ class TwilioProvider:
             if rec.get("trunk_sid") or rec.get("voice_application_sid"):
                 raise ProviderError(f"{number.e164} is routed by a SIP trunk or a TwiML app on your Twilio account; "
                                     "remove that in the Twilio console first, then try again")
-            journal.finish("claim", number_sid=rec["sid"], number_brought=True,
+            # its own key, never `number_sid`: `release` deletes a `number_sid`, and this number is not ours to delete
+            journal.finish("claim", brought_number_sid=rec["sid"], number_brought=True,
                            previous_voice_url=rec.get("voice_url") or "", previous_voice_method=rec.get("voice_method") or "POST")
-        number_sid = journal.resources()["number_sid"]
+        number_sid = journal.resources()["brought_number_sid"]
         domain_name = self._sip_domain(journal, line_id, sip_user, sip_password)
-        st, planned = journal.start("route", number_sid=number_sid)
+        st, planned = journal.start("route", brought_number_sid=number_sid)
         if st != "done":  # setting a voice URL is idempotent, so a half-done step is simply repeated
             self._call("POST", self._acct(f"/IncomingPhoneNumbers/{number_sid}.json"),
                        data={"VoiceUrl": _twiml_url(sip_user, domain_name), "VoiceMethod": "GET"})
@@ -214,7 +215,8 @@ class TwilioProvider:
         line = {"kind": "trunk", "number": e164, "caller_id": e164, "registrar": f"sip:{r['domain_name']}", "register_via_proxy": False,
                 "transport": "udp", "user": r["user"], "trusted_cidrs": list(SIGNALLING_CIDRS),
                 "provider": {"name": self.name, "state": "ready",
-                             "resources": {k: r[k] for k in ("credential_list_sid", "domain_sid", "number_sid", "trunk_sid") if r.get(k)}}}
+                             "resources": {k: r[k] for k in ("credential_list_sid", "domain_sid", "number_sid", "brought_number_sid", "trunk_sid")
+                                           if r.get(k)}}}
         if r.get("trunk_domain"):
             line.update(outbound_proxy=f"sip:{r['trunk_domain']}", dial_domain=r["trunk_domain"])
             return ProvisionResult("ready", f"{e164} is provisioned", line)
@@ -247,17 +249,18 @@ class TwilioProvider:
     def release(self, journal: Journal) -> ReleaseResult:
         r = journal.resources()
         leftover = {}
-        if r.get("number_brought") and r.get("number_sid"):
+        if r.get("brought_number_sid"):
             # never delete a number ai-phone did not buy: put its voice URL back and leave it on the account
+            sid = r["brought_number_sid"]
             try:
-                self._call("POST", self._acct(f"/IncomingPhoneNumbers/{r['number_sid']}.json"),
+                self._call("POST", self._acct(f"/IncomingPhoneNumbers/{sid}.json"),
                            data={"VoiceUrl": r.get("previous_voice_url", ""), "VoiceMethod": r.get("previous_voice_method") or "POST"})
             except ProviderError as e:
-                leftover["number_sid"] = f"{r['number_sid']}: {e} (the number stays on your account; reset its voice URL in the Twilio console)"
+                leftover["brought_number_sid"] = f"{sid}: {e} (the number stays on your account; reset its voice URL in the Twilio console)"
         for key, url in (("trunk_sid", lambda s: f"{TRUNKING}/Trunks/{s}"), ("number_sid", lambda s: self._acct(f"/IncomingPhoneNumbers/{s}.json")),
                          ("domain_sid", lambda s: self._acct(f"/SIP/Domains/{s}.json")), ("credential_list_sid", lambda s: self._acct(f"/SIP/CredentialLists/{s}.json"))):
             sid = r.get(key)
-            if not sid or (key == "number_sid" and r.get("number_brought")):
+            if not sid:  # a `number_sid` is always one ai-phone bought
                 continue
             try:
                 self._call("DELETE", url(sid))

@@ -291,10 +291,12 @@ def test_attach_routes_an_owned_number_without_buying(tmp_path: Path):
     domain = next(iter(c.domains.values()))["DomainName"]
     assert c.updates == [("PN9", {"VoiceUrl": _twiml_url("u1234", domain), "VoiceMethod": "GET"})]
     assert r.state == "ready" and r.line["number"] == "+15550100001" and r.line["caller_id"] == "+15550100001"
-    assert r.line["provider"]["resources"]["number_sid"] == "PN9" and r.line["registrar"] == f"sip:{domain}"
-    assert set(r.line["provider"]["resources"].values()) <= {"PN9", "SD1", "CL1", "TK1"}  # carrier ids only, no journal flags
+    resources = r.line["provider"]["resources"]
+    assert resources == {"credential_list_sid": "CL1", "domain_sid": "SD1", "brought_number_sid": "PN9", "trunk_sid": "TK1"}
+    assert r.line["registrar"] == f"sip:{domain}"
     res = j.resources()
-    assert res["number_brought"] is True and res["previous_voice_url"] == "https://example.com/old" and res["previous_voice_method"] == "POST"
+    assert res["number_brought"] is True and res["brought_number_sid"] == "PN9" and "number_sid" not in res
+    assert res["previous_voice_url"] == "https://example.com/old" and res["previous_voice_method"] == "POST"
     assert [s["name"] for s in j.doc["steps"]] == ["claim", "credential_list", "credential", "domain", "domain_mapping", "route",
                                                   "trunk", "trunk_credential_list"]
     assert list(c.numbers) == ["PN9"]
@@ -349,7 +351,7 @@ def test_release_of_a_brought_number_that_cannot_be_restored_keeps_it_and_says_s
     p.attach(j, Number("+15550100001", None, None, False, "PN9"), "main", "u1234", "pw")
     del c.numbers["PN9"]  # the restore is refused (404); nothing may be deleted in its place
     res = p.release(j)
-    assert not res.ok and "stays on your account" in res.leftover["number_sid"] and j.state == "rollback_failed"
+    assert not res.ok and "stays on your account" in res.leftover["brought_number_sid"] and j.state == "rollback_failed"
     assert not [x for x in c.calls if x[0] == "DELETE" and "IncomingPhoneNumbers" in x[2]]
     assert not c.domains and not c.credlists and not c.trunks
 
@@ -375,3 +377,50 @@ def test_attach_resumes_after_a_crash_in_route(tmp_path: Path):
     assert "twimlets.com/echo" in c.numbers["PN9"]["VoiceUrl"] and c.numbers["PN9"]["VoiceMethod"] == "GET"
     assert j.resources()["previous_voice_url"] == "https://example.com/old"  # the claim was not re-read after routing
     assert p.poll(j).line["number"] == "+15550100001"
+
+
+def _trunk_fails_once(c: Carrier) -> TwilioProvider:
+    failed = {"done": False}
+
+    def handler(req):
+        if not failed["done"] and req.method == "POST" and req.url.path == "/v1/Trunks":
+            failed["done"] = True
+            return httpx.Response(500, json={"message": "try again"})
+        return c(req)
+
+    return TwilioProvider(key=SID, secret="tok", http=httpx.Client(transport=httpx.MockTransport(handler)))
+
+
+def test_a_buy_then_a_bring_in_one_journal_releases_the_bought_number(tmp_path: Path):
+    """A journal shared by a failed purchase and a later attach: the bought number is still deleted, the brought one kept."""
+    from ai_phone.providers.base import Number
+    c = _owned(Carrier())
+    p = _trunk_fails_once(c)
+    j = Journal.open(tmp_path, "main", "twilio")
+    with pytest.raises(ProviderError):
+        p.provision(j, p.search_numbers("GB", None, 1)[0], "main", "u1234", "pw")
+    assert c.numbers["PN2"]["PhoneNumber"] == "+442079460000"
+    assert p.attach(j, Number("+15550100001", None, None, False, "PN9"), "main", "u1234", "pw").state == "ready"
+    res = j.resources()
+    assert res["number_sid"] == "PN2" and res["brought_number_sid"] == "PN9"
+    c.updates.clear()
+    assert p.release(j).ok
+    assert list(c.numbers) == ["PN9"] and c.numbers["PN9"]["VoiceUrl"] == "https://example.com/old"
+    assert c.updates == [("PN9", {"VoiceUrl": "https://example.com/old", "VoiceMethod": "POST"})]
+    assert not c.domains and not c.credlists and not c.trunks
+
+
+def test_a_bring_then_a_buy_in_one_journal_restores_the_brought_number(tmp_path: Path):
+    from ai_phone.providers.base import Number
+    c = _owned(Carrier())
+    p = _trunk_fails_once(c)
+    j = Journal.open(tmp_path, "main", "twilio")
+    with pytest.raises(ProviderError):
+        p.attach(j, Number("+15550100001", None, None, False, "PN9"), "main", "u1234", "pw")
+    assert "twimlets.com/echo" in c.numbers["PN9"]["VoiceUrl"]
+    assert p.provision(j, p.search_numbers("GB", None, 1)[0], "main", "u1234", "pw").state == "ready"
+    c.updates.clear()
+    assert p.release(j).ok
+    assert list(c.numbers) == ["PN9"], "the bought number is released"
+    assert c.updates == [("PN9", {"VoiceUrl": "https://example.com/old", "VoiceMethod": "POST"})]
+    assert c.numbers["PN9"]["VoiceUrl"] == "https://example.com/old" and not c.domains

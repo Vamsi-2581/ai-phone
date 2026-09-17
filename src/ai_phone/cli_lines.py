@@ -92,6 +92,12 @@ def _fail(msg: str):
 def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, number, existing: bool = False, say=_say) -> int:
     """Everything after the person said yes: the line's SIP password, then `provision` (buy and wire the number) or,
     for a number already on the account, `attach` (wire it only), then the config. Every message goes through `say`."""
+    refusal = _refusal(journal, config_path, line_id, number, existing)
+    if refusal:
+        if not journal.doc["steps"]:
+            journal.delete()  # the empty journal Journal.open() wrote: a refusal leaves nothing behind
+        say(f"error: {refusal}")
+        return EXIT_ERROR
     # first thing in the journal, so resume always knows the number and whether it was bought or brought
     journal.start("target", phone_number=number.e164, brought=existing)
     journal.finish("target")
@@ -110,6 +116,22 @@ def provision_flow(provider, journal: Journal, config_path: Path, line_id: str, 
         say(f"error: {e}\nThe journal is kept at {journal.path}; run `ai-phone lines resume {line_id}` to continue or `ai-phone lines remove {line_id}` to clean up.")
         return EXIT_ERROR
     return _commit(journal, config_path, line_id, result, env_name, say=say)
+
+
+def _refusal(journal: Journal, config_path: Path, line_id: str, number, existing: bool) -> str | None:
+    """Why this request must not run: the number is already another line (two lines would fight over its calls,
+    and removing one would release or re-route the other's number), or the journal holds an unfinished setup for
+    something else (one journal for two numbers lets `release` mix a bought number up with a brought one)."""
+    for lid, ln in (read_raw(config_path).get("lines") or {}).items():
+        if lid != line_id and (ln or {}).get("number") == number.e164:
+            return f"{number.e164} is already line {lid}"
+    if journal.doc["steps"]:
+        target = next((s["planned"] for s in journal.doc["steps"] if s["name"] == "target"), None)
+        if target is None or target.get("phone_number") != number.e164 or bool(target.get("brought")) != existing:
+            before = _journal_number(journal) or "another number"
+            return (f"line {line_id} has an unfinished setup for {before}; run `ai-phone lines resume {line_id}` to finish it "
+                    f"or `ai-phone lines remove {line_id}` to undo it, then try again")
+    return None
 
 
 def _commit(journal: Journal, config_path: Path, line_id: str, result, env_name: str, say=_say) -> int:
@@ -283,6 +305,13 @@ def _planned(journal: Journal, step: str, key: str):
     return next((s["planned"].get(key) for s in journal.doc["steps"] if s["name"] == step), None)
 
 
+def _journal_number(journal: Journal) -> str | None:
+    return (_planned(journal, "target", "phone_number")                      # journals from this version
+            or _planned(journal, "order", "phone_number")                    # older Telnyx journals
+            or _planned(journal, "number", "phone_number")                   # older Twilio journals
+            or _planned(journal, "number", "name"))                          # older fake-carrier journals
+
+
 def cmd_resume(a) -> int:
     """Re-runs provisioning from the journal: finished steps are skipped, half-done ones reconciled, a pending order polled."""
     pname, ln = _journal_for(a.line_id, a)
@@ -291,10 +320,7 @@ def cmd_resume(a) -> int:
     a.provider = pname
     provider = _provider(a)
     journal = Journal.open(paths.lines_dir(), a.line_id, pname)
-    e164 = (_planned(journal, "target", "phone_number")                      # journals from this version
-            or _planned(journal, "order", "phone_number")                    # older Telnyx journals
-            or _planned(journal, "number", "phone_number")                   # older Twilio journals
-            or _planned(journal, "number", "name"))                          # older fake-carrier journals
+    e164 = _journal_number(journal)
     user = _planned(journal, "credentials", "user")
     env_name = ln.get("password_env") or _planned(journal, "credentials", "password_env") or line_password_env(a.line_id)
     if not e164 or not user:
@@ -317,8 +343,28 @@ def _recorded_resources(ln: dict) -> dict:
     return dict((ln.get("provider") or {}).get("resources") or {})
 
 
+BROUGHT_KEYS = ("brought_number_sid", "brought_number_id")  # a number the person already had: kept, never released
+
+
+def _carrier_ids(res: dict) -> tuple[dict, str | None]:
+    """The ids of what ai-phone created, and the id of a brought number. Journal flags and `previous_*` values are
+    never shown: they are not ids, and a previous voice URL can carry credentials. A shared profile is the account's."""
+    ids = {k: v for k, v in res.items() if isinstance(v, str) and v and k.endswith(("_id", "_sid"))
+           and not k.startswith("previous_") and k not in BROUGHT_KEYS}
+    if res.get("profile_shared"):
+        ids.pop("outbound_voice_profile_id", None)
+    return ids, next((res[k] for k in BROUGHT_KEYS if res.get(k)), None)
+
+
 def _ids(res: dict, ln: dict, line_id: str) -> str:
     return ", ".join(f"{k}={v}" for k, v in res.items()) or f"no ids were kept here; find them by {ln.get('number') or line_id}"
+
+
+def _brought_note(journal: Journal | None, ln: dict, brought_id: str | None, pname: str, line_id: str) -> str | None:
+    if not brought_id and not (journal and _planned(journal, "target", "brought")):
+        return None
+    number = ln.get("number") or (journal and _planned(journal, "target", "phone_number")) or line_id
+    return f"{number} stays on your {pname} account; reset its voice URL / connection in the portal if you want its calls back."
 
 
 def cmd_remove(a) -> int:
@@ -336,10 +382,12 @@ def cmd_remove(a) -> int:
         stranded = {k: v for k, v in _recorded_resources(ln).items() if k not in (journalled or {})}
         if journalled is None or stranded:
             why = "is missing" if journal is None else "records no carrier steps" if journalled is None else "is incomplete"
+            ids, brought = _carrier_ids(stranded)
+            note = _brought_note(journal, ln, brought, pname, a.line_id)
             _say(f"error: the provisioning journal for {a.line_id} {why} ({jpath}), "
                  f"so releasing here would leave carrier resources live.\n"
-                 f"Release them on your {pname} account first ({_ids(stranded, ln, a.line_id)}), "
-                 f"then run `ai-phone lines remove {a.line_id} --local-only`.")
+                 f"Release them on your {pname} account first ({_ids(ids, ln, a.line_id)}), "
+                 f"then run `ai-phone lines remove {a.line_id} --local-only`." + (f"\n{note}" if note else ""))
             return EXIT_ERROR
         if not a.key_env:
             _say(f"line {a.line_id} was provisioned on {pname}. Pass --key-env (and --secret-env for twilio) to release its carrier resources, "
@@ -347,8 +395,8 @@ def cmd_remove(a) -> int:
             return EXIT_ERROR
         a.provider = pname
         provider = _provider(a)
-        number = ln.get("number", a.line_id)
-        if journal.resources().get("number_brought"):
+        number = ln.get("number") or _planned(journal, "target", "phone_number") or a.line_id
+        if _planned(journal, "target", "brought"):
             question = (f"Disconnect {number} from ai-phone and delete what ai-phone created on your {pname} account? "
                         "The number stays on your account.")
         else:
@@ -362,8 +410,14 @@ def cmd_remove(a) -> int:
             return EXIT_ERROR
         journal.delete()
     elif pname and a.local_only:
-        res = (Journal.open(paths.lines_dir(), a.line_id, pname).resources() if jpath.exists() else {}) or _recorded_resources(ln)
-        _say("Kept in your carrier account (release them in the portal): " + _ids(res, ln, a.line_id))
+        journal = Journal.open(paths.lines_dir(), a.line_id, pname) if jpath.exists() else None
+        ids, brought = _carrier_ids(journal.resources() if journal else {})
+        if not ids and not brought:
+            ids, brought = _carrier_ids(_recorded_resources(ln))
+        _say("Kept in your carrier account (release them in the portal): " + _ids(ids, ln, a.line_id))
+        note = _brought_note(journal, ln, brought, pname, a.line_id)
+        if note:
+            _say(note)
         jpath.unlink(missing_ok=True)
     remove_line(config_path, a.line_id)
     env_name = ln.get("password_env") or line_password_env(a.line_id)

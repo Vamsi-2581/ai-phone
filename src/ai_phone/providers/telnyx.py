@@ -22,6 +22,22 @@ SIGNALLING_CIDRS: list[str] = [
 ]
 
 
+# Calling code -> country, used only to add a number's own country to its outbound profile's destination whitelist
+# (Telnyx allows US and CA by default). A code missing here just means no extra destination.
+_CALLING_CODES = {"1": "US", "44": "GB", "353": "IE", "61": "AU", "49": "DE", "33": "FR", "31": "NL", "34": "ES", "39": "IT", "46": "SE"}
+
+
+def _country_of(e164: str) -> str:
+    digits = e164.lstrip("+")
+    return next((_CALLING_CODES[digits[:n]] for n in (1, 2, 3) if digits[:n] in _CALLING_CODES), "")  # codes are prefix-free
+
+
+def _record_country(rec: dict) -> str:
+    """The number record's own country, when it carries one (`country_iso_alpha2`); it tells +1 US and CA apart."""
+    c = rec.get("country_iso_alpha2")
+    return c.upper() if isinstance(c, str) and len(c) == 2 and c.isalpha() else ""
+
+
 def _detail(r: httpx.Response) -> str:
     """The carrier's error *message* (never the body): the `detail` strings of a JSON error, or nothing."""
     try:
@@ -77,7 +93,8 @@ class TelnyxProvider:
 
     def owned_numbers(self) -> list[Number]:
         """The numbers already on the account. Read-only: this is also the free key check."""
-        return [Number(n["phone_number"], None, None, False, n["id"]) for n in self._call("GET", "/phone_numbers", params={"page[size]": "100"}) or []]
+        return [Number(n["phone_number"], None, None, False, n["id"], country=_record_country(n) or _country_of(n["phone_number"]))
+                for n in self._call("GET", "/phone_numbers", params={"page[size]": "100"}) or []]
 
     def _exact_number(self, e164: str) -> None:
         """Telnyx only orders numbers returned by a recent search: search this exact number right before ordering."""
@@ -120,10 +137,12 @@ class TelnyxProvider:
                      if n.get("phone_number") == number.e164]
             if not owned:
                 raise ProviderError(f"{number.e164} is not on this Telnyx account")
-            journal.finish("claim", number_id=owned[0]["id"], number_brought=True, previous_connection_id=owned[0].get("connection_id") or "")
-        number_id = journal.resources()["number_id"]
+            # its own key, never `number_id`: `release` deletes a `number_id`, and this number is not ours to delete
+            journal.finish("claim", brought_number_id=owned[0]["id"], number_brought=True,
+                           previous_connection_id=owned[0].get("connection_id") or "")
+        number_id = journal.resources()["brought_number_id"]
         connection_id = self._profile_and_connection(journal, number, line_id, sip_user, sip_password)
-        st, data = journal.start("route", number_id=number_id, connection_id=connection_id)
+        st, data = journal.start("route", brought_number_id=number_id, connection_id=connection_id)
         if st != "done":  # assigning a connection is idempotent, so a half-done step is simply repeated
             self._call("PATCH", f"/phone_numbers/{number_id}", json={"connection_id": connection_id})
             journal.finish("route", routed=True)
@@ -141,8 +160,9 @@ class TelnyxProvider:
             else:
                 try:
                     # Telnyx's default whitelist is US+CA; a UK owner of a US number could not call home. Allow the
-                    # number's own country as well; anything else is a portal/API change to the profile.
-                    allowed = sorted({"US", "CA", number.country.upper()} - {""})
+                    # number's own country as well (a brought or resumed number arrives without one: derive it);
+                    # anything else is a portal/API change to the profile.
+                    allowed = sorted({"US", "CA", (number.country or _country_of(number.e164)).upper()} - {""})
                     rec = self._call("POST", "/outbound_voice_profiles",
                                      json={"name": name, "traffic_type": "conversational", "whitelisted_destinations": allowed})
                     journal.finish("profile", outbound_voice_profile_id=rec["id"])
@@ -171,7 +191,8 @@ class TelnyxProvider:
 
     def poll(self, journal: Journal) -> ProvisionResult:
         res = journal.resources()
-        e164 = next((s["planned"]["phone_number"] for s in journal.doc["steps"] if s["name"] in ("order", "claim")), None)
+        ordered = any(s["name"] == "order" for s in journal.doc["steps"])  # no order: an attached number, nothing to wait for
+        e164 = next((s["planned"]["phone_number"] for s in journal.doc["steps"] if s["name"] == ("order" if ordered else "claim")), None)
         status = res.get("order_status")
         if res.get("order_id") not in (None, "reconciled") and status != "success":
             order = self._call("GET", f"/number_orders/{res['order_id']}")
@@ -183,7 +204,7 @@ class TelnyxProvider:
                 journal.set_state("pending")
                 why = "regulatory documents required (see the Telnyx portal → Numbers → Orders)" if order.get("requirements_met") is False else "order pending"
                 return ProvisionResult("pending", f"{e164}: {why}; run `ai-phone lines resume` later", self._line(journal, e164, "pending"))
-        if not res.get("number_id"):  # delivered (now or at order time): the number's own id is what release deletes
+        if ordered and not res.get("number_id"):  # delivered (now or at order time): the number's own id is what release deletes
             owned = self._call("GET", "/phone_numbers", params={"filter[phone_number]": e164}) or []
             if not owned:  # the order says success but the number is not listed yet: not ready until it is
                 journal.set_state("pending")
@@ -200,7 +221,7 @@ class TelnyxProvider:
         line = {"kind": "trunk", "number": e164, "caller_id": e164, "registrar": REGISTRAR, "dial_domain": DIAL_DOMAIN,
                 "register_via_proxy": True, "transport": "udp", "trusted_cidrs": list(SIGNALLING_CIDRS),
                 "provider": {"name": self.name, "state": state,
-                             "resources": {k: r[k] for k in ("outbound_voice_profile_id", "connection_id", "order_id", "number_id") if r.get(k)}}}
+                             "resources": {k: r[k] for k in ("outbound_voice_profile_id", "connection_id", "order_id", "number_id", "brought_number_id") if r.get(k)}}}
         if sip_user:
             line["user"] = sip_user
         return line
@@ -208,20 +229,19 @@ class TelnyxProvider:
     def release(self, journal: Journal) -> ReleaseResult:
         r = journal.resources()
         leftover = {}
-        if r.get("number_brought") and r.get("number_id"):
+        if r.get("brought_number_id"):
             # never delete a number ai-phone did not buy: move it back to the connection it had (or none)
+            nid = r["brought_number_id"]
             try:
-                self._call("PATCH", f"/phone_numbers/{r['number_id']}", json={"connection_id": r.get("previous_connection_id") or None})
+                self._call("PATCH", f"/phone_numbers/{nid}", json={"connection_id": r.get("previous_connection_id") or None})
             except ProviderError as e:
-                leftover["number_id"] = f"{r['number_id']}: {e} (the number stays on your account; reassign it in the Telnyx portal)"
+                leftover["brought_number_id"] = f"{nid}: {e} (the number stays on your account; reassign it in the Telnyx portal)"
         # when that move failed the deletes below are still tried: the carrier may refuse the connection while the
         # number is on it, and that lands in `leftover` too
         for kind, key, path in (("number", "number_id", "/phone_numbers/"), ("connection", "connection_id", "/credential_connections/"),
                                 ("profile", "outbound_voice_profile_id", "/outbound_voice_profiles/")):
             rid = r.get(key)
             if not rid or (kind == "profile" and r.get("profile_shared")):  # a shared profile is the account's, not ours
-                continue
-            if kind == "number" and r.get("number_brought"):  # the person's own number, handled above
                 continue
             try:
                 self._call("DELETE", f"{path}{rid}")

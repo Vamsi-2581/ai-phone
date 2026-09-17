@@ -289,9 +289,11 @@ def test_attach_connects_an_owned_number_without_ordering(tmp_path: Path):
     assert carrier.numbers["n9"]["connection_id"] == "c1" and carrier.connections["c1"]["connection_name"] == "ai-phone:main"
     assert carrier.patches == [("n9", {"connection_id": "c1"})]
     assert r.state == "ready" and j.state == "ready" and r.line["number"] == "+15550100001" and r.line["user"] == "aimain1234"
-    assert r.line["provider"]["resources"] == {"outbound_voice_profile_id": "p1", "connection_id": "c1", "number_id": "n9"}
+    assert r.line["provider"]["resources"] == {"outbound_voice_profile_id": "p1", "connection_id": "c1", "brought_number_id": "n9"}
     res = j.resources()
-    assert res["number_brought"] is True and res["previous_connection_id"] == "old-conn"
+    assert res["number_brought"] is True and res["brought_number_id"] == "n9" and "number_id" not in res
+    assert res["previous_connection_id"] == "old-conn"
+    assert carrier.profiles["p1"]["whitelisted_destinations"] == ["CA", "US"]
     assert [s["name"] for s in j.doc["steps"]] == ["claim", "profile", "connection", "route"]
     assert p.poll(j).line["number"] == "+15550100001"
 
@@ -357,6 +359,70 @@ def test_release_of_a_brought_number_that_cannot_be_moved_still_deletes_the_rest
     p.attach(j, Number("+15550100001", None, None, False, "n9"), "main", "aimain1234", "pw")
     del carrier.numbers["n9"]  # the move back is refused (404)
     res = p.release(j)
-    assert not res.ok and "stays on your account" in res.leftover["number_id"] and j.state == "rollback_failed"
+    assert not res.ok and "stays on your account" in res.leftover["brought_number_id"] and j.state == "rollback_failed"
     assert not [c for c in carrier.calls if c == ("DELETE", "/v2/phone_numbers/n9")]
     assert not carrier.connections and not carrier.profiles
+
+
+def test_owned_numbers_carry_their_country():
+    from ai_phone.providers.telnyx import _country_of
+    carrier = _owned(Carrier())
+    carrier.numbers["n8"] = {"phone_number": "+442079460001"}
+    carrier.numbers["n7"] = {"phone_number": "+15550100002", "country_iso_alpha2": "CA"}  # the record's own country wins
+    assert [(n.e164, n.country) for n in _provider(carrier).owned_numbers()] == [
+        ("+15550100001", "US"), ("+442079460001", "GB"), ("+15550100002", "CA")]
+    assert _country_of("+447700900123") == "GB" and _country_of("+9990000000") == ""  # +999 is not assigned to anyone
+
+
+def test_attaching_a_uk_number_whitelists_gb(tmp_path: Path):
+    """A brought number must be able to call its own country, as a bought one can."""
+    carrier = Carrier()
+    carrier.numbers["n9"] = {"phone_number": "+442079460001", "connection_id": "old-conn"}
+    p = _provider(carrier)
+    r = p.attach(Journal.open(tmp_path, "main", "telnyx"), Number("+442079460001", None, None, False, "n9"), "main", "aimain1234", "pw")
+    assert r.state == "ready" and carrier.profiles["p1"]["whitelisted_destinations"] == ["CA", "GB", "US"]
+
+
+def test_resuming_a_uk_purchase_still_whitelists_gb(tmp_path: Path):
+    """`lines resume` passes a number without a country: the profile still allows the number's own country."""
+    carrier = Carrier()
+    p = _provider(carrier)
+    r = p.provision(Journal.open(tmp_path, "main", "telnyx"), Number("+442079460000", None, None, False, "+442079460000"),
+                    "main", "aimain1234", "pw")
+    assert r.state == "ready" and carrier.profiles["p1"]["whitelisted_destinations"] == ["CA", "GB", "US"]
+
+
+def test_a_buy_then_a_bring_in_one_journal_releases_the_bought_number(tmp_path: Path):
+    """A journal shared by a purchase whose line was never written and a later attach: the bought number is still
+    deleted, the brought one moved back and kept."""
+    carrier = _owned(Carrier(), connection_id="old-conn")
+    p = _provider(carrier)
+    j = Journal.open(tmp_path, "main", "telnyx")
+    assert p.provision(j, p.search_numbers("GB", None, 1)[0], "main", "aimain1234", "pw").state == "ready"
+    assert p.attach(j, Number("+15550100001", None, None, False, "n9"), "main", "aimain1234", "pw").state == "ready"
+    res = j.resources()
+    assert res["number_id"] == "n1" and res["brought_number_id"] == "n9"
+    assert p.release(j).ok
+    assert list(carrier.numbers) == ["n9"] and carrier.numbers["n9"]["connection_id"] == "old-conn"
+    assert not carrier.connections and not carrier.profiles
+
+
+def test_a_bring_then_a_buy_in_one_journal_restores_the_brought_number(tmp_path: Path):
+    carrier = _owned(Carrier(), connection_id="old-conn")
+    refused = {"done": False}
+
+    def handler(req):
+        if not refused["done"] and req.method == "PATCH":
+            refused["done"] = True
+            return httpx.Response(500, json={"errors": [{"detail": "try again"}]})
+        return carrier(req)
+
+    p = TelnyxProvider(key="KEY", http=httpx.Client(transport=httpx.MockTransport(handler), base_url=TELNYX_API))
+    j = Journal.open(tmp_path, "main", "telnyx")
+    with pytest.raises(ProviderError):
+        p.attach(j, Number("+15550100001", None, None, False, "n9"), "main", "aimain1234", "pw")
+    r = p.provision(j, p.search_numbers("GB", None, 1)[0], "main", "aimain1234", "pw")
+    assert r.state == "ready" and r.line["number"] == "+442079460000" and r.line["provider"]["resources"]["number_id"] == "n1"
+    assert p.release(j).ok
+    assert list(carrier.numbers) == ["n9"], "the bought number is released"
+    assert carrier.numbers["n9"]["connection_id"] == "old-conn" and not carrier.connections and not carrier.profiles

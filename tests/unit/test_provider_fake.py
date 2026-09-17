@@ -64,7 +64,7 @@ def test_attach_connects_the_owned_number_and_buys_nothing(tmp_path: Path):
     j = Journal.open(tmp_path, "main", "fake")
     r = p.attach(j, n, "main", "aimain1234", "Passw0rdPassw0rdPassw0rd")
     assert r.state == "ready" and j.state == "ready" and r.line["number"] == n.e164 and r.line["caller_id"] == n.e164
-    assert r.line["user"] == "aimain1234" and r.line["provider"]["resources"] == {"number_id": "owned-1", "profile_id": "profile-1",
+    assert r.line["user"] == "aimain1234" and r.line["provider"]["resources"] == {"brought_number_id": "owned-1", "profile_id": "profile-1",
                                                                                   "connection_id": "connection-1"}
     assert "number" not in p.carrier and "number" not in p.created
     assert p.carrier["owned"] == {"id": "owned-1", "name": n.e164, "connection": "connection-1"}
@@ -94,5 +94,15 @@ def test_release_of_a_brought_number_keeps_it(tmp_path: Path):
     p = FakeProvider()
     j = Journal.open(tmp_path, "main", "fake")
     p.attach(j, p.owned_numbers()[0], "main", "aimain1234", "pw")
+    assert p.release(j).ok
+    assert set(p.carrier) == {"owned"} and p.carrier["owned"]["connection"] is None
+
+
+def test_a_buy_then_a_bring_in_one_journal_releases_the_bought_number(tmp_path: Path):
+    p = FakeProvider()
+    j = Journal.open(tmp_path, "main", "fake")
+    p.provision(j, p.search_numbers("GB", None, 1)[0], "main", "aimain1234", "pw")
+    p.attach(j, p.owned_numbers()[0], "main", "aimain1234", "pw")
+    assert j.resources()["number_id"] == "number-1" and j.resources()["brought_number_id"] == "owned-1"
     assert p.release(j).ok
     assert set(p.carrier) == {"owned"} and p.carrier["owned"]["connection"] is None

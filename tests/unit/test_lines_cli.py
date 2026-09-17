@@ -358,7 +358,7 @@ def test_provision_flow_sends_messages_to_say(home: Path, capsys):
     msgs.clear()
     broken = FakeProvider(crash_after="profile")
     rc = provision_flow(broken, Journal.open(paths.lines_dir(), "work", "fake"), home / "config.yaml", "work",
-                        broken.owned_numbers()[0], existing=True, say=msgs.append)
+                        broken.search_numbers("GB", None, 2)[1], say=msgs.append)
     assert rc == EXIT_ERROR and len(msgs) == 1 and msgs[0].startswith("error: simulated crash after profile")
     assert capsys.readouterr().out == ""
 
@@ -396,3 +396,111 @@ def test_manual_line_and_write_line(home: Path):
     with pytest.raises(ValueError, match="line ids must match"):
         write_line(cfg, "Not Valid", manual_line("sip", user="sam", host="192.0.2.11"))
     assert read_raw(cfg) == before
+
+
+# ---- review round 1 ------------------------------------------------------------------------------
+
+def test_an_unfinished_buy_blocks_a_bring_under_the_same_id(home: Path, monkeypatch, capsys):
+    """A journal left by a failed purchase must not be reused for a different number: its release would mix the two."""
+    monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "number")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 3
+    monkeypatch.delenv("AI_PHONE_FAKE_CRASH_AFTER")
+    capsys.readouterr()
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--existing", "+442079460099", "--yes"]) == 3
+    out = capsys.readouterr().out
+    assert "line main has an unfinished setup for +442079460000" in out
+    assert "ai-phone lines resume main" in out and "ai-phone lines remove main" in out
+    assert "owned" not in _fake_carrier(home)["carrier"]
+    steps = Journal.open(home / "lines", "main").doc["steps"]
+    assert steps[0]["planned"] == {"phone_number": "+442079460000", "brought": False} and "claim" not in [s["name"] for s in steps]
+    # the same request again is a retry, not a mix: it finishes the purchase
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 0
+    assert load_config(home / "config.yaml").lines["main"].number == "+442079460000"
+
+
+def test_an_unfinished_bring_blocks_a_buy_under_the_same_id(home: Path, monkeypatch, capsys):
+    monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "connection")
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--existing", "+442079460099", "--yes"]) == 3
+    monkeypatch.delenv("AI_PHONE_FAKE_CRASH_AFTER")
+    capsys.readouterr()
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 3
+    assert "line main has an unfinished setup for +442079460099" in capsys.readouterr().out
+    assert "number" not in _fake_carrier(home)["carrier"] and "number" not in _fake_carrier(home)["created"]
+    assert main(["lines", "resume", "main", "--key-env", "FAKE_KEY"]) == 0  # the way forward still works
+    assert load_config(home / "config.yaml").lines["main"].number == "+442079460099"
+
+
+def test_a_number_that_is_already_a_line_is_refused(home: Path, capsys):
+    from ai_phone import paths
+    from ai_phone.cli_lines import EXIT_ERROR, provision_flow
+    from ai_phone.providers.fake import FakeProvider
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--existing", "+442079460099", "--yes"]) == 0
+    capsys.readouterr()
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "other", "--existing", "+442079460099", "--yes"]) == 3
+    assert "error: +442079460099 is already line main" in capsys.readouterr().out
+    assert not (home / "lines" / "other.journal.json").exists(), "a refusal leaves no journal behind"
+    assert _fake_carrier(home)["carrier"]["owned"]["connection"] == "connection-1"
+    assert "AI_PHONE_LINE_OTHER_PASSWORD" not in load_secrets(home / "secrets.env")
+    p = FakeProvider()  # the wizard's way in: a bought number that is already a line is refused the same way
+    main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "shop", "--yes"])
+    msgs = []
+    rc = provision_flow(p, Journal.open(paths.lines_dir(), "shop-2", "fake"), home / "config.yaml", "shop-2",
+                        p.search_numbers("GB", None, 1)[0], say=msgs.append)
+    assert rc == EXIT_ERROR and msgs == ["error: +442079460000 is already line shop"]
+
+
+def _brought_line(home: Path) -> None:
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--existing", "+442079460099", "--yes"]) == 0
+    j = Journal.open(home / "lines", "main")
+    claim = next(s for s in j.doc["steps"] if s["name"] == "claim")
+    claim["result"]["previous_voice_url"] = "https://sam:hunter22@hooks.example.com/voice"  # a URL can carry credentials
+    j._save()
+
+
+def test_keeping_a_brought_line_local_never_says_to_release_the_number(home: Path, capsys):
+    _brought_line(home)
+    capsys.readouterr()
+    assert main(["lines", "remove", "main", "--local-only", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "Kept in your carrier account (release them in the portal): profile_id=profile-1, connection_id=connection-1\n" in out
+    assert ("+442079460099 stays on your fake account; reset its voice URL / connection in the portal "
+            "if you want its calls back") in out
+    for leaked in ("owned-1", "hunter22", "previous", "number_brought", "True", "password_env", "AI_PHONE_LINE"):
+        assert leaked not in out
+
+
+def test_a_brought_line_without_its_journal_never_says_to_release_the_number(home: Path, capsys):
+    _brought_line(home)
+    (home / "lines" / "main.journal.json").unlink()
+    capsys.readouterr()
+    assert main(["lines", "remove", "main", "--key-env", "FAKE_KEY", "--yes"]) == 3
+    out = capsys.readouterr().out
+    assert "Release them on your fake account first (profile_id=profile-1, connection_id=connection-1)" in out
+    assert "+442079460099 stays on your fake account; reset its voice URL / connection in the portal" in out
+    assert "owned-1" not in out and "main" in load_config(home / "config.yaml").lines
+
+
+def test_keeping_a_bought_line_local_prints_carrier_ids_only(home: Path, capsys):
+    main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"])
+    capsys.readouterr()
+    assert main(["lines", "remove", "main", "--local-only", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "Kept in your carrier account (release them in the portal): profile_id=profile-1, connection_id=connection-1, number_id=number-1\n" in out
+    assert "stays on your" not in out and "password_env" not in out and "user=" not in out
+
+
+def test_remove_after_a_refused_claim_asks_the_disconnect_question_with_the_number(home: Path, monkeypatch):
+    from ai_phone import paths
+    from ai_phone.cli_lines import EXIT_ERROR, provision_flow
+    from ai_phone.providers.base import Number
+    from ai_phone.providers.fake import FakeProvider
+    msgs = []
+    rc = provision_flow(FakeProvider(), Journal.open(paths.lines_dir(), "main", "fake"), home / "config.yaml", "main",
+                        Number("+442079460001", None, None, False, "x"), existing=True, say=msgs.append)
+    assert rc == EXIT_ERROR and "is not on this fake account" in msgs[0]
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or "y")
+    assert main(["lines", "remove", "main", "--key-env", "FAKE_KEY"]) == 0
+    assert asked == ["Disconnect +442079460001 from ai-phone and delete what ai-phone created on your fake account? "
+                     "The number stays on your account. [y/N] "]
+    assert not (home / "lines" / "main.journal.json").exists()
