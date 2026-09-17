@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | v1.0 baseline, 2026-09-02; Milestone 2 as built in §14a (2026-09-03), Milestone 3 as built in §14b (2026-09-16). Companion to `architecture-essentials.md`. |
+| **Status** | v1.0 baseline, 2026-09-02; Milestone 2 as built in §14a (2026-09-03), Milestone 3 as built in §14b (2026-09-16), Milestone 4 (getting started) in §10 (2026-09-17). Companion to `architecture-essentials.md`. |
 | **Reading order** | `architecture-essentials.md` first. Come here when it does not answer the question. |
 | **Precedence** | Owner's decisions → this doc. Where the text and the decision log in §15 disagree on a *decision*, the decision log wins. |
 | **Notation** | **[D]** decided; do not change without the owner. **[P]** proposed default; change if Milestone 1 measurement says so, and record the change in §15. **[V]** verified against library source, PyPI, Hugging Face, or Homebrew on 2026-09-02 by an independent reviewer. |
@@ -33,7 +33,7 @@ Non-goals that shape the architecture: single-call, English-only, no web UI, no 
  │        (PJSIP)         (asyncio, main)     (3 child processes)            │
  │                              │                                            │
  │                       Layer 4 Control plane                               │
- │              CLI · YAML config · doctor · HTTP API (M5) · TUI (M5)        │
+ │                  CLI · YAML config · HTTP API (M5) · TUI (M5)             │
  └──────────────────────────────────────────────────────────────────────────┘
                               ▲
                               │  localhost only
@@ -67,7 +67,7 @@ PJSIP → Python callbacks are SWIG *director* calls; the extension **must be bu
 ### 2.3 Startup sequence **[D]**
 
 1. Parse and validate config (§8). Refuse to start on any error; print the field and the fix. A trunk whose password variable is not set is not a config error but a secrets one: that line is skipped with an error in the log and in `status`, and the other lines start.
-2. Verify model weights and the spaCy G2P model are present on disk (registry manifest, §7.5). Refuse to start if anything is missing; `doctor` explains how to fetch. No network here or later, other than SIP/RTP to the peer and, if configured, the brain endpoint (§14a) — plus, at start only, the STUN query and the DNS lookups for registrars and trusted peers (§14a.5), which a firewall rule set must allow.
+2. Verify model weights and the spaCy G2P model are present on disk (registry manifest, §7.5). Refuse to start if anything is missing; `ai-phone models pull` fetches it (§10.4). No network here or later, other than SIP/RTP to the peer and, if configured, the brain endpoint (§14a) — plus, at start only, the STUN query and the DNS lookups for registrars and trusted peers (§14a.5), which a firewall rule set must allow.
 3. Set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` in the environment of every process.
 4. Spawn the three workers. Each loads its model and replies `ready` with warm-up timings. Warm-up = one real inference each (a 1 s silent-plus-tone buffer for STT, a 16-token generation for the LLM with the system prompt as prefix so the prompt cache is primed, one short sentence for TTS).
 5. Create the PJSIP endpoint: `libCreate` → `libInit(EpConfig)` → transports → `audDevManager().setNullDev()` → codec priorities → `libStart`.
@@ -139,7 +139,7 @@ acc_cfg.mediaConfig.srtpSecureSignaling = 0
        └────────── backoff ◀────┴────────────────────────────────── DEGRADED ──retry──▶ REGISTERING
 ```
 
-Backoff on non-fatal failure: 5 s, 10 s, 20 s, 40 s, 60 s, then every 60 s, with ±20 % jitter **[P]**. The `onRegState` callback posts `RegEvent(state, code, reason)` to the asyncio queue; the pipeline never reads PJSIP state directly. `ai-phone status` shows the current state; `doctor` (M4) and the M5 API will too. Success criterion: registered 24 h unattended, which this machine satisfies by construction if refresh runs at `expiry/2`.
+Backoff on non-fatal failure: 5 s, 10 s, 20 s, 40 s, 60 s, then every 60 s, with ±20 % jitter **[P]**. The `onRegState` callback posts `RegEvent(state, code, reason)` to the asyncio queue; the pipeline never reads PJSIP state directly. `ai-phone status` shows the current state; a later check command and the M5 API will too. Success criterion: registered 24 h unattended, which this machine satisfies by construction if refresh runs at `expiry/2`.
 
 ### 3.4 Call handling
 
@@ -151,7 +151,7 @@ Backoff on non-fatal failure: 5 s, 10 s, 20 s, 40 s, 60 s, then every 60 s, with
 2. Evaluate `accept_invites_from`:
    - `registered_trunk`: accept only if the request arrived via the registered account's transport **and** the source IP matches the registrar/proxy address learned at registration (or an explicit `sip.trusted_peers` list). Otherwise reply **403 Forbidden**.
    - `lan`: accept if source IP ∈ RFC 1918 ∪ `127.0.0.0/8` ∪ `::1` ∪ `fe80::/10` **[D]** (loopback is included so the `pjsua` test peer and CI work). Otherwise 403.
-   - `any`: accept from anywhere (documented as unsafe; `doctor` warns).
+   - `any`: accept from anywhere (documented as unsafe; a later check command will warn, §7.3).
 3. If a call is already active or ending: reply **486 Busy Here**.
 4. Optional caller allowlist (M5): if configured and the From user is not listed, 403.
 5. Otherwise: create the `Call` object, answer **180 Ringing** immediately, then post `IncomingCall(call_id, from, source)` to the asyncio queue. The pipeline answers **200 OK** when it is ready to speak the greeting (normally within one loop iteration; the 180 covers the gap).
@@ -201,7 +201,7 @@ def onFrameRequested(self, frame):  # audio to caller, must fill 640 bytes
 
 Ring buffers: two single-producer/single-consumer rings of 100 frames (2 s) backed by `multiprocessing.shared_memory` **[D]** so the same memory can later be handed to a worker without a copy; head/tail indices are 64-bit atomics via `ctypes` in the same block. Overwrite-on-overflow on RX (a stalled consumer must not stall PJSIP); silence-on-underflow on TX. Both counters are exported to the latency record (§9).
 
-DTMF: `onDtmfDigit` → `DtmfEvent(digit)` to the queue. Unused through launch except by `doctor`'s codec check.
+DTMF: `onDtmfDigit` → `DtmfEvent(digit)` to the queue. Unused through launch (a later check command may use it to check codecs, §7.3).
 
 ### 3.6 Address and NAT
 
@@ -209,16 +209,16 @@ DTMF: `onDtmfDigit` → `DtmfEvent(digit)` to the queue. Unused through launch e
 |---|---|---|
 | `sip.bind.addr` / `.port` | `TransportConfig.boundAddress` / `.port` | default `0.0.0.0:5060` |
 | `sip.public_addr` | `TransportConfig.publicAddress` | when behind NAT without STUN |
-| `nat.stun_servers[]` | `uaConfig.stunServer` | any STUN server the user names; none by default (a STUN server *is* a network connection outside SIP/RTP, so `doctor` flags it against the isolation criterion) |
+| `nat.stun_servers[]` | `uaConfig.stunServer` | any STUN server the user names; none by default (a STUN server *is* a network connection outside SIP/RTP, so a later check command will flag it against the isolation criterion, §7.3) |
 | `nat.keepalive_sec` | `natConfig.udpKaIntervalSec` | 25 default |
-| `rtp.port_min` / `port_max` | `mediaConfig.transportConfig.port/portRange` | default 10000–10100; must be reachable; Docker requires `--network host` because bridge networking advertises the container IP in SDP **[V]** |
+| `rtp.port_min` / `port_max` | `mediaConfig.transportConfig.port/portRange` | default 10000–10100; must be reachable |
 
-### 3.7 Build and packaging of the extension
+### 3.7 Building the extension
 
-- macOS dev **[V]**: `brew install swig pjproject` gives the 2.17 bottle (static `.a` libs, headers, `libpjproject.pc`, `bin/pjsua`; **no `.i` files**). Fetch the 2.17 source tarball for `pjsip-apps/src/swig/pjsua2.i` and `symbols.i` (or use the tree's `pjsip-apps/src/swig/python/setup.py`). Build: `swig -c++ -python -threads -w312 -I$(brew --prefix pjproject)/include pjsua2.i`, then compile and link with `pkg-config --static --cflags --libs libpjproject` (pulls openssl@3 and the Apple frameworks the bottle was built with, including AVFoundation/VideoToolbox because the bottle has video enabled).
+- macOS **[V]**: `brew install swig pkgconf pjproject` gives the tools and the 2.17 bottle (static `.a` libs, headers, `libpjproject.pc`, `bin/pjsua`; **no `.i` files**). The interface files are committed in `native/pjsua2/` (`pjsua2.i` and `symbols.i` from the 2.17 source tarball, whose SHA-256 is recorded beside them), so the build downloads nothing. `native/pjsua2/build.sh` runs `swig -c++ -python -threads -w312 -I$(brew --prefix pjproject)/include pjsua2.i`, then compiles and links with `pkg-config --static --cflags --libs libpjproject` (pulls openssl@3 and the Apple frameworks the bottle was built with, including AVFoundation/VideoToolbox because the bottle has video enabled). `scripts/install.sh` runs it (§10.2).
 - Linux CI **[V]**: build pjproject 2.17 from source with `--enable-shared` or `CFLAGS=-fPIC`; the static default is not position-independent and the extension will not link.
-- The compiled module ships **inside the `ai-phone` platform wheel** as `ai_phone/_pjsua2.so` **[D]** (PyPI name `pjsua2` is taken by a stale 2023 sdist **[V]**). Wheel matrix: cp311–cp313 × macos-arm64 × manylinux x86_64; `requires-python >=3.11,<3.14`.
-- Licensing **[D][V]**: PJSIP is GPLv2-or-later; ai-phone is AGPLv3 (GPLv3 §13). The extension's corresponding source (interface files, build script, pjproject version) is published as an sdist beside the wheel (GPLv3 §6(d)).
+- The compiled module is built on each person's own Mac, for the project environment's Python, and copied with the generated `pjsua2.py` into `src/ai_phone/vendor/` (git-ignored), where ai-phone imports it as `ai_phone.vendor.pjsua2` **[D]** (2026-09-17: no wheel is published, §15). `requires-python >=3.11,<3.14`.
+- Licensing **[D][V]**: PJSIP is GPLv2-or-later; ai-phone is AGPLv3 (GPLv3 §13). The extension's corresponding source (interface files, build script, pjproject version and checksum) is `native/pjsua2/` in the repository, beside the code that uses it.
 
 ## 4. Layer 2: Pipeline (asyncio, main process)
 
@@ -274,7 +274,7 @@ One `TurnController` per call. Every generation carries a monotonically increasi
 ### 4.6 TTS, output, and cancellation
 
 - The TTS worker returns 24 kHz float32 chunks per unit **[V]** (Kokoro's native rate). The pipeline resamples to 16 kHz int16 with `soxr` (VHQ) **[P]** and pushes 640-byte frames to `tx_ring`. First frame pushed = t5 candidate; the actual t5 is stamped by the media port when it hands the first non-silent frame to PJSIP (a flag on the ring entry).
-- Underrun: if `tx_ring` empties mid-utterance (TTS slower than real time), the port sends silence and increments `tx_underruns`; the latency record shows it. Persistent underrun → `doctor` recommends the lighter tier.
+- Underrun: if `tx_ring` empties mid-utterance (TTS slower than real time), the port sends silence and increments `tx_underruns`; the latency record shows it. Persistent underrun → switch to the lighter tier (a later check command will recommend it, §7.3).
 - **Cancellation semantics [D]**: `cancel(gen_id)` is sent to all three workers; they abandon work for that id at their next check (≤ 1 chunk). The pipeline flushes `tx_ring` immediately (the caller stops hearing us within one frame plus the phone's jitter buffer), drops any in-flight chunks whose `gen_id` is stale, and keeps the partial assistant text in history marked `[interrupted]` so the model knows what the caller heard.
 
 ### 4.7 Barge-in **[D]**
@@ -345,8 +345,8 @@ Workers check for `cancel` between chunks/tokens; a cancelled `gen_id` is rememb
 | Role | Package | Model | Notes |
 |---|---|---|---|
 | STT | `mlx-audio[stt]` parakeet (has streaming) | `mlx-community/parakeet-tdt-0.6b-v2` (English) | v3 is multilingual, post-launch. Standalone `parakeet-mlx` is the fallback only if measurably faster. |
-| LLM | `mlx-lm` | `mlx-community/Qwen3.5-9B-MLX-4bit` (default, 24 GB+); `mlx-community/Qwen3.5-4B-MLX-4bit` (16 GB tier) | Both checkpoints include a vision tower; mlx-lm discards it at load (`sanitize()`), so only the text model is resident. No text-only checkpoint exists. |
-| TTS | `mlx-audio[tts]` Kokoro | `mlx-community/Kokoro-82M-bf16`, voice `af_heart`, 24 kHz | Needs `misaki[en]` (G2P), which pulls spaCy and PyTorch (~80 packages) and **downloads `en_core_web_sm` from GitHub at first use if absent**. `doctor` pre-installs and asserts it. |
+| LLM | `mlx-lm` | `mlx-community/Qwen3.5-9B-MLX-4bit` (32 GB+); `mlx-community/Qwen3.5-4B-MLX-4bit` (16 GB tier; the default below 32 GB, §5.5) | Both checkpoints include a vision tower; mlx-lm discards it at load (`sanitize()`), so only the text model is resident. No text-only checkpoint exists. |
+| TTS | `mlx-audio[tts]` Kokoro | `mlx-community/Kokoro-82M-bf16`, voice from `tts.voice` (default `af_heart`), 24 kHz | Needs `misaki[en]` (G2P), which pulls spaCy and PyTorch (~80 packages) and **downloads `en_core_web_sm` from GitHub at first use if absent**; `pyproject.toml` pins that model as a dependency, so `uv sync` installs it. The voice is loaded by file path from the model's own snapshot (`voices/<name>.safetensors`): given a bare name, mlx-audio looks in `prince-canuma/Kokoro-82M`, which holds only two voices. `a…` voices use American pronunciation and `b…` voices British (Kokoro's `lang_code`). |
 | VAD | `mlx-audio` Silero (or `silero-vad`) | — | 16 kHz, 512-sample chunks |
 
 LLM worker specifics: `mlx_lm.load(model_id)`; `make_prompt_cache(model)` primed with the system prompt at warm-up (since Milestone 3, with the fixed phone instructions and the "This call:" header, §14b.4); `stream_generate(model, tokenizer, prompt, max_tokens=..., prompt_cache=cache)`. Because history is a suffix of a stable prefix, the cache is reused every turn; the worker reports `prompt_eval_ms` and `gen_ms` separately so the LLM budget row (250 ms, zero slack) is diagnosable.
@@ -355,16 +355,16 @@ LLM worker specifics: `mlx_lm.load(model_id)`; `make_prompt_cache(model)` primed
 
 | Role | Package | Notes |
 |---|---|---|
-| STT | `sherpa-onnx` (parakeet or Nemotron via ONNX) or `faster-whisper` | pick by measured latency in M4 |
+| STT | `sherpa-onnx` (parakeet or Nemotron via ONNX) or `faster-whisper` | pick by measured latency when the Linux backends are built |
 | LLM | `llama-cpp-python` with CUDA | PyPI has sdist only **[V]**; the Docker image installs from the maintainer's `cu12x` wheel index. GGUF 4-bit Qwen3.5 of the same tier. |
 | TTS | `kokoro-onnx` | requires Python < 3.14 |
 | VAD | `silero-vad` | — |
 
 ### 5.5 Model registry, weights, and verification **[D]**
 
-- Weights live under `$AI_PHONE_HOME/models/` (default `~/.ai-phone/models`; `/var/lib/ai-phone/models` in the container). Fetched only by `ai-phone doctor --fetch` or `ai-phone models pull <tier>`; never at daemon runtime.
-- A `manifest.json` per tier lists every expected file with size and SHA-256. `doctor` verifies; the daemon refuses to start on mismatch.
-- Tiers: `t9` (9B LLM, ~7 GB resident total) and `t4` (4B LLM, ~4 GB). Selection: explicit `models.tier` in config, else auto by total memory (≥ 24 GB → t9, else t4).
+- Weights live in the Hugging Face cache (`~/.cache/huggingface/hub`, or wherever `HF_HOME` points), where the backends load them by repo id (amended 2026-09-17; `models.home` is not used). They are fetched only by `ai-phone models pull` and `ai-phone setup`, both through `ai_phone.models.pull`; never at daemon runtime.
+- What is needed: the STT and TTS models always, and the tier's LLM only for the local brain. A model counts as present when its cached snapshot has a `config.json` and weights. `pull` fetches only what is missing, first checks that the download plus 1 GB fits on the disk, reports progress, and picks up an interrupted download where it stopped. Checking every file against a per-tier manifest (sizes and SHA-256) is left to a later check command (§7.3).
+- Tiers: `t9` (9B LLM, ~7 GB resident total) and `t4` (4B LLM, ~4 GB). Selection: `ai-phone run --tier`, else `models.tier` in the config (setup writes it); `auto` picks by total memory: 32 GB or more → t9, else t4 (the 9B tier does not fit beside normal apps on 24 GB, §15).
 - Environment in every process: `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `TOKENIZERS_PARALLELISM=false`.
 
 ### 5.6 Memory budget (macOS, t9) **[P]**
@@ -377,7 +377,7 @@ LLM worker specifics: `mlx_lm.load(model_id)`; `make_prompt_cache(model)` primed
 | PJSIP, rings, Python | ~0.2 GB |
 | **Total** | **~7.5 GB** |
 
-`doctor` reports actual per-process RSS after warm-up; the README states the number.
+A later check command will report the actual per-process RSS after warm-up (§7.3); the README states the number.
 
 Resident means resident. Three things keep an idle worker's weights in RAM on a host that is short of memory (the Telnyx spike ran on a 24 GB Mac with 15 GB in swap: the first transcript came 9–10 s after the caller stopped, the model workers had been compressed to under 50 MB resident, and the caller hung up):
 - every MLX worker opens a wired limit before loading (`mx.set_wired_limit` to the GPU's recommended working set, `models.wire_memory`, `AI_PHONE_WIRE_MEMORY=0` to disable) — a hint the kernel does not always honour under pressure, so not the whole answer;
@@ -401,20 +401,19 @@ Two resamples on the outbound path (24→16 in Python, 16→8 in PJSIP) and one 
 
 ## 7. Layer 4: Control plane
 
-### 7.1 CLI (as built through Milestone 3 unless a milestone is noted)
+### 7.1 CLI (as built through Milestone 4 unless a milestone is noted)
 
 | Command | Does |
 |---|---|
-| `ai-phone run [--lan]` | Start the daemon in the foreground. `--lan` overrides `accept_invites_from` to `lan` and skips registration if no trunk is configured (dev and the timed install test) |
+| `ai-phone run [--lan] [--tier t4\|t9]` | Start the daemon in the foreground. `--tier` defaults to `models.tier` (§5.5). `--lan` overrides `accept_invites_from` to `lan` and skips registration if no trunk is configured (dev and the timed install test) |
 | `ai-phone call <target> [--prompt TEXT \| --prompt-file PATH] [--relay] [--line ID] [--timeout-sec N] [--json] [--yes]` | Place a call through the running daemon. Phone agent mode (no `--relay`): ai-phone's model holds the conversation with the prompt, and the command blocks until the call ends and prints the result with the transcript. `--relay`: returns once the call is answered; the calling AI goes on with `listen`, `say` and `hangup` (§14b.1) |
 | `ai-phone listen [--call ID] [--timeout-sec N] [--json]` | Wait (default 60 s) for the next event of the relay call in progress (`heard`, `ended`) or, with no call in progress, for an incoming call (`incoming`) |
 | `ai-phone say [--call ID] [--json] TEXT…` | Speak on the relay call in progress; returns `said` or `interrupted` |
 | `ai-phone hangup [--call ID] [--say TEXT] [--json]` | End the call in progress (either mode), speaking TEXT first if given; prints the call's result |
 | `ai-phone status [--last-call]` | Registration state per line, the call in progress, the brain in use; `--last-call` summarises the last call's turns |
-| `ai-phone lines …` | Buy, add, divert, verify and remove lines (§14a.4) |
-| `ai-phone doctor [--fetch]` (M4) | §7.3 |
-| `ai-phone models pull <tier>` (M4) | Download and verify a tier (with `doctor --fetch` and `lines`, the only networked commands) |
-| `ai-phone install-service` (M4) | Write and load the macOS LaunchAgent (§10.4) |
+| `ai-phone lines …` | Buy or connect numbers; add, divert, verify and remove lines (§14a.4) |
+| `ai-phone setup [--plain]` | The setup wizard (§10.3): a brain, a line, a voice and what callers hear, then a check. Full-screen in a terminal; `--plain`, or no terminal, asks the same questions as numbered prompts |
+| `ai-phone models pull [--tier t4\|t9]` | Download the models this config needs (setup time; with `lines` and `setup`, the only networked commands) |
 | `ai-phone latency` (M5) | The TUI latency view |
 
 ### 7.2 Control socket **[D]**
@@ -435,9 +434,9 @@ The server checks every request before the daemon sees it and refuses a bad one 
 
 One call in progress in the daemon: a `call` while any call, inbound or outbound, is up is refused with `{"ok": false, "error": "busy", "code": 5}` (the telephony claim decides, not the server). `status`, `listen`, `say` and `hangup` run alongside a call, each on its own connection. A client that goes away never unwinds a call: its later sends become no-ops, and a relay call carries on after its `call` has returned. `listen` is the exception: the server watches its connection and cancels it the moment the client disconnects, which frees the relay-listener slot (§14b.7). On shutdown the server cancels every waiting handler.
 
-### 7.3 `doctor` checks **[D]**
+### 7.3 A later check command
 
-Config valid · weights present and hashes match (per tier) · spaCy `en_core_web_sm` importable (`spacy.util.is_package`) · `import ai_phone._pjsua2` works · null audio device set · GPU in use (MLX device / CUDA visible) · resident memory after warm-up vs tier expectation · warm-start latency of each worker · SIP registration state and last error · codec list offered (must be PCMU/PCMA only) · invite-acceptance mode with a warning for `any` · STUN configured (warning: outside the isolation criterion) · outbound connectivity check *disabled* (doctor itself must not phone home) · macOS: LaunchAgent loaded; Linux: `--network host` detected. Exit code non-zero on any hard failure.
+Not built; later work (§15, 2026-09-17). A later check command would report: config valid · weights present and matching a per-tier manifest · spaCy `en_core_web_sm` importable (`spacy.util.is_package`) · `import ai_phone.vendor.pjsua2` works · null audio device set · GPU in use (MLX device) · resident memory after warm-up vs tier expectation · warm-start latency of each worker · SIP registration state and last error · codec list offered (must be PCMU/PCMA only) · invite-acceptance mode with a warning for `any` · STUN configured (warning: outside the isolation criterion) · outbound connectivity check *disabled* (the check itself must not phone home). Exit code non-zero on any hard failure. Until then, the Check step of `ai-phone setup` (§10.3) covers the models, the config, the lines and the voice, and `ai-phone status` shows registration.
 
 ### 7.4 HTTP API (M5) **[D]**
 
@@ -516,7 +515,9 @@ Definitions **[D]**: `first_audible_ms = (t5 − t0)/1e6`. `t0` is the last VAD-
 
 The TUI (M5) tails this file. The gate check for M1 is a script over 20 turns: `scripts/latency_report.py turns.jsonl --last 20` printing p50/p95 per stage.
 
-## 10. Packaging and deployment
+## 10. Getting started
+
+Decided 2026-09-17 (§15): nothing is packaged, published or installed as a background service. People clone the repository, run `scripts/install.sh`, then `ai-phone setup`, and start ai-phone in the foreground with `uv run ai-phone run`. macOS on Apple Silicon only; the Linux backends (§5.4) are later work.
 
 ### 10.1 Repository layout **[P]**
 
@@ -525,37 +526,58 @@ ai-phone/
   architecture-essentials.md · architecture.md · README.md · LICENSE (AGPLv3)
   pyproject.toml                    # ai-phone; requires-python >=3.11,<3.14
   src/ai_phone/
-    cli.py  config.py  daemon.py
+    cli.py  config.py  daemon.py  models.py  voices.py
     telephony/   endpoint.py account.py call.py media_port.py policy.py rings.py
     pipeline/    turn.py vad.py bargein.py chunker.py audio_out.py timing.py
     services/    base.py ipc.py worker.py registry.py
       backends/  mlx_parakeet.py mlx_lm_backend.py mlx_kokoro.py sherpa_stt.py llamacpp_llm.py kokoro_onnx.py silero.py
-    control/     socket.py doctor.py api.py (M5) tui.py (M5) service.py
-    _pjsua2.so                      # built extension, vendored into the platform wheel
-  native/pjsua2/                    # pjsua2.i, symbols.i (from pjproject 2.17), build.sh, GPL notice and source offer
-  scripts/     latency_report.py  pjsua_peer.sh  pf/ai-phone.conf  utterances.txt
-  packaging/   Formula/ai-phone.rb  Dockerfile.cuda  launchd/com.ai-phone.daemon.plist.tmpl
+    control/     protocol.py server.py client.py api.py (M5) tui.py (M5)
+    setup/       ui.py flow.py actions.py plain.py tui.py look.py     # ai-phone setup (§10.3)
+    vendor/      pjsua2.py _pjsua2*.so           # built by scripts/install.sh; git-ignored
+  native/pjsua2/                    # pjsua2.i, symbols.i (from pjproject 2.17), build.sh, GPL notice; the extension's source
+  scripts/     install.sh  latency_report.py  pjsua_peer.sh  pf/ai-phone.conf  utterances.txt
   tests/       unit/ integration/ soak/
-  .github/workflows/  wheels.yml  docker.yml  tests.yml
+  .github/workflows/  build.yml  tests.yml
 ```
 
-### 10.2 macOS **[D]**
+### 10.2 The install script (`scripts/install.sh`)
 
-`uv tool install ai-phone` is the supported path (misaki 0.9.4's `Requires-Python <3.13` is ignored by uv and enforced by pip **[V]**). The Homebrew tap formula depends on core `pjproject` and `python@3.12` and builds the SWIG module from source because homebrew-core rejects prebuilt binaries **[V]**. `doctor --fetch` on first run downloads the tier and runs `python -m spacy download en_core_web_sm`.
+It gets a clone ready to run and is safe to run again. In order, it:
 
-### 10.3 Linux **[D]**
+1. checks for macOS on Apple Silicon, Homebrew and uv, and stops with a one-line error that says how to get what is missing;
+2. installs `swig`, `pkgconf` and `pjproject` with Homebrew, skipping any already installed (the pjproject formula also brings `pjsua`, the softphone for free test calls);
+3. runs `uv sync`;
+4. unless `ai_phone.vendor.pjsua2` already imports, builds the SIP library with `native/pjsua2/build.sh` for the project environment's Python (§3.7), copies it into `src/ai_phone/vendor/` and checks that it imports;
+5. prints the next command, `uv run ai-phone setup`.
 
-`docker run --network host -v ~/.ai-phone:/var/lib/ai-phone ghcr.io/<owner>/ai-phone:cuda`. The image pre-installs llama-cpp-python from the cu12x index, kokoro-onnx, sherpa-onnx, silero-vad, and the spaCy model; weights are fetched into the mounted volume by `doctor --fetch`. `-cpu` image and bare-metal `uv tool install` are post-launch.
+Each step is printed as it starts, and the first failure stops the script. It downloads no models and never touches `~/.ai-phone/`.
 
-### 10.4 Service management
+### 10.3 The setup wizard (`ai-phone setup [--plain]`)
 
-macOS: `ai-phone install-service` writes `~/Library/LaunchAgents/com.ai-phone.daemon.plist` (RunAtLoad, KeepAlive, stdout/stderr to `~/Library/Logs/ai-phone/`). Linux: the container's restart policy; a systemd unit is a post-launch nicety.
+A full-screen Textual app when stdin and stdout are a terminal; otherwise, or with `--plain`, the same questions as numbered prompts. The conversation is one function (`setup/flow.py`) that runs in its own thread and talks to the person only through a small UI protocol (`setup/ui.py`). Two front-ends implement it: `setup/tui.py` with `setup/look.py`, and `setup/plain.py`. Everything the conversation changes goes through `setup/actions.py`, which calls the existing config writer, secrets and provisioning code.
+
+Each step asks only what applies to the earlier answers:
+
+| Step | Asks | Saves |
+|---|---|---|
+| Welcome | Shows checks of this Mac: SIP library, memory and the recommended model size, models, config. With a config already there: add a line, change the brain, change the voice, change what callers hear, or run every step | — |
+| Brain | On this Mac (Qwen 4B or 9B; 9B is recommended from 32 GB of memory), or your own OpenAI-compatible endpoint: URL, model and an optional key, then one short test request | `brain:`, `models.tier`; the key in `secrets.env` |
+| Line | A phone number, a free SIP address, your own SIP trunk, or skip. For a phone number: Twilio or Telnyx; the key is checked with a free read-only request that lists the account's numbers; then a new number, bought only after a confirmation that shows the number and its monthly price, or one already on the account, connected for free (§14a.3); then, if wanted, the codes to divert your own mobile to it | the line; carrier keys and SIP passwords in `secrets.env`; the carrier journal in `lines/` |
+| Voice | An English voice from the speech model, grouped American/British and female/male; each can be played on this Mac's speakers first. Then the speed | `tts:` |
+| Callers | The greeting, the instructions for when no AI is listening, and the daily limit on outbound calls (20 unless the config has one) | `inbound:`, `calls.daily_limit` |
+| Check | Offers to download missing models, with the size (§10.4). Then checks that the config loads, each line (the running daemon's status, or a background start with stand-in models for up to 20 s that reports registration, then stops) and the voice (plays the outbound disclosure) | — |
+| Done | A summary: what was saved and where, how to start ai-phone, a free test call, and what to tell your AI. For a SIP address the test call is `pjsua --local-port 5070 sip:<user>@127.0.0.1`, since the daemon cannot call itself | — |
+
+Everything is saved under `~/.ai-phone/` (or `AI_PHONE_HOME`): `config.yaml` (0600) and `secrets.env` (0600, written only with `write_secret`). A step's answers are kept in memory and written when the step completes, so cancelling never leaves half a step behind. The exception is a number: once it is bought or connected, its line is written at once, because the number is set up at the carrier. Running setup again reads what is there and changes only what is picked. Keys and passwords are typed into hidden fields and never shown, logged or put in an error. Setup never places a phone call; the voice sample plays locally.
+
+### 10.4 Models (`ai-phone models pull [--tier t4|t9]`)
+
+Downloads what the config needs and is not on this Mac yet (§5.5), for the tier given, else the config's, else the one memory suggests. It lists the models and the download size, shows progress in a terminal, and exits 0 when done (or when nothing is missing) and 3 on an error such as too little disk space. Setup's Check step uses the same function. With `lines` and `setup`, it is the only networked command; the daemon never downloads.
 
 ### 10.5 CI **[D]**
 
-- `wheels.yml`: macOS arm64 runner builds the SWIG module per ABI (cp311–cp313) against the brew bottle, `delocate`s; manylinux x86_64 builds pjproject 2.17 from source with `-fPIC`, SWIG per ABI, `auditwheel`. Publishes wheels + the extension sdist to PyPI on tags.
-- `docker.yml`: builds and pushes the `cuda` image to GHCR on tags.
-- `tests.yml`: unit tests on every push; integration tests using brew's/the container's `pjsua` as the SIP peer.
+- `build.yml`: a macOS arm64 runner builds the SWIG module per ABI (cp311–cp313) against the brew bottle, as `scripts/install.sh` does. Nothing is published. Linux, later: build pjproject 2.17 from source with `-fPIC` (§3.7), then the SWIG module per ABI.
+- `tests.yml`: unit tests on every push; integration tests using brew's `pjsua` as the SIP peer.
 
 ## 11. Testing strategy **[D]**
 
@@ -570,10 +592,10 @@ macOS: `ai-phone install-service` writes `~/Library/LaunchAgents/com.ai-phone.da
 ## 12. Security model **[D]**
 
 - Threat: SIP scanners on the public internet. Defaults: `registered_trunk` acceptance (unsolicited INVITEs get 403), per-IP lockout, TLS+SRTP accepted when offered, RTP port range narrow and documented.
-- Secrets: config file mode 0600; `password_env` supported; never logged.
+- Secrets: config file mode 0600; SIP passwords, the brain key and the carrier keys saved by `ai-phone setup` live in `secrets.env` (0600), named by `password_env`/`api_key_env`; never logged or shown.
 - API: loopback by default; bearer token required otherwise.
 - Control socket: mode 0600, so any process of the same user can place calls and read transcripts, and nobody else can. The daemon itself refuses emergency numbers and enforces `calls.daily_limit` for every client (§14b.8).
-- Isolation: no outbound connections except SIP/RTP to the peer (and STUN if the user configures it, flagged by `doctor`). No telemetry, no update checks. Verified by the shipped pf ruleset during the launch demo.
+- Isolation: no outbound connections except SIP/RTP to the peer (and STUN if the user configures it, which a later check command will flag, §7.3). No telemetry, no update checks. Verified by the shipped pf ruleset during the launch demo.
 - Supply chain: pinned versions; the vendored PJSIP build script records the exact pjproject tarball SHA.
 
 ## 13. Failure modes and recovery
@@ -581,10 +603,10 @@ macOS: `ai-phone install-service` writes `~/Library/LaunchAgents/com.ai-phone.da
 | Failure | Detection | Recovery |
 |---|---|---|
 | Worker crash | pipe EOF / process exit | restart (≤ 3 per 10 min); mid-call: cached apology, continue |
-| Model missing or corrupt | manifest check at start | refuse to start; `doctor` explains |
+| Model missing or corrupt | its worker cannot load it at start (the daemon runs offline) | refuse to start; `ai-phone models pull` fetches what is missing |
 | Trunk drop / registrar unreachable | `onRegState` error | backoff §3.3.1; calls impossible until re-registered; status shows DEGRADED |
 | RTP stops mid-call | watchdog on `last_rx_ns` | BYE after 10 s |
-| TTS slower than real time | `tx_underruns` > 0 | silence fill; `doctor` recommends lighter tier |
+| TTS slower than real time | `tx_underruns` > 0 | silence fill; switch to the lighter tier (a later check command will recommend it) |
 | LLM over budget | `llm_first_clause_ms` p50 > 250 | switch tier to t4 (config), re-measure |
 | Memory pressure | worker RSS check at warm-up | refuse tier, suggest t4 |
 | Model paged out while the line is idle (busy host; seen on the Telnyx spike: 10 s to the first transcript, caller hangs up) | warm-up wires each worker's model memory (`models.wire_memory`, macOS 15+, `warm` reports `wired_limit_bytes`) | wiring reduces paging — it is a hint the kernel need not honour under pressure (§5.6), so it is not the whole answer; `conversation.reply_timeout_sec` (12 s) is the backstop that turns any stalled stage into the brain-error path: apology, listen again, goodbye on the second in a row |
@@ -607,13 +629,13 @@ macOS: `ai-phone install-service` writes `~/Library/LaunchAgents/com.ai-phone.da
 
 ## 14a. Lines (Milestone 2, as built 2026-09-03)
 
-The daemon is carrier-free: it registers one pjsua2 `Account` per configured line over shared UDP/TCP(/TLS) transports and routes calls and caller IDs by line. Provisioning is a CLI concern (`ai-phone lines …`) behind a `Provider` protocol with a resumable journal; the daemon never imports `ai_phone.providers` (a test pins this). Outbound calls run through a minimal control socket (extended in Milestone 3, §7.2). The language-model worker has a second backend that streams from any OpenAI-compatible endpoint and reports recoverable `brain_error` events instead of dying. Configuration applies at daemon restart; live reload and IP-change handling are Milestone 5.
+The daemon is carrier-free: it registers one pjsua2 `Account` per configured line over shared UDP/TCP(/TLS) transports and routes calls and caller IDs by line. Provisioning is a CLI concern (`ai-phone lines …`) behind a `Provider` protocol with a resumable journal; the daemon never imports `ai_phone.providers` (a test pins this). Outbound calls run through a minimal control socket (extended in Milestone 3, §7.2). The language-model worker has a second backend that streams from any OpenAI-compatible endpoint and reports recoverable `brain_error` events instead of dying. Configuration applies at daemon restart; live reload and IP-change handling are later work.
 
 **Amended invariants.** During a call, ai-phone opens no network connection except SIP/RTP to the peer and HTTP(S), with its DNS lookup, to the one configured brain endpoint (the default brain is the local model and uses no socket). STUN and `trusted_peers` DNS resolution happen at daemon start only. One daemon, one or more lines, one call at a time across all of them; every telephony event carries `line_id`. Registration retry is PJSIP's own scheme (nominally 5 s, then every 30 s, each randomised by up to 10 s); the gate "re-registered within 60 s" is for induced transport loss with the carrier reachable. Latency is daemon-side (t0 → t5), on the PSTN leg as on the LAN.
 
 **Grammar** (validated with `fullmatch` in `config.py`, re-checked by `LineSpec.from_config` for anything that ends up in a SIP header): line id `^[a-z0-9-]{1,32}$`; trunk SIP user `^[A-Za-z0-9]{4,32}$` (the carriers' credential rule), sip-line user `^[A-Za-z0-9._-]{1,64}$`; E.164 `^\+[1-9][0-9]{6,14}$`; env var `^[A-Z_][A-Z0-9_]*$`; host `host[:port]`; registrar/proxy `sip:host[:port][;transport=udp|tcp|tls]` (never `sips:`); AOR `sip:user@host[:port]`; display name printable ASCII 1–64 without `"` or `\`. Name-addr strings are built only from validated parts, never escaped.
 
-**Secrets.** Carrier keys come from environment variables named on the command line and are never persisted. Generated SIP passwords live in `~/.ai-phone/secrets.env` (dir 0700, file 0600, atomic, opened component-by-component with `O_NOFOLLOW`) as `AI_PHONE_LINE_<ID>_PASSWORD`. The daemon reads that file itself and moves any exported secret variables out of its environment before spawning workers; each password reaches only its own account, and workers get no secrets except the brain API key, passed as a spawn argument. Provider errors redact keys, SIDs and tokens; HTTP bodies are never logged.
+**Secrets.** Carrier keys come from variables named on the command line, looked up in the environment and then in `secrets.env`; `lines` never writes them, `ai-phone setup` saves the ones typed into it there (Milestone 4), and the daemon never uses them. Generated SIP passwords live in `~/.ai-phone/secrets.env` (dir 0700, file 0600, atomic, opened component-by-component with `O_NOFOLLOW`) as `AI_PHONE_LINE_<ID>_PASSWORD`. The daemon reads that file itself and moves any exported secret variables out of its environment before spawning workers; each password reaches only its own account, and workers get no secrets except the brain API key, passed as a spawn argument. Provider errors redact keys, SIDs and tokens; HTTP bodies are never logged.
 
 **Paths.** Everything under `~/.ai-phone` comes from `ai_phone.paths` (`AI_PHONE_HOME` relocates it). The control socket falls back to a short deterministic `/tmp` path when the home is too deep for `AF_UNIX`.
 
@@ -689,17 +711,21 @@ brain:
   stream_idle_timeout_ms: 4000
   max_response_chars: 2000
 
+tts:                                                # Milestone 4 (2026-09-17)
+  voice: af_heart                                   # an English Kokoro voice from the speech model: af_/am_ American, bf_/bm_ British
+  speed: 1.0                                        # 0.5 to 2.0
+
 conversation: {endpoint_silence_ms, bargein_*, timers …unchanged…}
 ```
 
-Validation (extending `config.py`): grammar first: `user` `[A-Za-z0-9]{4,32}`; `display_name` printable ASCII without `"`, `\\`, CR or LF (name-addr strings are built only from validated parts, never escaped); registrar and proxy `sip:host[:port][;transport=x]` with host a DNS name or IP; `dial_domain` `host[:port]`; `aor` `sip:user@host[:port]`; environment-variable names `[A-Z_][A-Z0-9_]*`; E.164 `\\+[1-9][0-9]{6,14}`. Then: line ids unique; trunk `user` unique; `number` and `caller_id` E.164 (or a `sip:` URI on sip lines); `registrar`/`outbound_proxy` are `sip:` URIs and `dial_domain` a hostname; `srtp != off` requires `transport: tls`; `trusted` requires non-empty `trusted_peers`; `registered_trunk` requires non-empty `trusted_cidrs` or a resolvable registrar (a warning if only the registrar); `tls` transport on a sip line requires `sip.tls.cert_file` and `key_file`; `tcp_port != tls_port`; `password_env` must be set in the environment at start, otherwise that line is skipped with an error and the others start; `brain.base_url` non-loopback must be `https`. The M1 `sip:` block (`user`, `domain`, `password_env`, `bind`, `public_addr`, `trusted_peers`, `accept_invites_from`) is read for one release and mapped to `sip.bind`/`sip.public_addr` plus `lines.main`, with a deprecation warning.
+Validation (extending `config.py`): grammar first: `user` `[A-Za-z0-9]{4,32}`; `display_name` printable ASCII without `"`, `\\`, CR or LF (name-addr strings are built only from validated parts, never escaped); registrar and proxy `sip:host[:port][;transport=x]` with host a DNS name or IP; `dial_domain` `host[:port]`; `aor` `sip:user@host[:port]`; environment-variable names `[A-Z_][A-Z0-9_]*`; E.164 `\\+[1-9][0-9]{6,14}`. Then: line ids unique; trunk `user` unique; `number` and `caller_id` E.164 (or a `sip:` URI on sip lines); `registrar`/`outbound_proxy` are `sip:` URIs and `dial_domain` a hostname; `srtp != off` requires `transport: tls`; `trusted` requires non-empty `trusted_peers`; `registered_trunk` requires non-empty `trusted_cidrs` or a resolvable registrar (a warning if only the registrar); `tls` transport on a sip line requires `sip.tls.cert_file` and `key_file`; `tcp_port != tls_port`; `password_env` must be set in the environment at start, otherwise that line is skipped with an error and the others start; `brain.base_url` non-loopback must be `https`; `tts.voice` must be an English voice name (`[ab][fm]_[a-z]+`) and, unless it is the default `af_heart`, one of the voices installed with the speech model (only a warning while the model is not downloaded); `tts.speed` is 0.5 to 2.0. The M1 `sip:` block (`user`, `domain`, `password_env`, `bind`, `public_addr`, `trusted_peers`, `accept_invites_from`) is read for one release and mapped to `sip.bind`/`sip.public_addr` plus `lines.main`, with a deprecation warning.
 
 ### 14a.2 Line lifecycle in the daemon (as built: registration state, state file, control socket)
 
 - Transports are created once at start from `sip.bind`: UDP, TCP, and TLS only if a line uses it. Each line is an `Account` bound with `transportId` to its transport. `idUri` = `"<display_name>" <sip:<user>@<registrar host>>` for trunks, `<sip:<user>@<aor host>>` for sip lines. `AuthCredInfo("digest", "*", user, 0, password)` for trunks. `proxies` = `[outbound_proxy]` when set.
 - Per-line registration state: `unregistered → registering → registered → degraded (last REGISTER failed; PJSIP retry scheduled) → registered`. `RegState` events carry `line_id`, code, reason.
 - Registration loss during an established call: `dropCallsOnFail=false`, so the call continues; the line is `degraded`; `make_call` on a trunk line whose account is not registered raises `DialError` ("line … is not registered (degraded)") before dialling; inbound on that line is unavailable until re-registered. The RTP 10 s watchdog is unchanged and is the only thing that ends a call for network reasons. Tested separately from total network loss.
-- IP change (Wi-Fi to Ethernet, router reboot): not handled automatically in M2. `ai-phone status` shows the line `degraded` with the last error; the fix is a restart. (`Endpoint.handleIpChange` with `AccountIpChangeConfig` is the M5 follow-up, when there is a control plane to drive it while idle.)
+- IP change (Wi-Fi to Ethernet, router reboot): not handled automatically in M2. `ai-phone status` shows the line `degraded` with the last error; the fix is a restart. (`Endpoint.handleIpChange` with `AccountIpChangeConfig` is later work; something has to drive it while the line is idle.)
 - Acceptance policy per line: `registered_trunk` = the line's `trusted_cidrs` plus the registrar's addresses resolved at start; `trusted` = the line's `trusted_peers`; `lan`, `any` as before. INVITE on a line whose policy rejects the source → 403, logged with `line_id`. INVITE while any call is active, on any line → 486.
 - State file: the daemon writes `~/.ai-phone/state.json` (atomic, 0600) on every registration state change and call start/end: per line `{state, registrar, expires_at, last_error, since}`, plus `{active_call: {line_id, remote, started_at} | null, brain: {kind, base_url}}`. `ai-phone status` reads it and only probes the control socket for liveness (connect and close; connection refused or a missing socket → "daemon not running"); it never holds the socket, so it works during an outbound call.
 - Control socket: `~/.ai-phone/control.sock` (0600), newline-delimited JSON, one request per connection. Milestone 2 built `status`, `call` and `hangup`; Milestone 3 added `listen` and `say`, the `prompt` and `relay` fields of `call`, `call_id` and `say` on `hangup`, call records in the replies and a check of every request. The commands, their replies and the concurrency rules are in §7.2: one call in progress in the daemon, the other commands alongside it on their own connections. `ai-phone status` reads `state.json` and only probes the socket for liveness. If the client of a `call` disconnects, the call continues; the CLI's Ctrl-C handler sends `hangup` and waits up to about 7 s for the `ended` reply (a 2 s `hangup` request, then a 5 s cut-off); if the socket closes unexpectedly the CLI exits 9 ("daemon went away"). A client that goes away never unwinds the call handler: its later sends become no-ops.
@@ -713,6 +739,8 @@ class Provider(Protocol):
     signalling_cidrs: list[str]                       # published carrier ranges; written into the line's trusted_cidrs
     def search_numbers(self, country: str, area: str | None, limit: int) -> list[Number]: ...   # Number: e164, monthly_cost, currency, requires_regulatory: bool, source_id
     def provision(self, journal: Journal, number: Number, line_id: str, sip_user: str, sip_password: str) -> ProvisionResult: ...
+    def owned_numbers(self) -> list[Number]: ...                      # the numbers already on the account; read-only, and the free key check
+    def attach(self, journal: Journal, number: Number, line_id: str, sip_user: str, sip_password: str) -> ProvisionResult: ...  # provision without buying
     def poll(self, journal: Journal) -> ProvisionResult: ...          # advance a pending order
     def release(self, journal: Journal) -> ReleaseResult: ...         # undo every journaled resource, in reverse
     def start_caller_id_verification(self, e164: str) -> VerificationStep: ...  # kind: enter_code_in_cli | enter_code_on_phone; instructions; handle
@@ -721,16 +749,20 @@ class Provider(Protocol):
 
 - **Journal** (`~/.ai-phone/lines/<line-id>.journal.json`, dir 0700, file 0600, symlinks refused): each step is written as `started` *before* its request (including every name the request will use, such as Twilio's full SIP domain name, so reconciliation looks for exactly that name) and `done` with the resource id *after*, then flushed. Two further steps close a provisioning: `carrier_ready` (all carrier resources exist and the number is delivered) and `local_committed` (config and `secrets.env` written); `resume` finishes `local_committed` if the CLI died between the two. Each config edit (`add_line`/`update_line`/`remove_line`) runs under an exclusive `flock` on `~/.ai-phone/lines/.lock` (opened `O_NOFOLLOW`, 0600); `secrets.env` writes are atomic inside a descriptor-walked directory (`O_NOFOLLOW` at every component); journal writes are atomic too (temp file + rename) with path-based symlink checks on the directory and the file. Two `lines` commands on the same line at once are not supported and are not detected beyond that. On resume, a step that is `started` but not `done` is reconciled by **searching the carrier by the stable name** before creating anything (`ai-phone:<line-id>` as connection name, credential list name, SIP domain name; the number by E.164), so a crash between the API response and the journal write never duplicates. Idempotency keys are not relied on. `release` deletes in reverse and marks `rollback_failed` with the leftover ids if a delete fails, so the user can finish in the portal. The journal is what makes a release safe, so `lines remove` will not run one without it: a missing journal, or one that no longer accounts for an id the config recorded, refuses before the first carrier call (`--local-only` is the way out, and `_commit` copies the carrier ids into the config's `provider.resources` precisely so they outlive losing the journal).
 - **Provisioning states** (carrier side only): `pending` (order not delivered, or regulatory documents required: the CLI prints the requirement and the portal link; `lines resume` continues) → `ready` (all resources exist and the number is delivered) → or `failed` (the carrier rejected or cancelled the order: the CLI says so, keeps the journal, and `lines remove` releases what was created) → or `rollback_failed`. Registration is runtime state, shown by `ai-phone status`, never stored in the provider block.
-- **Secrets**: carrier keys are read from the environment variables named on the command line and never persisted; `lines remove`, `lines resume` and `verify-caller-id` need the same variables. SIP passwords generated by `provision` (24 random characters guaranteed to contain a digit, an upper-case and a lower-case letter, which satisfies Twilio's rule of 12+ characters with a digit and mixed case; usernames are `ai<id-without-hyphens><4 hex>`, alphanumeric, 4–32) are written to `~/.ai-phone/secrets.env` (dir 0700, file 0600, atomic, symlinks refused) as `AI_PHONE_LINE_<ID>_PASSWORD=…`; the daemon reads that file itself at start and hands each line's password to its account only; child worker processes receive no secrets except the brain API key, which the LLM worker gets as a spawn argument, not via the environment. Logs and exceptions redact keys, passwords and `Authorization` headers; HTTP bodies are never logged. Provider HTTP: HTTPS with certificate verification, 20 s timeouts, no automatic retries of creating calls (reconciliation handles re-runs).
+- **Secrets**: carrier keys are read from the variables named on the command line, in the environment or else in `secrets.env` (where `ai-phone setup` saves them; `lines` never writes them); `lines remove`, `lines resume` and `verify-caller-id` need the same variables. SIP passwords generated by `provision` (24 random characters guaranteed to contain a digit, an upper-case and a lower-case letter, which satisfies Twilio's rule of 12+ characters with a digit and mixed case; usernames are `ai<id-without-hyphens><4 hex>`, alphanumeric, 4–32) are written to `~/.ai-phone/secrets.env` (dir 0700, file 0600, atomic, symlinks refused) as `AI_PHONE_LINE_<ID>_PASSWORD=…`; the daemon reads that file itself at start and hands each line's password to its account only; child worker processes receive no secrets except the brain API key, which the LLM worker gets as a spawn argument, not via the environment. Logs and exceptions redact keys, passwords and `Authorization` headers; HTTP bodies are never logged. Provider HTTP: HTTPS with certificate verification, 20 s timeouts, no automatic retries of creating calls (reconciliation handles re-runs).
 - **Telnyx**: `search_numbers` → available numbers with `cost_information`; `--number` performs an exact `available_phone_numbers` search for that number immediately before ordering, because Telnyx only orders numbers returned by a recent search. `provision`: outbound voice profile (`ai-phone:<line-id>`) → credential connection (name `ai-phone:<line-id>`, registration allowed, NAT contact encoding on, profile attached, `user_name`, `password`) → number order with `connection_id` → poll until `success` (or `pending` with requirements). Caller ID: Verified Numbers (`enter_code_in_cli`). `signalling_cidrs`: Telnyx's published SIP signalling ranges (pinned in the module from the carrier's published page, dated; spike 0a, still pending, re-verifies them live).
 - **Twilio**: `--key-env` = Account SID, `--secret-env` = Auth Token. `search_numbers` → AvailablePhoneNumbers plus the Pricing API for the monthly price. `provision`: credential list (`ai-phone:<line-id>`) with the SIP user → SIP Domain `ai-phone-<line-id>-<6 hex>.sip.twilio.com` (a name collision reported by Twilio gets one fresh suffix, journaled before the retry) with SIP registration enabled and the credential list mapped for registration → IncomingPhoneNumber purchase with `VoiceUrl` = twimlets echo carrying `<Response><Dial><Sip>sip:<user>@<domain></Sip></Dial></Response>` (Serverless Function if spike 0b shows twimlets cannot be relied on) → Elastic SIP trunk (`ai-phone:<line-id>`) with the same credential list on termination; the line gets `outbound_proxy: "sip:<trunk>.pstn.twilio.com"`, `dial_domain: "<trunk>.pstn.twilio.com"` and `register_via_proxy: false`, so PSTN INVITEs have Request-URI `sip:+E164@<trunk>.pstn.twilio.com` and go through that proxy while REGISTER goes straight to the SIP Domain (`AccountRegConfig.proxyUse = 0`); spike 0b, still pending, will prove both on one account. Caller ID: Outgoing Caller IDs (`enter_code_on_phone`: the CLI shows the 6-digit code, Twilio calls the number, the user keys it in, the CLI polls up to 2 min). `signalling_cidrs`: Twilio's published signalling ranges for the region. Inbound via trunk origination (public address) is documented, not automated.
+- **Numbers you bring** (Milestone 4, 2026-09-17): `attach` sets up everything `provision` does except the purchase. It journals a `claim` step first: a read-only lookup, before anything is created, that records the carrier's number id, `number_brought: true` and where the number was routed before (Twilio: `previous_voice_url` and `previous_voice_method`; Telnyx: `previous_connection_id`). Twilio refuses there a number that a SIP trunk or a TwiML app already routes. Then come the same SIP steps as `provision`, then a `route` step that points the number at them (Twilio: the number's voice URL, the same twimlets URL a bought number gets; Telnyx: the number's `connection_id`). The `target` step records `brought`, so `lines resume` calls `attach` again, not `provision`. **`release` never deletes a brought number**: it puts the previous routing back (on Telnyx the previous connection, or none), then deletes what ai-phone created. If the routing cannot be put back, the number stays on the account and is listed as left for the user to fix in the portal.
 - **Registry**: `PROVIDERS = {"telnyx": TelnyxProvider, "twilio": TwilioProvider}`; `lines add <provider>` looks it up. Providers are httpx clients without vendor SDKs.
 
 ### 14a.4 CLI surface
 
 ```
-ai-phone lines add <telnyx|twilio> --key-env NAME [--secret-env NAME] [--id main] [--country GB] [--area 020] [--number +44…] [--yes]
+ai-phone lines add <telnyx|twilio> --key-env NAME [--secret-env NAME] [--id main] [--country GB] [--area 020] [--number +44…] [--existing +44…] [--yes]
       # --id defaults to the provider name, or <provider>-2, -3 … if taken
+      # --key-env/--secret-env name variables looked up in the environment, then in ~/.ai-phone/secrets.env
+      # --existing: a number already on the account (not with --number or --area); nothing is bought: after a confirmation it is
+      #   connected with attach (§14a.3); `lines remove` later disconnects it and keeps it
       # search → up to 10 numbers with monthly price and any regulatory requirement → pick (or --number; --yes takes the first)
       # → provision with a journal → if the order is still pending, the line is written as pending and the command returns 2 at once (`lines resume` polls) → otherwise:
       #   daemon running: "Restart ai-phone to bring +44 20 7946 0000 live."   daemon not running: "Run `ai-phone run`; +44 20 7946 0000 will register."
@@ -738,6 +770,7 @@ ai-phone lines add <telnyx|twilio> --key-env NAME [--secret-env NAME] [--id main
 ai-phone lines resume <id> --key-env NAME [--secret-env NAME]        # journal found by line id under ~/.ai-phone/lines/
 ai-phone lines remove <id> [--key-env NAME] [--secret-env NAME] [--local-only] [--yes]
       # with keys: releases every journaled carrier resource ("Release +44 20 7946 0000 from your Telnyx account? This cannot be undone [y/N]"), then removes the line and its password
+      #   a brought number: "Disconnect +44 20 7946 0000 from ai-phone and delete what ai-phone created on your Telnyx account? The number stays on your account."
       # without keys: refuses unless --local-only, which removes the line locally and prints the resources left in the carrier account
       #   (from the journal, or from the ids the config recorded when the journal is gone)
       # journal missing, or missing an id the config recorded: refuses before any carrier call, names the stranded ids and points at --local-only; exit 3
@@ -990,6 +1023,7 @@ Each came out of planning or a review:
 | 2026-09-03 | Dev-machine finding: the 9B tier (≈8.5 GB with fp16 parakeet) swaps beside a normal app load on 24 GB; minimum-hardware tiers stand (16 GB → t4) | [D] |
 | 2026-09-16 | **Personas replaced by per-call prompts; relay mode added** (Milestone 3, the agent tool, §14b). Any AI with a shell drives ai-phone: phone agent mode (`ai-phone call --prompt`, ai-phone's model holds the conversation, the transcript is returned) or relay mode (`call --relay`, `listen`, `say`, `hangup`; the calling AI holds the conversation). The `personas:` section, each line's `persona` key and `outbound_opening` are removed: an outbound call carries its own prompt and opens with the fixed disclosure "Hi, this is an AI assistant calling.", and incoming calls use one `inbound:` section. A config with `personas:` still loads: the first line's persona (or `default`) supplies `inbound.greeting` and `inbound.instructions` (from its `system_prompt`), the other personas and `outbound_opening` are dropped, line `persona` keys are ignored, and one warning says so. `lines add` no longer writes `persona`; `call --persona` and a control-socket `persona` field are refused with exit 2. Emergency numbers are refused in the daemon; `calls.daily_limit` is counted in `calls-today.json` | [D] |
 | 2026-09-16 | **Roadmap renumbered:** M3 agent tool, M4 packaging, M5 local dashboard (calls, transcripts, line status, logs; reachable only from the machine) and HTTP API, M6 launch, then post-launch work with no milestone number. Rows above this one use the old numbers (M3 packaging, M4 control plane, M5 launch, M6 post-launch). Not in M3: an MCP server (a thin wrapper, later), SMS, keypad tones, more than one call | [D] |
+| 2026-09-17 | **M4 is "get started", not packaging.** No Homebrew tap, Docker image, LaunchAgent or PyPI release: people clone the repo, run scripts/install.sh, then ai-phone setup (full-screen wizard, plain prompts without a terminal). Carriers can connect a number the person already has; ai-phone never releases a number it did not buy. The voice is configurable (tts:). Models download into the Hugging Face cache with ai-phone models pull. Doctor, install-service, live reload and IP-change handling move to later work | [D] |
 
 ## 16. Verified facts (2026-09-02; Milestone 2 rows added 2026-09-03)
 

@@ -4,11 +4,11 @@ Read this first. If it does not answer your question, the table at the bottom sa
 
 ## What it is
 
-One daemon, one or more lines, one phone call at a time across them. It registers to SIP trunks or PBXs (or answers at a plain SIP address), answers and places calls, and runs speech-to-text → language model → text-to-speech on the host by default. During a call, no network connections other than SIP signalling and RTP media to the peer, plus HTTP(S) to the one brain endpoint you configured if you chose a remote brain. Numbers come from lines (see below): a carrier key is used once, by the `lines` command, never by the daemon.
+One daemon, one or more lines, one phone call at a time across them. It registers to SIP trunks or PBXs (or answers at a plain SIP address), answers and places calls, and runs speech-to-text → language model → text-to-speech on the host by default. During a call, no network connections other than SIP signalling and RTP media to the peer, plus HTTP(S) to the one brain endpoint you configured if you chose a remote brain. Numbers come from lines (see below): a carrier key is used once, by `ai-phone lines` or `ai-phone setup`, never by the daemon.
 
 ## The six invariants (never break these)
 
-1. **During a call, no network except SIP/RTP to the peer, and HTTP(S) to the one brain endpoint you configured.** The default brain is the local model and uses no socket; a brain that is not on this machine must be `https` and the daemon says, at start and in `doctor`, that transcripts, the system prompt and the history go there. No model downloads at runtime (`HF_HUB_OFFLINE=1`), no telemetry, no update checks. STUN and trusted-peer DNS happen at start only. Buying a number uses a carrier API from `ai-phone lines …`, never from the daemon, which does not even import the carrier code (see `architecture.md` §14a).
+1. **During a call, no network except SIP/RTP to the peer, and HTTP(S) to the one brain endpoint you configured.** The default brain is the local model and uses no socket; a brain that is not on this machine must be `https` and the daemon says at start that transcripts, the system prompt and the history go there. No model downloads at runtime (`HF_HUB_OFFLINE=1`), no telemetry, no update checks. STUN and trusted-peer DNS happen at start only. Buying or connecting a number uses a carrier API from `ai-phone lines …` or `ai-phone setup`, never from the daemon, which does not even import the carrier code (see `architecture.md` §14a).
 2. **The PJSIP thread never blocks and never touches models.** Media callbacks only copy 640-byte frames into ring buffers. Model work lives in three child processes.
 3. **Everything internal is 16 kHz int16, 20 ms frames (320 samples).** The wire is 8 kHz G.711 (PCMU/PCMA only; all other codecs disabled). PJSIP resamples 8↔16; we resample TTS 24→16.
 4. **Every generation has a `gen_id`.** Cancel means: all workers drop that id, the outbound ring is flushed, late results with a stale id are discarded, the partial reply stays in history marked `[interrupted]`.
@@ -23,7 +23,7 @@ One daemon, one or more lines, one phone call at a time across them. It register
                           │        │ rx_ring / tx_ring (shared memory, 2 s)          │
                           │ L2 Pipeline: asyncio TurnController, VAD, endpointing,   │  main thread
                           │        barge-in, clause chunker, resampler, timers       │
-                          │ L4 Control: CLI over Unix socket, config, doctor,        │
+                          │ L4 Control: CLI over Unix socket, config,                │
                           │        HTTP API (M5), TUI (M5)                           │
                           └───────┬────────────┬────────────┬────────────────────────┘
                      JSON pipe + shm ▼          ▼            ▼
@@ -40,14 +40,14 @@ caller audio → `rx_ring` → VAD (Silero, 32 ms chunks) → **speech_end after
 
 | Layer | Choice | Not this |
 |---|---|---|
-| SIP/RTP | PJSIP 2.17 via pjsua2, extension vendored in our wheel, null audio device, media port at 16 kHz | pyVoIP, Asterisk, LiveKit |
+| SIP/RTP | PJSIP 2.17 via pjsua2, extension built on your Mac by `scripts/install.sh`, null audio device, media port at 16 kHz | pyVoIP, Asterisk, LiveKit |
 | Pipeline | hand-rolled asyncio | Pipecat (only if it ever deletes more code than it adds) |
 | STT (Mac) | mlx-audio parakeet `mlx-community/parakeet-tdt-0.6b-v2` | parakeet-mlx (fallback only) |
-| LLM (Mac) | mlx-lm, `mlx-community/Qwen3.5-9B-MLX-4bit` (24 GB+) or `-4B-` (16 GB), `enable_thinking=False`, in the daemon's worker process | Ollama or any model server |
-| TTS (Mac) | mlx-audio Kokoro `mlx-community/Kokoro-82M-bf16`, voice `af_heart`, 24 kHz | — |
+| LLM (Mac) | mlx-lm, `mlx-community/Qwen3.5-9B-MLX-4bit` (32 GB+) or `-4B-` (16 GB; the default below 32 GB), `enable_thinking=False`, in the daemon's worker process | Ollama or any model server |
+| TTS (Mac) | mlx-audio Kokoro `mlx-community/Kokoro-82M-bf16`, English voice from `tts.voice` (default `af_heart`), 24 kHz | — |
 | VAD | Silero, 16 kHz, in the main process | — |
 | Linux | sherpa-onnx or faster-whisper · llama-cpp-python CUDA (wheel index, not PyPI) · kokoro-onnx · silero-vad | — |
-| Install | `uv tool install ai-phone` on Mac (uv, not pip); `docker run --network host …:cuda` on Linux | pip, bridge networking |
+| Install | clone the repo, ./scripts/install.sh, uv run ai-phone setup | Homebrew tap, Docker, PyPI (dropped 2026-09-17) |
 | License | AGPLv3 (PJSIP is GPLv2-or-later; §13 permits) | MIT/Apache |
 
 ## Call rules
@@ -63,26 +63,32 @@ src/ai_phone/  telephony/ (endpoint, call, media_port, policy, events, state, ri
                lines/     (journal, config_writer, forward, credentials)     — provisioning bookkeeping (CLI only)
                providers/ (base, telnyx, twilio, fake)                       — carrier REST (CLI only; the daemon never imports it)
                control/   (protocol, server, client)                        — the unix control socket
+               setup/     (ui, flow, actions, plain, tui, look)              — `ai-phone setup` (CLI only)
                calls.py (call records), call_guard.py (emergency block, daily limit)
-               cli.py, cli_lines.py, cli_status.py, cli_call.py (call, listen, say, hangup), daemon.py, config.py, secrets.py, paths.py
-native/pjsua2/ SWIG interface + build script (GPL source offer)
-scripts/       latency_report.py, pjsua_peer.sh, pf/ ruleset, utterances.txt
-packaging/     Homebrew formula, Dockerfile.cuda, launchd plist
-config:        ~/.ai-phone/config.yaml (0600) · models: ~/.ai-phone/models · logs: ~/Library/Logs/ai-phone
+               models.py (model ids, download), voices.py (the English Kokoro voices), vendor/ (the built SIP library, git-ignored)
+               cli.py, cli_lines.py, cli_status.py, cli_call.py (call, listen, say, hangup), cli_models.py, daemon.py, config.py, secrets.py, paths.py
+native/pjsua2/ SWIG interface + build script (the extension's GPL source)
+scripts/       install.sh, latency_report.py, pjsua_peer.sh, pf/ ruleset, utterances.txt
+config:        ~/.ai-phone/config.yaml (0600) · secrets.env (0600) · lines/ (carrier journals) · logs: ~/Library/Logs/ai-phone
+models:        the Hugging Face cache (~/.cache/huggingface), fetched by `ai-phone setup` or `ai-phone models pull`
 state:         ~/.ai-phone/state.json · control.sock · calls-today.json (daily outbound counter)
 ```
 
 ## Lines (Milestone 2)
 
-An agent is reachable through lines: a number bought with your own Telnyx or Twilio key (`ai-phone lines add telnyx --key-env TELNYX_API_KEY`), your own phone diverted to it (`ai-phone lines forward main --when no-answer --from +44…` prints the dial codes), a free SIP address for agent-to-agent calls (`ai-phone lines add sip …`), or a trunk you bring. The daemon sees only SIP either way; `ai-phone call <number|sip:…>` dials out with the agent's number (or your verified mobile) as caller ID and opens with an AI disclosure line; `ai-phone status` shows registration per line. Provisioning is journaled and resumable (`lines resume`), and `lines remove` undoes everything a carrier created. Configuration applies at restart. The brain is pluggable: `brain: {kind: openai_compatible, base_url: …}` makes any OpenAI-compatible server the agent. Full detail in `architecture.md` §14a.
+An agent is reachable through lines: a number bought with your own Telnyx or Twilio key (`ai-phone lines add telnyx --key-env TELNYX_API_KEY`) or one already on that account (`--existing +1555…`), your own phone diverted to it (`ai-phone lines forward main --when no-answer --from +44…` prints the dial codes), a free SIP address for agent-to-agent calls (`ai-phone lines add sip …`), or a trunk you bring. The daemon sees only SIP either way; `ai-phone call <number|sip:…>` dials out with the agent's number (or your verified mobile) as caller ID and opens with an AI disclosure line; `ai-phone status` shows registration per line. Provisioning is journaled and resumable (`lines resume`), and `lines remove` undoes everything ai-phone created at the carrier; a number you brought is disconnected, never released. Configuration applies at restart. The brain is pluggable: `brain: {kind: openai_compatible, base_url: …}` makes any OpenAI-compatible server the agent. Full detail in `architecture.md` §14a.
 
 ## Agent tool (Milestone 3)
 
 Any AI that can run shell commands uses ai-phone as its phone, in one of two modes chosen per call. **Phone agent mode** (`ai-phone call <target> --prompt "…"`): ai-phone's own model holds the whole conversation, following fixed phone instructions (the cached prefix) plus the call's prompt; it ends the call by writing `[END]`, and the command returns the transcript. **Relay mode** (`ai-phone call <target> --relay`, then `ai-phone listen`, `say` and `hangup`): the calling AI holds the conversation; ai-phone turns the other person's speech into text and speaks the AI's replies, says "One moment." when a reply is slow and hangs up politely after `calls.relay_reply_timeout_sec` (25 s). Every incoming call hears `inbound.greeting`; `ai-phone listen` with no call in progress waits for an incoming call and takes it in relay mode, and with nobody listening an incoming call runs in phone agent mode with `inbound.instructions`. Every outbound call opens with the fixed disclosure "Hi, this is an AI assistant calling."; the daemon refuses emergency numbers and enforces `calls.daily_limit`. Each call gets a 6-character hex ID and an in-memory record (the call in progress and the last 20 that ended). `call`, `listen`, `say` and `hangup` take `--json` and then print exactly one JSON object. The calling AI reaches the daemon over the local control socket, so the six invariants are unchanged. Full detail in `architecture.md` §14b.
 
+## Get started (Milestone 4)
+
+No packages: people clone the repo, run `./scripts/install.sh` (Homebrew's swig, pkgconf and pjproject, `uv sync`, then the SIP library build into `src/ai_phone/vendor/`), then `uv run ai-phone setup`. Setup is a full-screen wizard (numbered prompts with `--plain` or without a terminal) that asks only what applies: where the agent thinks (this Mac, or your own endpoint), a line (a new or existing Twilio/Telnyx number, a free SIP address, or your own trunk), a voice, and what callers hear; it then checks the models, the config, the lines and the voice, and ends with how to start ai-phone and what to tell your AI. Everything it saves goes under `~/.ai-phone/` (`config.yaml`, `secrets.env`, the carrier journals), and a step's answers are written only when the step completes. `ai-phone models pull` is the same download without the wizard. Carrier and endpoint requests happen only in `lines`, `models pull` and `setup`, never in the daemon. Full detail in `architecture.md` §10.
+
 ## Milestone gates
 
-M1 latency proof: p50 < 1.0 s at 8 kHz over the 20-utterance script, else the 4B tier becomes default (passed: p50 874 ms). M2 lines: a Telnyx number bought by `lines add` registers from behind the home router and stays registered 24 h (≥ 99 %, induced drops recovered within 60 s); an iPhone call answered under 1 s daemon-side; the iPhone diverted with `**61*` reaches the agent; `ai-phone call` rings it with the agent's number; two daemons call each other over `sip:`; Twilio passes the same inbound/outbound flow; a killed brain yields the apology, not silence; `lines remove` leaves nothing in the carrier account; no worker ever holds a line password. M3 agent tool: an AI places a phone agent call and a relay call through the CLI, both end to end with transcripts; emergency numbers refused. M4 packaging: install-to-first-call under 10 min on both platforms. M5 local dashboard and HTTP API: the API drives a call. M6 launch. Nothing is built before its gate.
+M1 latency proof: p50 < 1.0 s at 8 kHz over the 20-utterance script, else the 4B tier becomes default (passed: p50 874 ms). M2 lines: a Telnyx number bought by `lines add` registers from behind the home router and stays registered 24 h (≥ 99 %, induced drops recovered within 60 s); an iPhone call answered under 1 s daemon-side; the iPhone diverted with `**61*` reaches the agent; `ai-phone call` rings it with the agent's number; two daemons call each other over `sip:`; Twilio passes the same inbound/outbound flow; a killed brain yields the apology, not silence; `lines remove` leaves nothing in the carrier account; no worker ever holds a line password. M3 agent tool: an AI places a phone agent call and a relay call through the CLI, both end to end with transcripts; emergency numbers refused. M4 get started: clone to a free first call on this Mac in under 10 minutes with the install script and `ai-phone setup`. M5 local dashboard and HTTP API: the API drives a call. M6 launch. Nothing is built before its gate.
 
 ## Test peer (same box)
 
@@ -98,7 +104,7 @@ pjsua --local-port 5062 --null-audio --play-file utt.wav --auto-play --auto-play
 | What `onIncomingCall` does, policy evaluation, lockout | §3.4.1 |
 | Call and registration state machines | §3.3.1, §3.4.3 |
 | Media port callbacks, ring buffer layout, overflow/underflow | §3.5 |
-| NAT, STUN, RTP ports, Docker networking | §3.6 |
+| NAT, STUN, RTP ports | §3.6 |
 | Building the SWIG extension on Mac and in CI | §3.7, §10.5 |
 | TurnController states, VAD and endpointing parameters | §4.2, §4.3 |
 | Clause chunking rules, token caps, thinking off | §4.5 |
@@ -108,10 +114,10 @@ pjsua --local-port 5062 --null-audio --play-file utt.wav --auto-play --auto-play
 | Worker interfaces (`STTBackend` etc.) and IPC messages | §5.1, §5.2 |
 | Model ids, packages, per-platform backends, memory budget | §5.3–§5.6 |
 | Sample rates at every hop | §6 |
-| CLI commands, control socket, doctor checks, HTTP API | §7 |
+| CLI commands, control socket, a later check command, HTTP API | §7 |
 | Full config schema | §8 |
 | Turn record fields and latency definitions | §9 |
-| Repo layout, wheels, Docker, launchd, CI | §10 |
+| Getting started (install script, `ai-phone setup`, `models pull`), repo layout, CI | §10 |
 | Tests at each level | §11 |
 | Security model | §12 |
 | Failure modes and recovery | §13 |

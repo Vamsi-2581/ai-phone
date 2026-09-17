@@ -1,11 +1,12 @@
 # ai-phone
 
-A phone line answered by an AI that runs on your own machine. Give an agent a real number (bought with
-your own Telnyx or Twilio key, once, from the command line), divert your own phone to it, or reach it at a
-SIP address; speech-to-text, the language model and text-to-speech run locally by default, and during a
-call the daemon talks to nothing but SIP/RTP (and a brain endpoint only if you configured one).
+A phone line answered by an AI that runs on your own machine. Give an agent a real number (a new one
+bought with your own Telnyx or Twilio key, or one already on that account), divert your own phone to it,
+or reach it at a SIP address; speech-to-text, the language model and text-to-speech run locally by
+default, and during a call the daemon talks to nothing but SIP/RTP (and a brain endpoint only if you
+configured one).
 
-**Status: Milestone 1 (latency proof) passed; Milestone 2 (lines) code complete, its live gate pending; Milestone 3 (agent tool) code complete, its gate pending.**
+**Status: Milestone 1 (latency proof) passed; Milestone 2 (lines) code complete, its live gate pending; Milestone 3 (agent tool) code complete, its gate pending; Milestone 4 (get started: install script and setup wizard) in progress.**
 English only, one call at a time. See `architecture-essentials.md` for how it works.
 
 ## Milestone 1 numbers (Apple M5 Pro, 24 GB, 4B tier, 20 LAN calls over 8 kHz PCMU)
@@ -25,18 +26,21 @@ heard in full.
 ## Try it (macOS, Apple Silicon)
 
 ```bash
-brew install swig pjproject && ./native/pjsua2/build.sh
-mkdir -p src/ai_phone/vendor && cp native/pjsua2/build/pjsua2.py native/pjsua2/build/_pjsua2*.so src/ai_phone/vendor/
-uv sync
-# weights (one-off, ~4.3 GB): Qwen3.5-4B-MLX-4bit, parakeet-tdt-0.6b-v2, Kokoro-82M-bf16, plus voices from prince-canuma/Kokoro-82M
-mkdir -p ~/.ai-phone && cp config.example.yaml ~/.ai-phone/config.yaml && chmod 600 ~/.ai-phone/config.yaml
-HF_HUB_OFFLINE=1 uv run ai-phone run --lan
+git clone https://github.com/oxnw/ai-phone.git && cd ai-phone
+./scripts/install.sh        # the SIP library and the Python environment (needs Homebrew and uv)
+uv run ai-phone setup       # pick a line, a brain and a voice; downloads the models; checks it all works
+uv run ai-phone run         # start ai-phone
 ```
 
-Then call `sip:ai@<your-mac-ip>` from any SIP softphone on the same network, or run the test
-caller: `scripts/pjsua_peer.sh scripts/utt/00.wav /tmp/rec.wav 18`.
+`setup` saves everything under `~/.ai-phone/` (`config.yaml`, and keys and passwords in `secrets.env`, both
+readable only by you) and changes only what you pick when you run it again. `uv run ai-phone setup --plain` asks the
+same questions as plain prompts. The models go to the Hugging Face cache; `uv run ai-phone models pull` fetches them
+without the wizard. The commands below are written as `ai-phone …`; from the repo folder that is `uv run ai-phone …`.
 
-Packaging (`uv tool install`, Homebrew tap, Docker) is Milestone 4. Real numbers, diverts and SIP addresses are Milestone 2, below.
+No carrier yet? Pick "A SIP address" in setup and talk to your agent from this Mac with
+`pjsua --local-port 5070 sip:agent@127.0.0.1` (free).
+
+Real numbers, diverts and SIP addresses are Milestone 2, below.
 
 ## Three ways to call it (Milestone 2)
 
@@ -44,6 +48,7 @@ Packaging (`uv tool install`, Homebrew tap, Docker) is Milestone 4. Real numbers
 # 1. Its own number (a Telnyx or Twilio account and API key; about £1/month for the number)
 export TELNYX_API_KEY=…
 ai-phone lines add telnyx --key-env TELNYX_API_KEY --country GB --area 020
+ai-phone lines add twilio --key-env TWILIO_ACCOUNT_SID --secret-env TWILIO_AUTH_TOKEN --existing +15550100000   # a number you already have: nothing is bought, and removing the line keeps it
 ai-phone run
 
 # 2. Your own mobile number. It stays on your SIM, so this is two halves:
@@ -64,9 +69,13 @@ ai-phone status
 
 # Any brain: LM Studio, llama.cpp, or your own agent behind an OpenAI-compatible endpoint
 #   brain: {kind: openai_compatible, base_url: "http://127.0.0.1:1234/v1", model: "…"}
+# And the voice
+#   tts: {voice: bf_emma, speed: 1.0}   (English voices: af_/am_ American, bf_/bm_ British)
 ```
 
-During a call the daemon opens no network connection except SIP/RTP to the peer and, only if you configured one, HTTP(S) to that brain endpoint. Buying a number talks to the carrier once, from the `lines` command, and the daemon never loads the carrier code. Provisioning is journaled: `ai-phone lines resume` picks up where a crash left off, `ai-phone lines remove` deletes what the carrier created and lists exactly what is left for you to remove in the portal if a deletion fails — or, if the journal recording what was created has gone missing, refuses rather than delete the local record of a number that is still billing. Configuration applies at restart. The NAT and transport checks run before calling it done are in [docs/nat-checklist.md](docs/nat-checklist.md); the 24 h registration soak is `scripts/soak.sh`.
+`--key-env` and `--secret-env` name variables in your environment or in `~/.ai-phone/secrets.env` (where setup saves them).
+
+During a call the daemon opens no network connection except SIP/RTP to the peer and, only if you configured one, HTTP(S) to that brain endpoint. Buying or connecting a number talks to the carrier once, from the `lines` command or `setup`, and the daemon never loads the carrier code. Provisioning is journaled: `ai-phone lines resume` picks up where a crash left off, `ai-phone lines remove` deletes what ai-phone created at the carrier (a number you brought is disconnected and stays on your account) and lists exactly what is left for you to remove in the portal if a deletion fails — or, if the journal recording what was created has gone missing, refuses rather than delete the local record of a number that is still billing. Configuration applies at restart. The NAT and transport checks run before calling it done are in [docs/nat-checklist.md](docs/nat-checklist.md); the 24 h registration soak is `scripts/soak.sh`.
 
 What an incoming call hears is set by one `inbound:` section of the config: a greeting that plays on every incoming
 call, and the instructions ai-phone's own model follows when no AI is waiting in `ai-phone listen` (the example config
