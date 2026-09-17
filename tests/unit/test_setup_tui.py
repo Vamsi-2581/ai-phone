@@ -693,7 +693,7 @@ def test_run_tui_reports_a_crash_without_its_message(monkeypatch):
 
     monkeypatch.setattr(tui, "SetupApp", headless())
     assert run_tui(lambda ui: Outcome(0, "done")) == Outcome(0, "done")
-    assert run_tui(crash) == Outcome(3, "setup stopped: RuntimeError")
+    assert run_tui(crash) == Outcome(3, "Setup stopped: RuntimeError")
     assert run_tui(broken_screen) == Outcome(3, "Setup stopped: the screen closed unexpectedly.")
 
 

@@ -288,7 +288,7 @@ class SetupApp(App):
         except Cancel:
             self.outcome = Outcome(1, CANCELLED)
         except Exception as e:  # the flow's own errors are ActionErrors it already handled; this is a bug
-            self.outcome = Outcome(3, f"setup stopped: {type(e).__name__}")
+            self.outcome = Outcome(3, f"Setup stopped: {type(e).__name__}")
         finally:
             if self.return_code is None:  # not already closed by ctrl+c while the flow was working
                 try:
