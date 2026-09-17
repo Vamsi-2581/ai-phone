@@ -181,10 +181,12 @@ Screen {{ background: {BG}; align: center top; }}
 #note {{ width: 100%; text-align: center; }}
 #checks {{ width: auto; margin: 2 0 1 0; }}
 #body {{ width: auto; margin: 1 0 0 0; }}
+.dense #body {{ margin: 0; }}
 Center {{ height: auto; }}
 #menu {{ width: auto; margin: 2 0 0 0; }}
 #hint {{ width: auto; margin: 2 0 0 0; }}
 .eyebrow {{ width: 100%; text-align: center; margin: 5 0 1 0; }}
+.dense .eyebrow {{ margin: 1 0 1 0; }}
 .question {{ width: 100%; text-align: center; }}
 .detail {{ width: 100%; text-align: center; margin: 0 0 1 0; }}
 .error {{ width: 100%; text-align: center; color: {RED}; margin: 0 0 1 0; }}

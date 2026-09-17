@@ -470,6 +470,29 @@ async def test_resizing_the_terminal_refits_the_crumbs_and_the_wordmark():
 
 
 @pytest.mark.asyncio
+async def test_a_long_body_fits_without_scrolling():
+    # the Done page: a summary of ~22 lines, one option and the hint must fit in 40 rows
+    lines = [f"line {i:02d}  " + "·" * 60 for i in range(22)]
+    done = Page(6, "You're set up", "Everything is saved. Here's how to use it.", body="\n".join(lines))
+    app = SetupApp(lambda ui: Outcome(ui.choose(done, [Option("Finish")], back=False)))
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "[1] Finish"))
+        rows = screen_text(app).splitlines()
+        assert app.screen.max_scroll_y == 0 and not app.screen.show_vertical_scrollbar
+        assert any("↑↓ move   ⏎ select   1-9 jump   q quit" in row for row in rows)
+        assert "S T E P   7   O F   7" in rows[5]  # the eyebrow moves up
+        body = [(row.index(line), row) for line in lines for row in rows if line in row]
+        assert len(body) == 22
+        detail = next(r for r, row in enumerate(rows) if "Everything is saved." in row)
+        assert rows.index(body[0][1]) == detail + 2  # one blank line under the detail, no more
+        left = body[0][0]
+        assert {col for col, _ in body} == {left}
+        assert abs((left - 5) - (99 - (left + len(lines[0])))) <= 1  # still centred in the page's 94 columns
+        await pilot.press("enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+
+
+@pytest.mark.asyncio
 async def test_no_color(monkeypatch):
     monkeypatch.setenv("NO_COLOR", "1")
     app = SetupApp(lambda ui: Outcome(ui.choose(WELCOME, [Option("Continue")], back=False)))
@@ -544,7 +567,90 @@ async def test_ctrl_c_between_an_answer_and_the_next_question_still_cancels():
 
 
 @pytest.mark.asyncio
-async def test_ctrl_c_while_working_leaves_at_once():
+@pytest.mark.parametrize("kind", ["busy", "progress"])
+async def test_ctrl_c_just_before_work_starts_cancels_the_work(kind):
+    class LateQuit(SetupApp):
+        def show(self, screen):
+            if screen.busy:
+                self.action_request_quit()  # lands while the answered question is still up
+            return super().show(screen)
+
+    ran = []
+
+    def flow(ui):
+        ui.choose(Page(3, "Download the voice now?"), OPTIONS)
+        work_page = Page(3, "Downloading the voice")
+        if kind == "busy":
+            ui.busy(work_page, "Downloading…", lambda: ran.append("work"))
+        else:
+            ui.progress(work_page, "Downloading…", lambda report: ran.append("work"))
+        return Outcome(0)
+
+    app = LateQuit(flow)
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "Download the voice now?"))
+        await pilot.press("enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert ran == [] and app.outcome == Outcome(1, "Setup cancelled.")
+
+
+def stopping_line(app) -> str:
+    return next((l.strip() for l in screen_text(app).splitlines() if "Stopping after this step…" in l), "")
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_while_working_lets_the_step_finish_then_stops():
+    release = threading.Event()
+    got = {}
+
+    def flow(ui):
+        got["step"] = ui.busy(Page(2, "Buying +15550100001"), "Buying the number…", lambda: release.wait(5))
+        ui.choose(Page(2, "Which voice?"), OPTIONS)  # never shown: the person asked to quit
+        return Outcome(0)
+
+    app = SetupApp(flow)
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "Buying the number…"))
+        await pilot.press("ctrl+c")
+        await wait_for(pilot, app, lambda: stopping_line(app)[:1] in tuple(FRAMES))
+        assert "Buying the number…" not in screen_text(app)
+        assert app.quit_requested and app.return_code is None and "step" not in got
+        frame = stopping_line(app)[:1]
+        await wait_for(pilot, app, lambda: stopping_line(app)[:1] != frame)  # still spinning
+        release.set()
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+        await wait_for(pilot, app, lambda: app.return_code is not None)
+    assert got["step"] is True  # the step ran to its end
+    assert app.outcome == Outcome(1, "Setup cancelled.")
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_while_a_form_is_checked_says_so_under_the_fields():
+    release = threading.Event()
+
+    def flow(ui):
+        ui.ask(TWILIO, KEY_FIELDS)
+        ui.busy(TWILIO, "Checking your Twilio account…", lambda: release.wait(5))
+        ui.choose(Page(2, "Which number?"), OPTIONS)  # never shown
+        return Outcome(0)
+
+    app = SetupApp(flow)
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "Account SID"))
+        await pilot.press("a", "enter", "b", "enter")
+        await wait_for(pilot, app, lambda: "Checking your Twilio account…" in screen_text(app))
+        await pilot.press("ctrl+c")
+        await wait_for(pilot, app, lambda: "Stopping after this step…" in screen_text(app))
+        rows = screen_text(app).splitlines()
+        assert rows[26].index("Stopping after this step…") == 22 and "Auth Token" in screen_text(app)
+        assert app.return_code is None
+        release.set()
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert app.outcome == Outcome(1, "Setup cancelled.")
+
+
+@pytest.mark.asyncio
+async def test_a_second_ctrl_c_while_working_leaves_at_once():
     release = threading.Event()
 
     def flow(ui):
@@ -556,8 +662,11 @@ async def test_ctrl_c_while_working_leaves_at_once():
     async with app.run_test(size=(104, 40)) as pilot:
         await wait_for(pilot, app, showing(app, "Loading voices…"))
         await pilot.press("ctrl+c")
+        await wait_for(pilot, app, lambda: "Stopping after this step…" in screen_text(app))
+        assert app.return_code is None
+        await pilot.press("ctrl+q")
         await wait_for(pilot, app, lambda: app.return_code is not None)
-        assert app.quit_requested and app.outcome is None
+        assert app.outcome is None and not app.left_download
     # the work was left to finish on its own; the flow then stops at its next question
     release.set()
     deadline = time.monotonic() + 5
@@ -629,14 +738,16 @@ def test_quitting_other_work_returns_as_before(monkeypatch):
 
     def flow(ui):
         ui.busy(Page(3, "Which voice?"), "Loading voices…", lambda: release.wait(5))
+        ui.choose(Page(3, "Which voice?"), OPTIONS)
         return Outcome(0)
 
     async def quit_while_loading(pilot):
         await wait_for(pilot, pilot.app, showing(pilot.app, "Loading voices…"))
         await pilot.press("ctrl+c")
+        await wait_for(pilot, pilot.app, lambda: "Stopping after this step…" in screen_text(pilot.app))
+        release.set()
 
     monkeypatch.setattr(tui, "SetupApp", headless(quit_while_loading))
     monkeypatch.setattr(tui.os, "_exit", exits.append)
     assert run_tui(flow) == Outcome(1, "Setup cancelled.")
     assert exits == []
-    release.set()

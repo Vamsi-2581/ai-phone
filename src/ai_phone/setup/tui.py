@@ -27,13 +27,15 @@ UNCHECKABLE = "That value could not be checked."
 CANCELLED = "Setup cancelled."
 DOWNLOAD_LEFT = "Setup cancelled. The download stops now and picks up where it left off next time."
 SCREEN_CLOSED = "Setup stopped: the screen closed unexpectedly."
+STOPPING = "Stopping after this step…"
+DENSE_BODY_LINES = 12  # a longer body (the Done page) gets tighter spacing so the page fits 40 rows
 
 
 class PageScreen(Screen):
     """One Page: a menu (options), a form (fields), or a spinner/progress bar while the flow works."""
 
     def __init__(self, page: Page, reply=None, options=(), default=0, back=False, fields=(), busy="", progress=False):
-        super().__init__()
+        super().__init__(classes="dense" if len(page.body.splitlines()) > DENSE_BODY_LINES else None)
         self.page, self.reply = page, reply
         self.options, self.default, self.back = list(options), default, back
         self.fields, self.busy, self.progress = list(fields), busy, progress
@@ -125,6 +127,11 @@ class PageScreen(Screen):
         if self.spinning is None:
             self.spinning = self.set_interval(0.08, self._spin)
 
+    def stopping(self) -> None:
+        """ctrl+c while a step runs: say so, and keep spinning until the step is done."""
+        self.label = STOPPING
+        self.query_one("#status", Static).update(self._spinner())
+
     class Progress(Message):
         """Posted from the downloader's thread: posting never blocks it, and a closed screen just drops it."""
 
@@ -202,9 +209,14 @@ class TextualUI(BaseUI):
         self.form: PageScreen | None = None  # the form on screen whose values the flow has just been given
 
     def _call(self, fn, *args):
+        """Run fn on the UI thread. A ctrl+c from before it ran, or while it ran, cancels the flow here: once a new
+        screen is up, the key goes to that screen, but one pressed while the old screen was still up would be lost."""
         if self.app.quit_requested:
             raise Cancel()
-        return self.app.call_from_thread(fn, *args)
+        result = self.app.call_from_thread(fn, *args)
+        if self.app.quit_requested:
+            raise Cancel()
+        return result
 
     def _show(self, screen: PageScreen) -> None:
         self.form = None
@@ -214,8 +226,6 @@ class TextualUI(BaseUI):
         q: queue.Queue = queue.Queue()
         screen.reply = q.put
         self._show(screen)
-        if self.app.quit_requested:  # ctrl+c landed after the last answer, before this screen was up
-            raise Cancel()
         answer = q.get()
         if answer is _QUIT:
             raise Cancel()
@@ -293,13 +303,18 @@ class SetupApp(App):
         return self.push_screen(screen)
 
     def action_request_quit(self) -> None:
-        # On a question screen: quit now (the flow thread gets Cancel). While the flow is working (a purchase, a
-        # download): the work finishes or is abandoned with the process; a purchase is journaled either way.
+        # On a question screen: quit now (the flow thread gets Cancel). While a step works (it may be a purchase):
+        # the first press lets it finish and the flow stops before its next screen; a second press leaves at once.
+        # A download is left at once: it resumes next time.
+        screen = self.screen if isinstance(self.screen, PageScreen) else None
+        first = not self.quit_requested
         self.quit_requested = True
-        if isinstance(self.screen, PageScreen) and self.screen.reply is not None and not self.screen.busy:
-            self.screen.send(_QUIT)
+        if screen is not None and screen.reply is not None and not screen.busy:
+            screen.send(_QUIT)
+        elif screen is not None and screen.busy and not screen.progress and first:
+            screen.stopping()
         else:
-            self.left_download = isinstance(self.screen, PageScreen) and self.screen.progress
+            self.left_download = screen is not None and screen.progress
             self.exit()
 
 
