@@ -3,7 +3,7 @@
 config.yaml
 *.local.yaml
 
-# Model weights (fetched by `ai-phone doctor --fetch`)
+# Model weights (`ai-phone models pull` puts them in the Hugging Face cache, never here)
 models/
 *.safetensors
 *.gguf
@@ -22,7 +22,7 @@ turns.jsonl
 *.m4a
 *.flac
 
-# Build output (the SIP extension is built into the wheel, not committed)
+# Build output (the SIP extension is built on each Mac by scripts/install.sh, not committed)
 build/
 dist/
 *.egg-info/

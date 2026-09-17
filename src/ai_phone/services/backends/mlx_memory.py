@@ -4,7 +4,7 @@ macOS pages idle memory out aggressively: after a quiet spell on a busy host the
 idle worker are no longer resident and the first inference pays seconds of page-ins before it runs.
 On a phone call that looks like "it does not hear me". MLX (macOS 15+) can wire buffers so the pager
 leaves them alone; we wire exactly what the model needs plus a small working set, never more than the
-GPU's recommended working set, and report the numbers so `doctor`/logs can show them.
+GPU's recommended working set, and report the numbers so the logs (and a later check command) can show them.
 """
 from __future__ import annotations
 
