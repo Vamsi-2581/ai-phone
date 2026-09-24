@@ -494,15 +494,37 @@ def cmd_remove(a) -> int:
     return EXIT_OK
 
 
+def _unfinished_row(line_id: str, setup: JournalSetup) -> str:
+    """One row of the unfinished block: how far the journal got, and the command that finishes or undoes it."""
+    local_only = f"ai-phone lines remove {line_id} --local-only"
+    if setup.number is None:  # the journal was opened, but nothing exists at the carrier to finish or release
+        return f"  {line_id:12s} nothing created yet · remove: {local_only}"
+    where = "unreadable" if setup.number == "?" else setup.number
+    got = f"{'brought' if setup.brought else 'bought'} · {setup.state}"
+    if setup.state == "rollback_failed":  # the carrier refused the undo, so only a person can clear it
+        how = f"finish in the carrier portal, then: {local_only}"
+    else:
+        how = (f"resume: ai-phone lines resume {line_id} --key-env <NAME>   "
+               f"undo: ai-phone lines remove {line_id} --key-env <NAME>")
+    return f"  {line_id:12s} {where:14s} {got:26s} {how}"
+
+
 def cmd_list(a) -> int:
     cfg = load_config(_config_path(a))
-    if not cfg.lines:
+    unfinished = {lid: s for lid, s in journal_setups().items() if lid not in cfg.lines}
+    if not cfg.lines and not unfinished:
         _say("no lines configured; try: ai-phone lines add telnyx --key-env TELNYX_API_KEY")
         return EXIT_OK
     for lid, ln in cfg.lines.items():
         where = ln.number or ln.aor
         prov = f" ({ln.provider.name}: {ln.provider.state})" if ln.provider else ""
         _say(f"{lid:12s} {ln.kind:5s} {where}{prov}")
+    if unfinished:  # a stopped purchase leaves a journal and no config line; this is where the stop message sends people
+        if cfg.lines:
+            _say("")
+        _say("Unfinished setups")
+        for lid, setup in unfinished.items():
+            _say(_unfinished_row(lid, setup))
     return EXIT_OK
 
 

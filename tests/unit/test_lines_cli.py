@@ -547,6 +547,46 @@ def test_journal_setups_reads_every_journal_without_writing(home: Path):
     assert {p.name: p.stat().st_mtime_ns for p in (home / "lines").iterdir()} == before
 
 
+def test_list_shows_configured_lines_then_unfinished_setups(home: Path, capsys):
+    """An interrupted purchase leaves a journal and no config line; `lines list` is where the stop message
+    sends people, so it has to show those too, with the command that finishes or undoes each one."""
+    assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "main", "--yes"]) == 0
+    shop = Journal.open(home / "lines", "shop", "fake")
+    shop.start("target", phone_number="+15550100001", brought=False)
+    desk = Journal.open(home / "lines", "desk", "fake")
+    desk.start("target", phone_number="+442079460000", brought=True)
+    desk.set_state("rollback_failed")
+    capsys.readouterr()
+    assert main(["lines", "list"]) == 0
+    assert capsys.readouterr().out == (
+        "main         trunk +442079460000 (fake: ready)\n"
+        "\n"
+        "Unfinished setups\n"
+        "  desk         +442079460000  brought · rollback_failed  "
+        "finish in the carrier portal, then: ai-phone lines remove desk --local-only\n"
+        "  shop         +15550100001   bought · pending           "
+        "resume: ai-phone lines resume shop --key-env <NAME>   undo: ai-phone lines remove shop --key-env <NAME>\n"
+    )
+
+
+def test_list_with_no_configured_lines_shows_the_journals_instead_of_the_empty_hint(home: Path, capsys):
+    Journal.open(home / "lines", "early", "fake")  # opened, nothing created at the carrier yet
+    capsys.readouterr()
+    assert main(["lines", "list"]) == 0
+    assert capsys.readouterr().out == (
+        "Unfinished setups\n"
+        "  early        nothing created yet · remove: ai-phone lines remove early --local-only\n"
+    )
+    (home / "lines" / "early.journal.json").write_text("{not json")
+    assert main(["lines", "list"]) == 0
+    assert "  early        unreadable     bought · ?" in capsys.readouterr().out
+
+
+def test_list_without_lines_or_journals_still_suggests_adding_one(home: Path, capsys):
+    assert main(["lines", "list"]) == 0
+    assert capsys.readouterr().out == "no lines configured; try: ai-phone lines add telnyx --key-env TELNYX_API_KEY\n"
+
+
 def test_remove_refuses_to_release_a_number_another_line_uses(home: Path, monkeypatch, capsys):
     monkeypatch.setenv("AI_PHONE_FAKE_CRASH_AFTER", "number")
     assert main(["lines", "add", "fake", "--key-env", "FAKE_KEY", "--id", "shop", "--yes"]) == 3  # bought, then stopped
