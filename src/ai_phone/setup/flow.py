@@ -298,7 +298,7 @@ def brain_endpoint(ui, actions, session: Session, cur) -> None:
 def line(ui, actions, session: Session) -> None:
     cur = actions.current()
     i = ui.choose(Page(LINE, "How should people reach your agent?", "You can add more lines later by running setup again."),
-                  [Option("A phone number", "Twilio or Telnyx · a new number or one you already have"),
+                  [Option("A phone number", "Twilio or Telnyx · a new number, or one already on that account"),
                    Option("A SIP address", "free · softphones and other agents"),
                    Option("My own SIP trunk", "your PBX or provider"),
                    Option("Skip", "keep the lines you have" if cur.lines else "add one later")])
@@ -335,12 +335,13 @@ def phone_number(ui, actions, session: Session) -> None:
     connected = {ln.get("number") for ln in actions.current().lines.values()} | actions.unfinished_numbers()
     free = [n for n in owned if n.e164 not in connected]
     left = f"{len(free)} not yet connected" if free else "none left to connect" if owned else "none on this account"
-    new = ui.choose(Page(LINE, "A new number or one you already have?",
+    new = ui.choose(Page(LINE, f"A new number, or one already on your {name} account?",
                          checks=[Check(f"{name} key", f"works · {plural(len(owned), 'number')} on this account", True)]),
-                    [Option("A new number", "search and buy one"), Option("One I already have", left)]) == 0
+                    [Option("A new number", "search and buy one"), Option(f"One already on my {name} account", left)]) == 0
     if not new and not free:
         ui.choose(Page(LINE, f"No other numbers on this {name} account" if owned else f"No numbers on this {name} account",
-                       "Buy one instead, or add a number in the carrier's console and run setup again."),
+                       "A number on your phone's SIM cannot be connected; buy one here, or add a number in the "
+                       f"{name} console and run setup again."),
                   [Option("Buy a new number")])
         new = True
     if new:

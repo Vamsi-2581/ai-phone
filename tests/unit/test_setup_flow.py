@@ -284,6 +284,7 @@ def test_new_setup_local_brain_sip_line_default_voice():
     assert ui.questions("Which model size?")[0].detail == "This Mac has 24 GB of memory, so Qwen 4B is recommended."
     assert [o.label for o in ui.menu("How should people reach")[1]][3] == "Skip"
     assert ui.menu("How should people reach")[1][3].hint == "add one later"
+    assert ui.menu("How should people reach")[1][0].hint == "Twilio or Telnyx · a new number, or one already on that account"
     group = ui.menu("American · female")
     assert [o.label for o in group[1]] == ["Bella", "Heart"] and group[2] == 1 and group[1][1].hint == "current"
     assert ui.questions("Heart")[0].detail == "American · female"
@@ -410,7 +411,7 @@ def add_a_line(carrier="Twilio"):
 def test_twilio_new_number_buys_only_after_confirmation():
     choose_a_number = [
         ("Your Twilio credentials", ["ACsid", "tokSECRET"]),
-        ("A new number or one you already have?", "A new number"),
+        ("A new number, or one already on", "A new number"),
         ("Where should the number be?", ["", ""]),
         ("Pick a number", "+15550100001"),
     ]
@@ -433,9 +434,9 @@ def test_twilio_new_number_buys_only_after_confirmation():
     credentials = ui.questions("Your Twilio credentials")[0]
     assert credentials.detail == "Saved to ~/.ai-phone/secrets.env, readable only by you. Never shown or sent anywhere else."
     assert [(f.label, f.secret, f.placeholder) for f in ui.fields[:2]] == [("Account SID", True, "AC…"), ("Auth Token", True, "32 characters")]
-    assert ui.questions("A new number or one")[0].checks == [Check("Twilio key", "works · 2 numbers on this account", True)]
-    assert [(o.label, o.hint) for o in ui.menu("A new number or one")[1]] == [
-        ("A new number", "search and buy one"), ("One I already have", "2 not yet connected")]
+    assert ui.questions("A new number, or one already on")[0].checks == [Check("Twilio key", "works · 2 numbers on this account", True)]
+    assert [(o.label, o.hint) for o in ui.menu("A new number, or one already on")[1]] == [
+        ("A new number", "search and buy one"), ("One already on my Twilio account", "2 not yet connected")]
     assert [(o.label, o.hint) for o in ui.menu("Pick a number")[1]] == [
         ("+15550100001", "$1.15/month"), ("+15550100002", "$1.15/month · documents required")]
     confirm = ui.questions("Buy +15550100001")[0]
@@ -452,7 +453,7 @@ def test_no_numbers_found_asks_for_another_area():
     ui = ScriptedUI([
         *add_a_line(),
         ("Your Twilio credentials", ["ACsid", "tokSECRET"]),
-        ("A new number or one you already have?", "A new number"),
+        ("A new number, or one already on", "A new number"),
         ("Where should the number be?", ["gb", "999"]),
         ("Where should the number be?", ["", ""]),
         ("Pick a number", "<quit>"),
@@ -468,7 +469,7 @@ def test_telnyx_existing_number_and_forward():
     ui = ScriptedUI([
         *add_a_line("Telnyx"),
         ("Use the saved Telnyx key?", "Use the saved key"),
-        ("A new number or one you already have?", "One I already have"),
+        ("A new number, or one already on", "One already on my Telnyx account"),
         ("Which number?", "+15550100008"),
         ("Connect +15550100008 to ai-phone?", "Connect +15550100008"),
         ("Also forward your own mobile to it?", "Yes"),
@@ -502,7 +503,7 @@ def test_back_in_the_forward_questions_never_returns_to_the_purchase():
     ui = ScriptedUI([
         *add_a_line("Telnyx"),
         ("Use the saved Telnyx key?", "Use the saved key"),
-        ("A new number or one you already have?", "One I already have"),
+        ("A new number, or one already on", "One already on my Telnyx account"),
         ("Which number?", "+15550100007"),
         ("Connect +15550100007 to ai-phone?", "Connect +15550100007"),
         ("Also forward your own mobile to it?", "Yes"),
@@ -520,7 +521,7 @@ def test_no_owned_numbers_offers_to_buy_one():
     ui = ScriptedUI([
         *add_a_line("Telnyx"),
         ("Your Telnyx credentials", ["KEYnew"]),
-        ("A new number or one you already have?", "One I already have"),
+        ("A new number, or one already on", "One already on my Telnyx account"),
         ("No numbers on this Telnyx account", "Buy a new number"),
         ("Where should the number be?", ["", ""]),
         ("Pick a number", "<quit>"),
@@ -528,10 +529,10 @@ def test_no_owned_numbers_offers_to_buy_one():
     actions = FakeActions(exists=True, owned_numbers=[])
     drive(ui, actions)
     assert ui.questions("No numbers on this Telnyx account")[0].detail == \
-        "Buy one instead, or add a number in the carrier's console and run setup again."
-    assert ui.questions("A new number or one")[0].checks == [Check("Telnyx key", "works · 0 numbers on this account", True)]
+        "A number on your phone's SIM cannot be connected; buy one here, or add a number in the Telnyx console and run setup again."
+    assert ui.questions("A new number, or one already on")[0].checks == [Check("Telnyx key", "works · 0 numbers on this account", True)]
     assert [(f.label, f.placeholder) for f in ui.fields[:1]] == [("API key", "KEY…")]
-    assert ui.menu("A new number or one")[1][1].hint == "none on this account"
+    assert ui.menu("A new number, or one already on")[1][1].hint == "none on this account"
 
 
 def test_numbers_already_connected_are_left_out():
@@ -539,7 +540,7 @@ def test_numbers_already_connected_are_left_out():
     ui = ScriptedUI([
         *add_a_line("Telnyx"),
         ("Use the saved Telnyx key?", "Use the saved key"),
-        ("A new number or one you already have?", "One I already have"),
+        ("A new number, or one already on", "One already on my Telnyx account"),
         ("Which number?", "+15550100008"),
         ("Connect +15550100008 to ai-phone?", "<quit>"),
     ])
@@ -547,13 +548,13 @@ def test_numbers_already_connected_are_left_out():
                           lines={"telnyx": {"kind": "trunk", "number": "+15550100007"}, "agent": SIP_LINE})
     drive(ui, actions)
     assert [o.label for o in ui.menu("Which number?")[1]] == ["+15550100008"]
-    assert ui.questions("A new number or one")[0].checks == [Check("Telnyx key", "works · 2 numbers on this account", True)]
-    assert ui.menu("A new number or one")[1][1].hint == "1 not yet connected"
+    assert ui.questions("A new number, or one already on")[0].checks == [Check("Telnyx key", "works · 2 numbers on this account", True)]
+    assert ui.menu("A new number, or one already on")[1][1].hint == "1 not yet connected"
 
     ui = ScriptedUI([
         *add_a_line("Telnyx"),
         ("Use the saved Telnyx key?", "Use the saved key"),
-        ("A new number or one you already have?", "One I already have"),
+        ("A new number, or one already on", "One already on my Telnyx account"),
         ("No other numbers on this Telnyx account", "Buy a new number"),
         ("Where should the number be?", ["", ""]),
         ("Pick a number", "<quit>"),
@@ -562,9 +563,9 @@ def test_numbers_already_connected_are_left_out():
     actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}, lines=lines)
     drive(ui, actions)
     page = ui.questions("No other numbers")[0]
-    assert page.detail == "Buy one instead, or add a number in the carrier's console and run setup again."
+    assert page.detail == "A number on your phone's SIM cannot be connected; buy one here, or add a number in the Telnyx console and run setup again."
     assert [o.label for o in ui.menu("No other numbers")[1]] == ["Buy a new number"]
-    assert ui.menu("A new number or one")[1][1].hint == "none left to connect"
+    assert ui.menu("A new number, or one already on")[1][1].hint == "none left to connect"
     assert not actions.args("attach_number")
 
 
@@ -573,7 +574,7 @@ def test_a_forward_that_cannot_be_saved_is_asked_again():
     ui = ScriptedUI([
         *add_a_line("Telnyx"),
         ("Use the saved Telnyx key?", "Use the saved key"),
-        ("A new number or one you already have?", "One I already have"),
+        ("A new number, or one already on", "One already on my Telnyx account"),
         ("Which number?", "+15550100007"),
         ("Connect +15550100007 to ai-phone?", "Connect +15550100007"),
         ("Also forward your own mobile to it?", "Yes"),
@@ -595,20 +596,20 @@ def test_numbers_with_an_unfinished_setup_are_left_out():
     ui = ScriptedUI([
         *add_a_line("Telnyx"),
         ("Use the saved Telnyx key?", "Use the saved key"),
-        ("A new number or one you already have?", "One I already have"),
+        ("A new number, or one already on", "One already on my Telnyx account"),
         ("Which number?", "<quit>"),
     ])
     actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}, unfinished_numbers={"+15550100007"})
     drive(ui, actions)
     assert [o.label for o in ui.menu("Which number?")[1]] == ["+15550100008"]
-    assert ui.menu("A new number or one")[1][1].hint == "1 not yet connected"
+    assert ui.menu("A new number, or one already on")[1][1].hint == "1 not yet connected"
 
 
 def test_pasted_keys_lose_their_spaces():
     ui = ScriptedUI([
         *add_a_line("Twilio"),
         ("Your Twilio credentials", [" ACsid ", "tokSECRET\t "]),
-        ("A new number or one you already have?", "<quit>"),
+        ("A new number, or one already on", "<quit>"),
     ])
     actions = FakeActions(exists=True)
     drive(ui, actions)
@@ -639,7 +640,7 @@ def test_bad_key_is_asked_again_with_the_error():
         *add_a_line("Telnyx"),
         ("Your Telnyx credentials", ["KEYbad"]),
         ("Your Telnyx credentials", ["KEYgood"]),
-        ("A new number or one you already have?", "<quit>"),
+        ("A new number, or one already on", "<quit>"),
     ])
     actions = FakeActions(exists=True, owned_numbers=Seq(ActionError("That key did not work: 401 Unauthorized"), OWNED))
     assert drive(ui, actions).code == 1
@@ -654,7 +655,7 @@ def test_a_saved_key_that_fails_asks_for_a_new_one():
         *add_a_line("Twilio"),
         ("Use the saved Twilio key?", "Use the saved key"),
         ("Your Twilio credentials", ["ACsid", "tokSECRET"]),
-        ("A new number or one you already have?", "<quit>"),
+        ("A new number, or one already on", "<quit>"),
     ])
     old = {"TWILIO_ACCOUNT_SID": "ACold", "TWILIO_AUTH_TOKEN": "old"}
     actions = FakeActions(exists=True, saved_keys=old,
@@ -669,7 +670,7 @@ def test_enter_a_different_key_asks_for_it():
         *add_a_line("Twilio"),
         ("Use the saved Twilio key?", "Enter a different key"),
         ("Your Twilio credentials", ["ACsid", "tokSECRET"]),
-        ("A new number or one you already have?", "<quit>"),
+        ("A new number, or one already on", "<quit>"),
     ])
     actions = FakeActions(exists=True, saved_keys={"TWILIO_ACCOUNT_SID": "ACold", "TWILIO_AUTH_TOKEN": "old"})
     drive(ui, actions)
@@ -683,7 +684,7 @@ def test_pending_number_shows_the_messages_and_skips_forwarding():
     ui = ScriptedUI([
         *add_a_line(),
         ("Your Twilio credentials", ["ACsid", "tokSECRET"]),
-        ("A new number or one you already have?", "A new number"),
+        ("A new number, or one already on", "A new number"),
         ("Where should the number be?", ["", "555"]),
         ("Pick a number", "+15550100002"),
         ("Buy +15550100002 for $1.15/month?", "Buy +15550100002"),
@@ -705,7 +706,7 @@ def test_failed_number_says_something_went_wrong():
     ui = ScriptedUI([
         *add_a_line(),
         ("Your Twilio credentials", ["ACsid", "tokSECRET"]),
-        ("A new number or one you already have?", "A new number"),
+        ("A new number, or one already on", "A new number"),
         ("Where should the number be?", ["", ""]),
         ("Pick a number", "+15550100001"),
         ("Buy +15550100001", "Buy +15550100001"),
@@ -891,7 +892,7 @@ def buy_then(*after):
     return ScriptedUI([
         *add_a_line(),
         ("Your Twilio credentials", ["ACsid", "tokSECRET"]),
-        ("A new number or one you already have?", "A new number"),
+        ("A new number, or one already on", "A new number"),
         ("Where should the number be?", ["", ""]),
         ("Pick a number", "+15550100001"),
         ("Buy +15550100001 for $1.15/month?", "Buy +15550100001"),
@@ -913,7 +914,7 @@ def test_a_cancel_after_a_purchase_names_the_number():
     ui = ScriptedUI([
         *add_a_line("Telnyx"),
         ("Use the saved Telnyx key?", "Use the saved key"),
-        ("A new number or one you already have?", "One I already have"),
+        ("A new number, or one already on", "One already on my Telnyx account"),
         ("Which number?", "+15550100007"),
         ("Connect +15550100007 to ai-phone?", "Connect +15550100007"),
         ("Also forward your own mobile to it?", "Yes"),

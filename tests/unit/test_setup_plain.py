@@ -13,7 +13,7 @@ from tests.unit.test_setup_flow import FakeActions, ScriptedUI
 
 LINE_PAGE = Page(2, "How should people reach your agent?", "You can add more lines later by running setup again.",
                  checks=[Check("Twilio key", "works · 2 numbers on this account", True)])
-LINE_OPTIONS = [Option("A phone number", "Twilio or Telnyx · a new number or one you already have"),
+LINE_OPTIONS = [Option("A phone number", "Twilio or Telnyx · a new number, or one already on that account"),
                 Option("A SIP address", "free · softphones and other agents")]
 
 
@@ -48,7 +48,7 @@ def test_choose_prints_the_page_and_enter_takes_the_default(typed, capsys):
         "How should people reach your agent?",
         "You can add more lines later by running setup again.",
         "  ✓ Twilio key   works · 2 numbers on this account",
-        "  1) A phone number   Twilio or Telnyx · a new number or one you already have",
+        "  1) A phone number   Twilio or Telnyx · a new number, or one already on that account",
         "  2) A SIP address    free · softphones and other agents",
         "  b) Back",
         "Choose [2]: ",
@@ -242,7 +242,7 @@ def test_pressing_enter_never_buys_or_connects_a_number(capsys, monkeypatch):
     assert "Buy +15550100001 for $1.15/month?" in capsys.readouterr().out
 
     actions = FakeActions(exists=True, saved_keys=saved)
-    # Add a line, A phone number, Twilio, Use the saved key, One I already have, the first number, then Enter
+    # Add a line, A phone number, Twilio, Use the saved key, one already on the account, the first number, then Enter
     monkeypatch.setattr("builtins.input", EndOfInput(["", "", "", "", "2", ""] + [""] * 30))
     assert flow.run(PlainUI(), actions).code == 1
     assert "Connect +15550100007 to ai-phone?" in capsys.readouterr().out

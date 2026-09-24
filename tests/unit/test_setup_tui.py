@@ -892,7 +892,7 @@ def test_run_setup_names_a_purchase_that_a_second_ctrl_c_left(monkeypatch, capsy
         app = pilot.app
         # Add a line, A phone number, Twilio, the saved key, A new number
         for question in ("Give your AI", "How should people reach", "Which carrier?", "Use the saved Twilio key?",
-                         "A new number or one"):
+                         "A new number, or one"):
             await wait_for(pilot, app, showing(app, question))
             await pilot.press("enter")
         await wait_for(pilot, app, showing(app, "Where should the number be?"))
