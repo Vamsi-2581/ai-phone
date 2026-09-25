@@ -489,15 +489,21 @@ def caller_id(ui, actions, session: Session, carrier: str, name: str, creds: dic
                         lambda: actions.start_caller_id(carrier, creds, mine))
             verified = (typed_code(ui, actions, session, carrier, creds, step, name) if step.kind == "enter_code_in_cli"
                         else keyed_code(ui, actions, session, carrier, creds, step, name))
-            if verified:
-                actions.record_caller_id(line_id, mine, carrier)
-                session.note(f"line {line_id} calls out as {mine}")
         except Back:
             continue
         except ActionError as e:
             error = str(e)
             continue
-        if not verified:
+        if verified:
+            try:
+                actions.record_caller_id(line_id, mine, carrier)
+                session.note(f"line {line_id} calls out as {mine}")
+            except ActionError as e:  # the carrier has accepted it by now: never lose that quietly
+                ui.choose(Page(LINE, f"{mine} is verified, but not saved",
+                               f"{mine} is verified with {name}; run: uv run ai-phone lines verify-caller-id "
+                               f"{line_id} {mine} --key-env <NAME> to record it.", error=str(e)),
+                          [Option("Continue")], back=False)
+        else:
             ui.choose(Page(LINE, "Verification did not complete",
                            f"Your agent still calls out as {number}. To try again: "
                            f"uv run ai-phone lines verify-caller-id {line_id} {mine} --key-env <NAME>"),

@@ -624,6 +624,28 @@ def test_three_wrong_codes_give_up_without_saving_anything():
     assert ui.menu("Verification did not complete")[3] is False
 
 
+def test_a_verification_the_config_will_not_record_is_never_silently_dropped():
+    """The carrier has accepted the number by now. If the config write fails, say so and name the command that
+    records it, instead of looping back as though nothing had happened."""
+    broken = "config.yaml is not valid YAML; fix it or move it away, then run setup again"
+    ui = connect_a_number(
+        ("Show your own number when the agent calls out?", "Yes"),
+        ("Your mobile number", ["+447700900123"]),
+        ("Enter the code", ["123456"]),
+        ("+447700900123 is verified, but not saved", "Continue"),
+        ("Everything works", "<quit>"),
+    )
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}, record_caller_id=ActionError(broken))
+    outcome = drive(ui, actions)
+    page = ui.questions("+447700900123 is verified, but not saved")[0]
+    assert page.detail == ("+447700900123 is verified with Telnyx; run: uv run ai-phone lines verify-caller-id "
+                           "telnyx +447700900123 --key-env <NAME> to record it.")
+    assert page.error == broken
+    assert ui.menu("+447700900123 is verified, but not saved")[3] is False
+    assert not ui.questions("Verification did not complete")
+    assert "calls out as" not in outcome.summary  # nothing was saved, so nothing claims it was
+
+
 def test_no_asks_the_carrier_nothing():
     ui = connect_a_number(CALLER_ID_NO, ("Everything works", "<quit>"))
     actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"})

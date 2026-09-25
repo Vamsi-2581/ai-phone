@@ -579,7 +579,24 @@ def test_list_with_no_configured_lines_shows_the_journals_instead_of_the_empty_h
     )
     (home / "lines" / "early.journal.json").write_text("{not json")
     assert main(["lines", "list"]) == 0
-    assert "  early        unreadable     bought · ?" in capsys.readouterr().out
+    assert capsys.readouterr().out == (
+        "Unfinished setups\n"
+        "  early        unreadable · remove: ai-phone lines remove early --local-only\n"
+    )
+
+
+def test_list_never_offers_to_resume_a_journal_that_has_no_number(home: Path, capsys):
+    """`target` is the first step provisioning writes, before any carrier call, so a journal without it reached no
+    carrier step and has nothing for `resume` to pick up. Claiming "bought" and offering `resume` would send people
+    to a command that fails at once."""
+    odd = Journal.open(home / "lines", "odd", "fake")
+    odd.start("profile", name="ai-phone:odd")
+    capsys.readouterr()
+    assert main(["lines", "list"]) == 0
+    assert capsys.readouterr().out == (
+        "Unfinished setups\n"
+        "  odd          nothing created yet · remove: ai-phone lines remove odd --local-only\n"
+    )
 
 
 def test_list_without_lines_or_journals_still_suggests_adding_one(home: Path, capsys):

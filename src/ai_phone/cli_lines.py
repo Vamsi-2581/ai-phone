@@ -497,9 +497,13 @@ def cmd_remove(a) -> int:
 def _unfinished_row(line_id: str, setup: JournalSetup) -> str:
     """One row of the unfinished block: how far the journal got, and the command that finishes or undoes it."""
     local_only = f"ai-phone lines remove {line_id} --local-only"
-    if setup.number is None:  # the journal was opened, but nothing exists at the carrier to finish or release
+    if setup.state == "?":  # the file could not be read: claim nothing about what it holds
+        return f"  {line_id:12s} unreadable · remove: {local_only}"
+    if setup.number is None or not setup.resumable:
+        # `target` is the first step provision_flow writes, before any carrier call, so a journal without it
+        # reached no carrier step — and there is nothing for `resume` to pick up
         return f"  {line_id:12s} nothing created yet · remove: {local_only}"
-    where = "unreadable" if setup.number == "?" else setup.number
+    where = setup.number
     got = f"{'brought' if setup.brought else 'bought'} · {setup.state}"
     if setup.state == "rollback_failed":  # the carrier refused the undo, so only a person can clear it
         how = f"finish in the carrier portal, then: {local_only}"

@@ -366,10 +366,10 @@ class Actions:
         """The carrier accepted it: remember the verified number and call out as it, which is the point of the step
         (`ai-phone lines verify-caller-id` only records it, and says to set caller_id by hand)."""
         def change(raw: dict) -> None:
-            ln = _section(raw, "lines").get(line_id)
+            lines = raw.get("lines")
+            ln = lines.get(line_id) if isinstance(lines, dict) else None  # the line itself, to change in place
             if not isinstance(ln, dict):
                 raise ActionError(f"no line {line_id} to verify a number for")
-            ln = raw["lines"][line_id]
             verified = [v for v in (ln.get("verified_caller_ids") or []) if v.get("number") != number]
             verified.append({"number": number, "provider": carrier,
                              "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
