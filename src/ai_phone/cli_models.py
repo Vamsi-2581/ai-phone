@@ -1,4 +1,4 @@
-"""`ai-phone models pull [--tier t4|t9]`: download the models for this config (setup time only; networked)."""
+"""`ai-phone models pull [--tier <model>]`: download the models for this config (setup time only; networked)."""
 from __future__ import annotations
 
 import os
@@ -31,7 +31,8 @@ def _wanted() -> tuple[str, str]:
     raw = raw if isinstance(raw, dict) else {}
     tier = (raw.get("models") if isinstance(raw.get("models"), dict) else {}).get("tier")
     kind = (raw.get("brain") if isinstance(raw.get("brain"), dict) else {}).get("kind")
-    tier, kind = (tier if tier in ("auto", "t4", "t9") else None), (kind if kind in ("local", "openai_compatible") else None)
+    tier = tier if isinstance(tier, str) and models.known_tier(tier) else None
+    kind = kind if kind in ("local", "openai_compatible") else None
     used = " and ".join(f"{k} {v}" for k, v in (("models.tier", tier), ("brain.kind", kind)) if v)
     print(f"warning: the config does not load ({why}); " + (f"using {used} from it" if used else "using the defaults"))
     return tier or Config().models.tier, kind or Config().brain.kind
@@ -39,7 +40,11 @@ def _wanted() -> tuple[str, str]:
 
 def cmd_pull(a) -> int:
     tier, kind = _wanted()
-    tier = a.tier or models.resolve_tier(tier)
+    try:
+        tier = models.resolve_tier(a.tier or tier)
+    except models.ModelsError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     repos = models.missing(tier, kind)
     if not repos:
         print("All models are already downloaded.")
@@ -71,5 +76,5 @@ def register(sub) -> None:
     m = sub.add_parser("models", help="download the speech and language models (setup time only)")
     ms = m.add_subparsers(dest="models_cmd", required=True)
     p = ms.add_parser("pull", help="download what this config needs and is not on this Mac yet")
-    p.add_argument("--tier", choices=["t4", "t9"], help="the local model size (default: the config's, or by memory)")
+    p.add_argument("--tier", help="a key from the model catalog, or a Hub repo id (default: the config's, or by memory)")
     p.set_defaults(func=cmd_pull)

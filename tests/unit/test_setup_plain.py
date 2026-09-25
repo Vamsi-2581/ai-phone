@@ -190,7 +190,7 @@ def sip_setup_answers():
     return [
         "",   # Welcome: Continue
         "",   # Brain: On this Mac
-        "",   # size: Qwen 4B
+        "",   # model: Qwen3.5 4B
         "2",  # Line: A SIP address
         "", "",  # name and address: defaults
         "", "", "",  # voice group, voice, Use this voice
@@ -277,7 +277,7 @@ def test_run_setup_in_a_terminal_runs_the_full_screen_app(capsys, monkeypatch, t
 
     def run_tui(flow_fn, summary=None):
         seen["flow"] = flow_fn(ScriptedUI([("Give your AI", "Continue"), ("Where should your agent think?", "On this Mac"),
-                                           ("Which model size?", "<default>"), ("How should people reach", "<quit>")]))
+                                           ("Which model?", "<default>"), ("How should people reach", "<quit>")]))
         seen["summary"] = summary()  # what a run the app had to leave early says: the same session
         return Outcome(0, "Saved\n  summary")
 

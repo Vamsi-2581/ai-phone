@@ -18,9 +18,52 @@ def plenty_of_disk(monkeypatch, free=100 * 10**9):
     monkeypatch.setattr(models.shutil, "disk_usage", lambda p: types.SimpleNamespace(total=free, used=0, free=free))
 
 
+TABLE = [  # the curated list, in the order the wizard offers it
+    ("t4", "mlx-community/Qwen3.5-4B-MLX-4bit", "Qwen3.5 4B", 3.1, 16, True, "tested · first word in 0.9 s"),
+    ("t9", "mlx-community/Qwen3.5-9B-MLX-4bit", "Qwen3.5 9B", 6.0, 32, True, "tested · smarter, swaps below 32 GB"),
+    ("qwen2b", "mlx-community/Qwen3.5-2B-MLX-4bit", "Qwen3.5 2B", 1.8, 8, False, "untested for calls · for 8 GB Macs"),
+    ("llama3b", "mlx-community/Llama-3.2-3B-Instruct-4bit", "Llama 3.2 3B", 1.8, 16, False, "untested for calls"),
+    ("gemma4b", "mlx-community/gemma-3-4b-it-4bit", "Gemma 3 4B", 3.4, 16, False, "untested for calls"),
+    ("mistral7b", "mlx-community/Mistral-7B-Instruct-v0.3-4bit", "Mistral 7B", 4.1, 24, False, "untested for calls"),
+    ("gemma12b", "mlx-community/gemma-3-12b-it-4bit", "Gemma 3 12B", 8.1, 32, False, "untested for calls"),
+]
+
+
+def test_the_catalog_holds_the_curated_list_in_order():
+    assert [(m.key, m.repo, m.name, m.weights_gb, m.needs_gb, m.tested, m.note) for m in models.CATALOG.values()] == TABLE
+    assert all(key == m.key for key, m in models.CATALOG.items())
+    assert LLM == {key: repo for key, repo, *_ in TABLE}  # the old tier → repo view still works
+
+
+def test_resolve_tier_takes_auto_a_catalog_key_or_a_hub_repo(monkeypatch):
+    monkeypatch.setattr(models, "memory_gb", lambda: 32)
+    assert models.resolve_tier("auto") == "t9"
+    assert models.resolve_tier("gemma12b") == "gemma12b"
+    assert models.resolve_tier("org/my-own-4bit") == "org/my-own-4bit"  # hand-edited configs may name any repo
+    with pytest.raises(ModelsError) as bad:
+        models.resolve_tier("t5")
+    assert "t5" in str(bad.value) and "gemma12b" in str(bad.value) and "org/name" in str(bad.value)
+    assert not models.known_tier("t5") and models.known_tier("auto") and models.known_tier("org/x")
+
+
+def test_repo_for_follows_the_catalog_and_passes_a_repo_through(monkeypatch):
+    monkeypatch.setattr(models, "memory_gb", lambda: 8)
+    assert models.repo_for("qwen2b") == "mlx-community/Qwen3.5-2B-MLX-4bit"
+    assert models.repo_for("auto") == LLM["t4"]
+    assert models.repo_for("org/my-own-4bit") == "org/my-own-4bit"
+
+
+def test_fits_compares_what_a_model_needs_with_this_Mac():
+    assert models.fits("qwen2b", 8) and not models.fits("t4", 8)
+    assert models.fits("t9", 32) and not models.fits("gemma12b", 24)
+    assert models.fits("org/unknown", 8)  # nothing is known about a hand-picked repo, so it is not refused
+
+
 def test_needed_depends_on_the_brain():
     assert models.needed("t4", "local") == [STT, TTS, LLM["t4"]]
     assert models.needed("t9", "openai_compatible") == [STT, TTS]
+    assert models.needed("gemma4b", "local") == [STT, TTS, "mlx-community/gemma-3-4b-it-4bit"]
+    assert models.needed("org/mine", "local") == [STT, TTS, "org/mine"]
 
 
 def test_recommended_tier(monkeypatch):
@@ -256,5 +299,7 @@ def test_constants_match_the_backends():
 
     assert LLM["t4"] == mlx_lm_backend.T4
     assert LLM["t9"] == mlx_lm_backend.T9
+    assert mlx_lm_backend.make_t4().model_id == LLM["t4"] and mlx_lm_backend.make_t9().model_id == LLM["t9"]
+    assert mlx_lm_backend.make_llm("org/anything").model_id == "org/anything"
     assert STT == inspect.signature(mlx_parakeet.ParakeetSTT).parameters["model_id"].default
     assert TTS == inspect.signature(mlx_kokoro.KokoroTTS).parameters["model_id"].default

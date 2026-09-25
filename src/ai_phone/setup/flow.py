@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import ai_phone
-from ai_phone import paths, voices
+from ai_phone import models, paths, voices
 from ai_phone.config import E164_RE, HOST_RE, LINE_ID_RE, SIP_USER_RE
 from ai_phone.pipeline.prompts import DISCLOSURE
 from ai_phone.setup.actions import CARRIER_KEYS, LOOPBACK, ActionError, LineResult
@@ -21,7 +21,6 @@ from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
 
 WELCOME, BRAIN, LINE, VOICE, CALLERS, CHECK, DONE = range(7)
 SAMPLE = "Hi, this is your agent. This is how I sound on the phone."
-TIERS = (("t4", "Qwen 4B"), ("t9", "Qwen 9B"))
 CARRIERS = (("twilio", "Twilio"), ("telnyx", "Telnyx"))
 VOICE_GROUPS = (("af", "American · female"), ("am", "American · male"), ("bf", "British · female"), ("bm", "British · male"))
 FORWARD_WHEN = ("no-answer", "busy", "unreachable", "all")
@@ -212,7 +211,14 @@ def home_dir() -> str:
 
 
 def tier_name(tier: str) -> str:
-    return dict(TIERS).get(tier, tier)
+    """What to call the local brain: its catalog name, or the repo id when the config names one by hand."""
+    entry = models.CATALOG.get(tier)
+    return entry.name if entry else tier
+
+
+def model_hint(entry, mem_gb: int) -> str:
+    more = "" if entry.needs_gb <= mem_gb else " · more than this Mac has"
+    return f"{entry.note} · needs {entry.needs_gb} GB{more}"
 
 
 # ---- Welcome -----------------------------------------------------------------------------------
@@ -258,17 +264,26 @@ def brain(ui, actions, session: Session) -> None:
     if where == 1:
         return brain_endpoint(ui, actions, session, cur)
     mem = actions.machine().memory_gb
-    recommended = "t9" if mem >= 32 else "t4"
-    tiers = [t for t, _ in TIERS]
-    default = tiers.index(cur.tier if cur.brain_kind == "local" and cur.tier in tiers else recommended)
+    catalog = list(models.CATALOG.values())
+    keys = [m.key for m in catalog]
+    default = keys.index(cur.tier if cur.brain_kind == "local" and cur.tier in keys else models.recommended_tier(mem))
     error = ""
     while True:
-        default = ui.choose(Page(BRAIN, "Which model size?", f"This Mac has {mem} GB of memory, so {tier_name(recommended)} "
-                                 "is recommended.", error=error),
-                            [Option("Qwen 4B", "fastest · best below 32 GB of memory"),
-                             Option("Qwen 9B", "smarter · needs 32 GB or more")], default=default)
+        default = ui.choose(Page(BRAIN, "Which model?", f"This Mac has {mem} GB of memory. Models that need more "
+                                 "will swap and answer slowly.", error=error),
+                            [Option(m.name, model_hint(m, mem)) for m in catalog], default=default)
+        error = ""
+        chosen = catalog[default]
+        if not models.fits(chosen.key, mem):  # a model bigger than the memory works, slowly: say so before saving it
+            try:
+                if ui.choose(Page(BRAIN, f"Use {chosen.name} anyway?", f"It needs {chosen.needs_gb} GB; this Mac has "
+                                  f"{mem} GB, so it will swap and answer slowly."),
+                             [Option("Use it anyway")], default=1) != 0:
+                    continue
+            except Back:  # Esc or the Back option: choose again, with this model still picked
+                continue
         try:
-            actions.save_brain_local(tiers[default])
+            actions.save_brain_local(chosen.key)
             session.note("the brain")
             return
         except ActionError as e:

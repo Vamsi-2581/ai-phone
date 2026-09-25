@@ -121,6 +121,9 @@ class FakeDaemon:
     (["run"], "", "t4"),                                   # models.tier: auto on 24 GB
     (["run"], "models:\n  tier: t9\n", "t9"),              # the config's tier
     (["run", "--tier", "t4"], "models:\n  tier: t9\n", "t4"),  # the flag wins
+    (["run", "--tier", "gemma4b"], "", "gemma4b"),         # any catalog key
+    (["run", "--tier", "org/my-own-4bit"], "", "org/my-own-4bit"),  # or a repo named by hand
+    (["run", "--tier", "auto"], "models:\n  tier: t9\n", "t4"),   # auto still picks by memory
 ])
 def test_run_follows_the_config_tier(home, monkeypatch, argv, config, tier):
     import asyncio
@@ -190,3 +193,23 @@ def test_run_still_logs_at_info(home, monkeypatch):
     with fresh_logging() as root:
         assert main(["run", "--fake"]) == 0
         assert handled(root, "ai-phone", logging.INFO)
+
+
+def test_a_model_nobody_has_heard_of_is_a_clean_error(home, capsys, monkeypatch):
+    import ai_phone.daemon
+
+    monkeypatch.setattr(ai_phone.daemon, "Daemon", FakeDaemon)
+    (home / "config.yaml").write_text("")
+    assert main(["run", "--tier", "t5", "--fake"]) == 2
+    err = capsys.readouterr().err.splitlines()
+    assert err == ["error: unknown model 't5'", f"Use {models.tier_help()}."]
+    assert main(["models", "pull", "--tier", "t5"]) == 2
+    assert capsys.readouterr().err.splitlines() == ["error: unknown model 't5'", f"Use {models.tier_help()}."]
+
+
+def test_pull_takes_any_catalog_key_or_a_repo(home, monkeypatch, capsys):
+    asked = []
+    monkeypatch.setattr(models, "missing", lambda tier, brain: asked.append((tier, brain)) or [])
+    assert main(["models", "pull", "--tier", "gemma12b"]) == 0
+    assert main(["models", "pull", "--tier", "org/my-own-4bit"]) == 0
+    assert asked == [("gemma12b", "local"), ("org/my-own-4bit", "local")]

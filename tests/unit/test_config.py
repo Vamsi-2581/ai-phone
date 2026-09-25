@@ -108,6 +108,14 @@ def test_grammar_errors_name_the_field(tmp_path: Path, patch: str, msg: str):
         _load(tmp_path, bad)
 
 
+def test_models_tier_takes_auto_a_catalog_key_or_a_repo(tmp_path: Path):
+    for tier in ("auto", "t4", "gemma12b", "org/my-own-4bit"):
+        assert _load(tmp_path, V2 + f"models:\n  tier: {tier}\n").models.tier == tier
+    with pytest.raises(ConfigError) as bad:
+        _load(tmp_path, V2 + "models:\n  tier: t99\n")
+    assert "config.models.tier" in str(bad.value) and "gemma12b" in str(bad.value) and "org/name" in str(bad.value)
+
+
 def test_trusted_mode_requires_peers(tmp_path: Path):
     bad = V2.replace('    trusted_peers: ["203.0.113.7"]\n', "")
     with pytest.raises(ConfigError, match="trusted_peers"):

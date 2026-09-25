@@ -67,7 +67,10 @@ ai-phone call sip:agents@friend.example.org --line agents
 ai-phone call +447700900123
 ai-phone status
 
-# Any brain: LM Studio, llama.cpp, or your own agent behind an OpenAI-compatible endpoint
+# The brain on this Mac: one of t4, t9, qwen2b, llama3b, gemma4b, mistral7b, gemma12b (the catalog in models.py),
+# auto to pick by memory, or any mlx-lm 4-bit repo id
+#   models: {tier: gemma4b}
+# Or any brain: LM Studio, llama.cpp, or your own agent behind an OpenAI-compatible endpoint
 #   brain: {kind: openai_compatible, base_url: "http://127.0.0.1:1234/v1", model: "…"}
 # And the voice
 #   tts: {voice: bf_emma, speed: 1.0}   (English voices: af_/am_ American, bf_/bm_ British)

@@ -364,7 +364,7 @@ LLM worker specifics: `mlx_lm.load(model_id)`; `make_prompt_cache(model)` primed
 
 - Weights live in the Hugging Face cache (`~/.cache/huggingface/hub`, or wherever `HF_HOME` points), where the backends load them by repo id (amended 2026-09-17; `models.home` is not used). They are fetched only by `ai-phone models pull` and `ai-phone setup`, both through `ai_phone.models.pull`; never at daemon runtime.
 - What is needed: the STT and TTS models always, and the tier's LLM only for the local brain. A model counts as present when its cached snapshot has a `config.json` and weights. `pull` fetches only what is missing, first checks that the download plus 1 GB fits on the disk, reports progress, and picks up an interrupted download where it stopped. Checking every file against a per-tier manifest (sizes and SHA-256) is left to a later check command (§7.3).
-- Tiers: `t9` (9B LLM, ~7 GB resident total) and `t4` (4B LLM, ~4 GB). Selection: `ai-phone run --tier`, else `models.tier` in the config (setup writes it); `auto` picks by total memory: 32 GB or more → t9, else t4 (the 9B tier does not fit beside normal apps on 24 GB, §15).
+- Models: the curated catalog lives in `models.py` (`CATALOG`), one entry per local brain with its repo, name, weights size, the memory it wants and whether ai-phone has made calls with it: `t4`, `t9`, `qwen2b`, `llama3b`, `gemma4b`, `mistral7b`, `gemma12b`. Selection: `ai-phone run --tier`, else `models.tier` in the config (setup writes it); `auto` picks by total memory: 32 GB or more → t9, else t4 (the 9B model does not fit beside normal apps on 24 GB, §15). A `models.tier` containing a `/` is taken as a Hub repo id, so a hand-edited config can run any mlx-lm model; anything else is refused with the list of keys.
 - Environment in every process: `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `TOKENIZERS_PARALLELISM=false`.
 
 ### 5.6 Memory budget (macOS, t9) **[P]**
@@ -405,7 +405,7 @@ Two resamples on the outbound path (24→16 in Python, 16→8 in PJSIP) and one 
 
 | Command | Does |
 |---|---|
-| `ai-phone run [--lan] [--tier t4\|t9]` | Start the daemon in the foreground. `--tier` defaults to `models.tier` (§5.5). `--lan` overrides `accept_invites_from` to `lan` and skips registration if no trunk is configured (dev and the timed install test) |
+| `ai-phone run [--lan] [--tier <model>]` | Start the daemon in the foreground. `--tier` takes a catalog key or a Hub repo id and defaults to `models.tier` (§5.5). `--lan` overrides `accept_invites_from` to `lan` and skips registration if no trunk is configured (dev and the timed install test) |
 | `ai-phone call <target> [--prompt TEXT \| --prompt-file PATH] [--relay] [--line ID] [--timeout-sec N] [--json] [--yes]` | Place a call through the running daemon. Phone agent mode (no `--relay`): ai-phone's model holds the conversation with the prompt, and the command blocks until the call ends and prints the result with the transcript. `--relay`: returns once the call is answered; the calling AI goes on with `listen`, `say` and `hangup` (§14b.1) |
 | `ai-phone listen [--call ID] [--timeout-sec N] [--json]` | Wait (default 60 s) for the next event of the relay call in progress (`heard`, `ended`) or, with no call in progress, for an incoming call (`incoming`) |
 | `ai-phone say [--call ID] [--json] TEXT…` | Speak on the relay call in progress; returns `said` or `interrupted` |
@@ -413,7 +413,7 @@ Two resamples on the outbound path (24→16 in Python, 16→8 in PJSIP) and one 
 | `ai-phone status [--last-call]` | Registration state per line, the call in progress, the brain in use; `--last-call` summarises the last call's turns |
 | `ai-phone lines …` | Buy or connect numbers; add, divert, verify and remove lines (§14a.4) |
 | `ai-phone setup [--plain]` | The setup wizard (§10.3): a brain, a line, a voice and what callers hear, then a check. Full-screen in a terminal; `--plain`, or no terminal, asks the same questions as numbered prompts |
-| `ai-phone models pull [--tier t4\|t9]` | Download the models this config needs (setup time; with `lines` and `setup`, the only networked commands) |
+| `ai-phone models pull [--tier <model>]` | Download the models this config needs (setup time; with `lines` and `setup`, the only networked commands) |
 | `ai-phone latency` (M5) | The TUI latency view |
 
 ### 7.2 Control socket **[D]**
@@ -473,7 +473,7 @@ rtp:
   port_max: 10100
 codecs: [PCMU, PCMA]                 # order = priority; only these are enabled
 models:
-  tier: auto                         # auto | t9 | t4
+  tier: auto                         # auto, a catalog key (§5.5), or a Hub repo id
   home: "~/.ai-phone/models"
 conversation:
   greeting: "Hi, this is the house. What can I do for you?"
@@ -561,7 +561,7 @@ Each step asks only what applies to the earlier answers:
 | Step | Asks | Saves |
 |---|---|---|
 | Welcome | Shows checks of this Mac: SIP library, memory and the recommended model size, models, config. With a config already there: add a line, change the brain, change the voice, change what callers hear, or run every step | — |
-| Brain | On this Mac (Qwen 4B or 9B; 9B is recommended from 32 GB of memory), or your own OpenAI-compatible endpoint: URL, model and an optional key, then one short test request | `brain:`, `models.tier`; the key in `secrets.env` |
+| Brain | On this Mac (one model from the catalog in `models.py`; the list shows what each needs, and one that needs more memory than this Mac has is confirmed first), or your own OpenAI-compatible endpoint: URL, model and an optional key, then one short test request | `brain:`, `models.tier`; the key in `secrets.env` |
 | Line | A phone number, a free SIP address, your own SIP trunk, or skip. For a phone number: Twilio or Telnyx; the key is checked with a free read-only request that lists the account's numbers; then a new number, bought only after a confirmation that shows the number and its monthly price, or one already on the account, connected for free (§14a.3); then, if wanted, the codes to divert your own mobile to it | the line; carrier keys and SIP passwords in `secrets.env`; the carrier journal in `lines/` |
 | Voice | An English voice from the speech model, grouped American/British and female/male; each can be played on this Mac's speakers first. Then the speed | `tts:` |
 | Callers | The greeting, the instructions for when no AI is listening, and the daily limit on outbound calls (20 unless the config has one) | `inbound:`, `calls.daily_limit` |
@@ -570,7 +570,7 @@ Each step asks only what applies to the earlier answers:
 
 Everything is saved under `~/.ai-phone/` (or `AI_PHONE_HOME`): `config.yaml` (0600) and `secrets.env` (0600, written only with `write_secret`). A step's answers are kept in memory and written when the step completes, so cancelling never leaves half a step behind. The exception is a number: once it is bought or connected, its line is written at once, because the number is set up at the carrier. Running setup again reads what is there and changes only what is picked. Keys and passwords are typed into hidden fields and never shown, logged or put in an error. Setup never places a phone call; the voice sample plays locally.
 
-### 10.4 Models (`ai-phone models pull [--tier t4|t9]`)
+### 10.4 Models (`ai-phone models pull [--tier <model>]`)
 
 Downloads what the config needs and is not on this Mac yet (§5.5), for the tier given, else the config's, else the one memory suggests. It lists the models and the download size, shows progress in a terminal, and exits 0 when done (or when nothing is missing) and 3 on an error such as too little disk space. Setup's Check step uses the same function. With `lines` and `setup`, it is the only networked command; the daemon never downloads.
 

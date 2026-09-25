@@ -789,3 +789,30 @@ async def test_an_incoming_call_with_blank_instructions_gets_the_inbound_default
     composed = FakeTC.last.args[11]
     assert "calling on behalf" not in composed
     assert composed == prompts.system_prompt("FIXED", InboundConfig().instructions)
+
+
+def test_the_llm_worker_runs_the_model_the_tier_names(tmp_path, monkeypatch):
+    """One factory for every local brain: the catalog key (or a repo named by hand) becomes its model_id."""
+    import ai_phone.daemon
+
+    made = []
+
+    class Recorder:
+        def __init__(self, name, factory, *a, **kw):
+            made.append((name, factory, kw.get("factory_args")))
+
+        async def start(self):
+            raise RuntimeError("far enough")
+
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    monkeypatch.setattr(ai_phone.daemon, "WorkerClient", Recorder)
+    for tier, repo in (("gemma4b", "mlx-community/gemma-3-4b-it-4bit"), ("org/my-own-4bit", "org/my-own-4bit")):
+        made.clear()
+        with pytest.raises(SystemExit):
+            asyncio.run(Daemon(Config(), tier, tmp_path, lan=True, fake=False).run())
+        assert ("llm", "ai_phone.services.backends.mlx_lm_backend:make_llm", {"model_id": repo}) in made
+
+    made.clear()
+    with pytest.raises(SystemExit):
+        asyncio.run(Daemon(Config(), "gemma12b", tmp_path, lan=True, fake=True).run())
+    assert ("llm", "ai_phone.services.backends.fake:FakeLLM", None) in made  # the fake brain ignores the tier

@@ -7,14 +7,38 @@ import os
 import shutil
 import subprocess
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 STT = "mlx-community/parakeet-tdt-0.6b-v2"
 TTS = "mlx-community/Kokoro-82M-bf16"
-LLM = {"t4": "mlx-community/Qwen3.5-4B-MLX-4bit", "t9": "mlx-community/Qwen3.5-9B-MLX-4bit"}
 BIG_MEMORY_GB = 32
 DOWNLOADING = ".ai-phone-downloading"  # in a repo's cache folder while `pull` has not finished it
+
+
+@dataclass(frozen=True)
+class LocalModel:
+    """One entry of the curated list of brains that run on this Mac."""
+    key: str           # what `models.tier` holds in the config
+    repo: str          # the Hugging Face repo the weights come from
+    name: str          # what the wizard shows
+    weights_gb: float  # what the download costs
+    needs_gb: int      # the memory it wants; less than this and macOS swaps, which makes it answer slowly
+    tested: bool       # ai-phone has made calls with it
+    note: str
+
+
+CATALOG: dict[str, LocalModel] = {m.key: m for m in (
+    LocalModel("t4", "mlx-community/Qwen3.5-4B-MLX-4bit", "Qwen3.5 4B", 3.1, 16, True, "tested · first word in 0.9 s"),
+    LocalModel("t9", "mlx-community/Qwen3.5-9B-MLX-4bit", "Qwen3.5 9B", 6.0, 32, True, "tested · smarter, swaps below 32 GB"),
+    LocalModel("qwen2b", "mlx-community/Qwen3.5-2B-MLX-4bit", "Qwen3.5 2B", 1.8, 8, False, "untested for calls · for 8 GB Macs"),
+    LocalModel("llama3b", "mlx-community/Llama-3.2-3B-Instruct-4bit", "Llama 3.2 3B", 1.8, 16, False, "untested for calls"),
+    LocalModel("gemma4b", "mlx-community/gemma-3-4b-it-4bit", "Gemma 3 4B", 3.4, 16, False, "untested for calls"),
+    LocalModel("mistral7b", "mlx-community/Mistral-7B-Instruct-v0.3-4bit", "Mistral 7B", 4.1, 24, False, "untested for calls"),
+    LocalModel("gemma12b", "mlx-community/gemma-3-12b-it-4bit", "Gemma 3 12B", 8.1, 32, False, "untested for calls"),
+)}
+LLM = {key: m.repo for key, m in CATALOG.items()}  # the tier → repo view the backends and older code use
 
 
 class ModelsError(RuntimeError):
@@ -32,12 +56,39 @@ def recommended_tier(mem_gb: int) -> str:
     return "t9" if mem_gb >= BIG_MEMORY_GB else "t4"
 
 
+def known_tier(tier: str) -> bool:
+    """Whether `models.tier` names something runnable, without asking this Mac how much memory it has."""
+    return tier == "auto" or tier in CATALOG or "/" in tier
+
+
+def tier_help() -> str:
+    return f"auto, one of {', '.join(CATALOG)}, or a Hub repo id like org/name"
+
+
 def resolve_tier(tier: str) -> str:
-    return recommended_tier(memory_gb()) if tier == "auto" else tier
+    """The catalog key (or raw repo id) to run: "auto" picks by memory, anything with a "/" is a repo someone
+    named by hand in the config."""
+    if tier == "auto":
+        return recommended_tier(memory_gb())
+    if known_tier(tier):
+        return tier
+    raise ModelsError(f"unknown model {tier!r}\nUse {tier_help()}.")
+
+
+def repo_for(tier: str) -> str:
+    key = resolve_tier(tier)
+    entry = CATALOG.get(key)
+    return entry.repo if entry else key
+
+
+def fits(key: str, mem_gb: int) -> bool:
+    """Whether this Mac has the memory the model wants. A repo named by hand is unknown, so it is not refused."""
+    entry = CATALOG.get(key)
+    return True if entry is None else entry.needs_gb <= mem_gb
 
 
 def needed(tier: str, brain_kind: str) -> list[str]:
-    return [STT, TTS] + ([LLM[tier]] if brain_kind == "local" else [])
+    return [STT, TTS] + ([repo_for(tier)] if brain_kind == "local" else [])
 
 
 def local_path(repo: str) -> Path | None:

@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from ai_phone import paths
+from ai_phone import models, paths
 from ai_phone.call_guard import DailyCounter, is_emergency
 from ai_phone.calls import CallRecord, CallRegistry, ListenerBusy
 from ai_phone.config import Config, InboundConfig, LineConfig, line_password_env
@@ -34,10 +34,10 @@ from ai_phone.telephony.state import LineStatus, StateFile, next_state
 log = logging.getLogger("ai-phone")
 FACTORIES = {
     "real": {"stt": "ai_phone.services.backends.mlx_parakeet:ParakeetSTT",
-             "llm": {"t9": "ai_phone.services.backends.mlx_lm_backend:make_t9", "t4": "ai_phone.services.backends.mlx_lm_backend:make_t4"},
+             "llm": "ai_phone.services.backends.mlx_lm_backend:make_llm",  # one factory; models.tier names the weights
              "tts": "ai_phone.services.backends.mlx_kokoro:KokoroTTS"},
     "fake": {"stt": "ai_phone.services.backends.fake:FakeSTT",
-             "llm": {"t9": "ai_phone.services.backends.fake:FakeLLM", "t4": "ai_phone.services.backends.fake:FakeLLM"},
+             "llm": "ai_phone.services.backends.fake:FakeLLM",  # the fake brain is the same whatever the tier says
              "tts": "ai_phone.services.backends.fake:FakeTTS"},
 }
 APOLOGY = "Sorry, I lost my train of thought. Could you say that again?"
@@ -175,7 +175,8 @@ class Daemon:
                                              "first_token_timeout_ms": b.first_token_timeout_ms, "stream_idle_timeout_ms": b.stream_idle_timeout_ms,
                                              "max_response_chars": b.max_response_chars})
         else:
-            llm = WorkerClient("llm", F["llm"][self.tier], loop, None, None, {"system_prompt": default_prompt, **wa}, keep_warm_sec=kw)
+            llm = WorkerClient("llm", F["llm"], loop, None, None, {"system_prompt": default_prompt, **wa},
+                               factory_args=None if self.fake else {"model_id": models.repo_for(self.tier)}, keep_warm_sec=kw)
         tts = WorkerClient("tts", F["tts"], loop, None, tts_out, dict(wa),
                            factory_args=None if self.fake else {"voice": self.cfg.tts.voice, "speed": self.cfg.tts.speed}, keep_warm_sec=kw)
         tel: Telephony | None = None
@@ -215,7 +216,8 @@ class Daemon:
                        turn_log=turn_log, events=events, stop=stop, specs={s.id: s for s in specs})
             control = ControlServer(paths.socket_path(), lambda msg, send: self._control(msg, send, ctx))
             await control.start()
-            log.info("ready lines=%s brain=%s tier=%s warm=%s", [s.id for s in specs], self.cfg.brain.kind, self.tier, warm)
+            brain = self.cfg.brain.model if self.remote_brain else models.repo_for(self.tier)
+            log.info("ready lines=%s brain=%s model=%s warm=%s", [s.id for s in specs], self.cfg.brain.kind, brain, warm)
             print("ready", flush=True)
             while not stop.is_set():
                 try:

@@ -277,7 +277,7 @@ def test_new_setup_local_brain_sip_line_default_voice():
     ui = ScriptedUI([
         WELCOME_NEW,
         ("Where should your agent think?", "On this Mac"),
-        ("Which model size?", "<default>"),
+        ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["agent", "192.0.2.10"]),
         ("How should your agent sound?", "American · female"),
@@ -292,9 +292,10 @@ def test_new_setup_local_brain_sip_line_default_voice():
     outcome = drive(ui, actions)
     assert outcome.code == 0 and ui.closed and not ui.answers
     assert ui.steps == [WELCOME, BRAIN, LINE, VOICE, CALLERS, CHECK, DONE]
-    _question, options, default, _back = ui.menu("Which model size?")
-    assert options[default].label == "Qwen 4B"
-    assert ui.questions("Which model size?")[0].detail == "This Mac has 24 GB of memory, so Qwen 4B is recommended."
+    _question, options, default, _back = ui.menu("Which model?")
+    assert options[default].label == "Qwen3.5 4B"
+    assert ui.questions("Which model?")[0].detail == \
+        "This Mac has 24 GB of memory. Models that need more will swap and answer slowly."
     assert [o.label for o in ui.menu("How should people reach")[1]][3] == "Skip"
     assert ui.menu("How should people reach")[1][3].hint == "add one later"
     assert ui.menu("How should people reach")[1][0].hint == "Twilio or Telnyx · a new number, or one already on that account"
@@ -404,15 +405,15 @@ def test_a_config_that_does_not_load_is_shown_where_the_answer_is_saved():
     ui = ScriptedUI([
         ("Give your AI", "Change the brain"),
         ("Where should your agent think?", "On this Mac"),
-        ("Which model size?", "Qwen 9B"),
-        ("Which model size?", "<default>"),
+        ("Which model?", "Qwen3.5 9B"),
+        ("Which model?", "<default>"),
         ("A few things need attention", "<quit>"),
     ])
-    actions = FakeActions(exists=True, save_brain_local=Seq(ActionError(broken), None))
+    actions = FakeActions(exists=True, memory=32, save_brain_local=Seq(ActionError(broken), None))
     drive(ui, actions)
-    first, second = ui.questions("Which model size?")
+    first, second = ui.questions("Which model?")
     assert first.error == "" and second.error == broken
-    assert ui.menus[-2][2] == 1  # the size that was picked stays picked
+    assert ui.menus[-2][2] == 1  # the model that was picked stays picked
     assert actions.args("save_brain_local") == [("t9",), ("t9",)]
 
 
@@ -1015,22 +1016,94 @@ def test_price_size_and_plural_helpers():
     assert flow.plural(1, "number") == "1 number" and flow.plural(2, "number") == "2 numbers"
 
 
+def test_the_brain_step_offers_the_whole_model_catalog():
+    ui = ScriptedUI([
+        WELCOME_NEW,
+        ("Where should your agent think?", "On this Mac"),
+        ("Which model?", "<default>"),
+        ("How should people reach your agent?", "<quit>"),
+    ])
+    actions = FakeActions(memory=24)
+    drive(ui, actions)
+    _q, options, default, _back = ui.menu("Which model?")
+    assert ui.questions("Which model?")[0].detail == \
+        "This Mac has 24 GB of memory. Models that need more will swap and answer slowly."
+    assert [(o.label, o.hint) for o in options] == [
+        ("Qwen3.5 4B", "tested · first word in 0.9 s · needs 16 GB"),
+        ("Qwen3.5 9B", "tested · smarter, swaps below 32 GB · needs 32 GB · more than this Mac has"),
+        ("Qwen3.5 2B", "untested for calls · for 8 GB Macs · needs 8 GB"),
+        ("Llama 3.2 3B", "untested for calls · needs 16 GB"),
+        ("Gemma 3 4B", "untested for calls · needs 16 GB"),
+        ("Mistral 7B", "untested for calls · needs 24 GB"),
+        ("Gemma 3 12B", "untested for calls · needs 32 GB · more than this Mac has"),
+    ]
+    assert options[default].label == "Qwen3.5 4B"  # 24 GB: the recommended one
+    assert actions.args("save_brain_local") == [("t4",)]
+
+
+def test_a_model_this_Mac_cannot_hold_is_confirmed_first():
+    ui = ScriptedUI([
+        WELCOME_NEW,
+        ("Where should your agent think?", "On this Mac"),
+        ("Which model?", "Gemma 3 12B"),
+        ("Use Gemma 3 12B anyway?", "<default>"),  # Enter is Back: nothing is saved
+        ("Which model?", "Gemma 3 12B"),
+        ("Use Gemma 3 12B anyway?", "Use it anyway"),
+        ("How should people reach your agent?", "<quit>"),
+    ])
+    actions = FakeActions(memory=24)
+    drive(ui, actions)
+    assert ui.questions("Use Gemma 3 12B anyway?")[0].detail == \
+        "It needs 32 GB; this Mac has 24 GB, so it will swap and answer slowly."
+    assert ui.menu("Use Gemma 3 12B anyway?")[2:] == (1, True)  # the default is Back
+    assert [o.label for o in ui.menu("Use Gemma 3 12B anyway?")[1]] == ["Use it anyway"]
+    assert actions.args("save_brain_local") == [("gemma12b",)]
+    assert [m[2] for m in ui.menus if "Which model?" in m[0]] == [0, 6]  # Back leaves the big one picked
+
+
+def test_a_model_that_fits_is_saved_without_a_confirmation():
+    ui = ScriptedUI([
+        WELCOME_NEW,
+        ("Where should your agent think?", "On this Mac"),
+        ("Which model?", "Mistral 7B"),
+        ("How should people reach your agent?", "<quit>"),
+    ])
+    actions = FakeActions(memory=24)
+    drive(ui, actions)
+    assert not ui.questions("anyway?")
+    assert actions.args("save_brain_local") == [("mistral7b",)]
+
+
+def test_a_repo_named_by_hand_in_the_config_keeps_the_recommended_default():
+    """models.tier may be any Hub repo; the wizard cannot name that one, so it offers the recommended one."""
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "On this Mac"),
+        ("Which model?", "<default>"),
+        ("A few things need attention", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, memory=32)
+    actions.cur.tier = "org/my-own-4bit"
+    drive(ui, actions)
+    assert actions.args("save_brain_local") == [("t9",)]
+
+
 def test_back_at_the_first_question_goes_to_the_previous_step():
     ui = ScriptedUI([
         WELCOME_NEW,
         ("Where should your agent think?", "On this Mac"),
-        ("Which model size?", "Qwen 9B"),
+        ("Which model?", "Qwen3.5 9B"),
         ("How should people reach your agent?", "<back>"),
         ("Where should your agent think?", "On this Mac"),
-        ("Which model size?", "Qwen 4B"),
+        ("Which model?", "Qwen3.5 4B"),
         ("How should people reach your agent?", "Skip"),
         ("How should your agent sound?", "<quit>"),
     ])
-    actions = FakeActions()
+    actions = FakeActions(memory=32)
     assert drive(ui, actions).code == 1
     assert ui.steps == [WELCOME, BRAIN, LINE, BRAIN, LINE, VOICE]
     assert actions.args("save_brain_local") == [("t9",), ("t4",)]
-    assert ui.menus[-3][2] == 1  # the size menu now defaults to what was saved
+    assert ui.menus[-3][2] == 1  # the model menu now defaults to what was saved
 
 
 def test_back_later_in_a_step_restarts_it():
@@ -1039,7 +1112,7 @@ def test_back_later_in_a_step_restarts_it():
         ("Where should your agent think?", "My own endpoint"),
         ("Your endpoint", "<back>"),
         ("Where should your agent think?", "On this Mac"),
-        ("Which model size?", "<default>"),
+        ("Which model?", "<default>"),
         ("How should people reach your agent?", "<quit>"),
     ])
     actions = FakeActions()
@@ -1075,7 +1148,7 @@ def test_cancel_keeps_finished_steps_only():
     ui = ScriptedUI([
         WELCOME_NEW,
         ("Where should your agent think?", "On this Mac"),
-        ("Which model size?", "<default>"),
+        ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["", ""]),
         ("How should your agent sound?", "<quit>"),
@@ -1153,7 +1226,7 @@ def test_ctrl_c_during_a_purchase_says_it_may_be_half_done():
     ui = ScriptedUI([
         WELCOME_NEW,
         ("Where should your agent think?", "On this Mac"),
-        ("Which model size?", "<default>"),
+        ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["", ""]),
         ("How should your agent sound?", "American · female"),
@@ -1461,7 +1534,7 @@ def test_done_text_fits_the_page(monkeypatch):
         "         telnyx   +15550100003           Telnyx number · pending",
         "         desk     sip:desk@192.0.2.10    SIP address",
         "         odd      +15550100004           SIP trunk",
-        "Brain    on this Mac · Qwen 4B",
+        "Brain    on this Mac · Qwen3.5 4B",
         "Voice    Heart · American · female · 1.0×",
         "",
         "Start ai-phone",

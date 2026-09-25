@@ -71,7 +71,7 @@ class RtpConfig:
 
 @dataclass
 class ModelsConfig:
-    tier: Literal["auto", "t9", "t4"] = "auto"
+    tier: str = "auto"  # auto, a key from ai_phone.models.CATALOG, or a Hub repo id someone named by hand
     home: str = field(default_factory=lambda: str(paths.home() / "models"))
     wire_memory: bool = True  # keep model weights resident (macOS 15+); off = the pager may evict them while idle
     keep_warm_sec: int = 30  # idle workers run one tiny inference this often so the pager evicts other things first; 0 = off
@@ -399,6 +399,8 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
              "config.calls.relay_second_filler_sec: must come after relay_filler_after_ms")
     _require(c.relay_reply_timeout_sec > c.relay_second_filler_sec,
              "config.calls.relay_reply_timeout_sec: must be longer than relay_second_filler_sec")
+    from ai_phone import models  # here, not at import: `config` is loaded by every command
+    _require(models.known_tier(cfg.models.tier), f"config.models.tier: must be {models.tier_help()}")
     _require(0 < len(cfg.inbound.greeting.strip()) <= 500, "config.inbound.greeting: 1 to 500 characters")
     _require(len(cfg.inbound.instructions) <= 4000, "config.inbound.instructions: at most 4000 characters")
     users_seen: dict[str, str] = {}

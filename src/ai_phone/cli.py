@@ -22,7 +22,8 @@ def main(argv=None) -> int:
     r = sub.add_parser("run", help="start the daemon in the foreground")
     r.add_argument("--config", default=None, help=f"default: {paths.config_path()}")
     r.add_argument("--lan", action="store_true", help="every line accepts calls from the LAN, loopback and link-local (dev/test)")
-    r.add_argument("--tier", choices=["t9", "t4"], default=None, help="default: models.tier from the config (auto picks by memory)")
+    r.add_argument("--tier", default=None, help="a key from the model catalog, or a Hub repo id "
+                   "(default: models.tier from the config; auto picks by memory)")
     r.add_argument("--fake", action="store_true", help="fake model backends (tests)")
     cli_lines.register(sub)
     cli_status.register(sub)
@@ -42,7 +43,11 @@ def main(argv=None) -> int:
         cfg = load_config(Path(a.config).expanduser() if a.config else paths.config_path(), env={**os.environ, **load_secrets(paths.secrets_path())})
         for w in cfg.warnings:
             logging.getLogger("ai-phone").warning(w)
-        tier = a.tier or models.resolve_tier(cfg.models.tier)
+        try:
+            tier = models.resolve_tier(a.tier or cfg.models.tier)
+        except models.ModelsError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
         asyncio.run(Daemon(cfg, tier, Path(cfg.log.dir), a.lan, a.fake).run())
         return 0
     try:

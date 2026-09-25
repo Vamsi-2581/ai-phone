@@ -1,6 +1,7 @@
-"""Qwen3.5 via mlx-lm, in the worker's own process. Thinking disabled through the chat template.
+"""Any mlx-lm model (the catalog in models.py, or a repo named by hand) in the worker's own process.
+Thinking disabled through the chat template where the model has it.
 
-Prompt-cache reuse: Qwen3.5's cache is a hybrid (linear-attention state plus KV) and cannot be trimmed,
+Prompt-cache reuse: a hybrid cache (linear-attention state plus KV, as Qwen3.5 has) cannot be trimmed,
 so the reusable part is the prefix every call shares: the fixed phone instructions plus the call-section
 header. It is evaluated once at warm-up into a snapshot; each turn starts from a copy of that snapshot
 (0.2 ms) and evaluates only the call section, the history and the new user turn. The prefix is found as
@@ -15,8 +16,8 @@ import time
 from ai_phone.pipeline.prompts import cache_probe_sections, system_prompt as compose_prompt
 from ai_phone.services.base import Message
 
-T9 = "mlx-community/Qwen3.5-9B-MLX-4bit"
-T4 = "mlx-community/Qwen3.5-4B-MLX-4bit"
+T9 = "mlx-community/Qwen3.5-9B-MLX-4bit"  # models.LLM["t9"]
+T4 = "mlx-community/Qwen3.5-4B-MLX-4bit"  # models.LLM["t4"]
 
 
 class MlxLmLLM:
@@ -98,9 +99,13 @@ class MlxLmLLM:
         self.last_timings = saved
 
 
+def make_llm(model_id: str) -> MlxLmLLM:
+    return MlxLmLLM(model_id)
+
+
 def make_t9() -> MlxLmLLM:
-    return MlxLmLLM(T9)
+    return make_llm(T9)
 
 
 def make_t4() -> MlxLmLLM:
-    return MlxLmLLM(T4)
+    return make_llm(T4)

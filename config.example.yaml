@@ -48,7 +48,9 @@ rtp:
   port_min: 10000
   port_max: 10100
 models:
-  tier: auto                 # auto (t9 with 32 GB or more, else t4) | t9 (24 GB+) | t4 (16 GB)
+  tier: auto                 # auto (t9 with 32 GB or more, else t4), a model from the catalog in models.py —
+                             # t4 | t9 | qwen2b | llama3b | gemma4b | mistral7b | gemma12b — or any
+                             # mlx-lm 4-bit repo id, like "org/name"
   wire_memory: true          # ask MLX to keep the model weights resident (macOS 15+)
   keep_warm_sec: 30          # idle workers run one tiny inference this often, so on a crowded host macOS compresses
                              # something else first and the first reply after a quiet spell is not seconds late. 0 = off
