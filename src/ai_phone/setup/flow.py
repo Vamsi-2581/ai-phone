@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -24,6 +25,9 @@ TIERS = (("t4", "Qwen 4B"), ("t9", "Qwen 9B"))
 CARRIERS = (("twilio", "Twilio"), ("telnyx", "Telnyx"))
 VOICE_GROUPS = (("af", "American · female"), ("am", "American · male"), ("bf", "British · female"), ("bm", "British · male"))
 FORWARD_WHEN = ("no-answer", "busy", "unreachable", "all")
+CALLER_ID_TRIES = 3        # codes the carrier lets a person type, as `ai-phone lines verify-caller-id` does
+CALLER_ID_WAIT_SEC = 120   # how long to wait while the carrier's call asks for the code
+CALLER_ID_POLL_SEC = 3
 TRANSPORTS = ("udp", "tcp", "tls")
 DOWNLOAD_LEFT = "Setup cancelled. The download stops now and picks up where it left off next time."
 HALF_DONE = ("That carrier step may be half done. See your lines with: uv run ai-phone lines list\n"
@@ -123,6 +127,10 @@ def required(v: str) -> str | None:
 
 def e164(v: str) -> str | None:
     return None if E164_RE.fullmatch(v.strip()) else "Use international format, like +15550100000."
+
+
+def six_digits(v: str) -> str | None:
+    return None if re.fullmatch(r"\d{6}", v.strip()) else "Enter the 6-digit code."
 
 
 def country(v: str) -> str | None:
@@ -354,7 +362,8 @@ def phone_number(ui, actions, session: Session) -> None:
         ui.choose(Page(LINE, "The number is not ready yet" if result.code == 2 else "Something went wrong",
                        body="\n".join(result.messages)), [Option("Continue")], back=False)
         return
-    forward(ui, actions, session, result.line_id)
+    mobile = forward(ui, actions, session, result.line_id)
+    caller_id(ui, actions, session, carrier, name, creds, result.line_id, n.e164, mobile)
 
 
 def line_note(result: LineResult, number: str, carrier: str, bought: bool) -> str:
@@ -415,9 +424,9 @@ def run_line_action(ui, session: Session, page: Page, label: str, work) -> LineR
         return LineResult(getattr(e, "line_id", ""), 3, [str(e)])
 
 
-def forward(ui, actions, session: Session, line_id: str) -> None:
+def forward(ui, actions, session: Session, line_id: str) -> str:
     """The line exists now, so Back inside these questions (or a forward that cannot be saved) returns to the first
-    one, never to the purchase."""
+    one, never to the purchase. Returns the mobile number typed, or "" when forwarding was skipped."""
     error = ""
     while True:
         try:
@@ -425,7 +434,7 @@ def forward(ui, actions, session: Session, line_id: str) -> None:
                               "Calls to your mobile can ring your agent when you are busy or don't answer. "
                               "Your mobile carrier's divert charges apply.", error=error),
                          [Option("No"), Option("Yes")], back=False) == 0:
-                return
+                return ""
             (mobile,) = ask(ui, Page(LINE, "Your mobile number", "In international format, like +447700900123."),
                             [Field("Mobile number", validate=e164)])
             when = FORWARD_WHEN[ui.choose(Page(LINE, "When should calls go to your agent?"),
@@ -443,6 +452,70 @@ def forward(ui, actions, session: Session, line_id: str) -> None:
     body = "\n".join(f"{label.ljust(21)}   {code}" for label, code in rows)
     ui.choose(Page(LINE, "Dial this on your mobile", "Open the phone app, type the code and press call.", body=body),
               [Option("Done")], back=False)
+    return mobile
+
+
+def caller_id(ui, actions, session: Session, carrier: str, name: str, creds: dict, line_id: str, number: str,
+              mobile: str) -> None:
+    """Prove to the carrier that the person's own mobile is theirs, so the agent's outgoing calls show it instead of
+    the line's number. The line exists now, so Back returns to the first question here, never to the purchase."""
+    error = ""
+    while True:
+        if ui.choose(Page(LINE, "Show your own number when the agent calls out?",
+                          f"People you call see your mobile number instead of {number}. {name} sends one code to "
+                          "your phone to prove it is yours; no paperwork.", error=error),
+                     [Option("No"), Option("Yes")], back=False) == 0:
+            return
+        error = ""
+        try:
+            (mine,) = ask(ui, Page(LINE, "Your mobile number", "In international format, like +447700900123."),
+                          [Field("Mobile number", mobile, validate=e164)])
+            step = busy(ui, session, Page(LINE, f"Verifying {mine}"), f"Asking {name} to verify {mine}…",
+                        lambda: actions.start_caller_id(carrier, creds, mine))
+            verified = (typed_code(ui, actions, session, carrier, creds, step, name) if step.kind == "enter_code_in_cli"
+                        else keyed_code(ui, actions, session, carrier, creds, step, name))
+            if verified:
+                actions.record_caller_id(line_id, mine, carrier)
+                session.note(f"line {line_id} calls out as {mine}")
+        except Back:
+            continue
+        except ActionError as e:
+            error = str(e)
+            continue
+        if not verified:
+            ui.choose(Page(LINE, "Verification did not complete",
+                           f"Your agent still calls out as {number}. To try again: "
+                           f"uv run ai-phone lines verify-caller-id {line_id} {mine} --key-env <NAME>"),
+                      [Option("Continue")], back=False)
+        return
+
+
+def typed_code(ui, actions, session: Session, carrier: str, creds: dict, step, name: str) -> bool:
+    """The carrier texted a code: up to three tries at it, as the CLI's verify-caller-id allows."""
+    error = ""
+    for _ in range(CALLER_ID_TRIES):
+        (typed,) = ask(ui, Page(LINE, "Enter the code", step.instructions, error=error),
+                       [Field("Code", placeholder="6 digits", validate=six_digits)])
+        if busy(ui, session, Page(LINE, "Enter the code", step.instructions), f"Asking {name} to check the code…",
+                lambda: actions.check_caller_id(carrier, creds, step, typed)):
+            return True
+        error = "That code was not accepted."
+    return False
+
+
+def keyed_code(ui, actions, session: Session, carrier: str, creds: dict, step, name: str) -> bool:
+    """The carrier is calling the phone and the instructions hold the code to key in; wait for it to accept."""
+    def wait() -> bool:
+        deadline = time.monotonic() + CALLER_ID_WAIT_SEC
+        while True:
+            if actions.check_caller_id(carrier, creds, step, None):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(CALLER_ID_POLL_SEC)
+
+    return busy(ui, session, Page(LINE, f"{name} is calling you now", body=step.instructions),
+                "Waiting for you to enter the code on the call… (up to 2 minutes)", wait)
 
 
 def free_sip_name(lines: dict[str, dict]) -> str:
@@ -642,7 +715,7 @@ AI_COMMANDS = (('uv run ai-phone call +15550100000 --prompt "…" --json', "ai-p
 def done_text(actions, session: Session) -> str:
     cur = actions.current()
     out = [f"Saved in {home_dir()}/   config.yaml and secrets.env (keys and passwords, private to you)", ""]
-    rows = [(line_id, ln.get("number") or ln.get("aor") or "", line_kind(ln)) for line_id, ln in cur.lines.items()]
+    rows = [(line_id, ln.get("number") or ln.get("aor") or "", line_kind(ln) + calls_out(ln)) for line_id, ln in cur.lines.items()]
     if rows:
         a, b = (max(len(r[i]) for r in rows) for i in (0, 1))
         out += [f"{'Lines' if k == 0 else '':9}{i.ljust(a)}   {where.ljust(b)}   {kind}" for k, (i, where, kind) in enumerate(rows)]
@@ -677,6 +750,12 @@ def try_it(lines: dict[str, dict]) -> list[str]:
 def provider_of(ln: dict) -> dict:
     provider = ln.get("provider")
     return provider if isinstance(provider, dict) else {}  # a hand-edited config may hold anything here
+
+
+def calls_out(ln: dict) -> str:
+    """A verified caller id the agent uses instead of the line's own number."""
+    caller = ln.get("caller_id")
+    return f" · calls out as {caller}" if caller and caller != ln.get("number") else ""
 
 
 def line_kind(ln: dict) -> str:

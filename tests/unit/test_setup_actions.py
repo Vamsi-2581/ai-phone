@@ -20,7 +20,7 @@ import yaml
 from ai_phone import models, voices
 from ai_phone.config import InboundConfig, load_config
 from ai_phone.lines.journal import Journal
-from ai_phone.providers.base import Number, ProviderError
+from ai_phone.providers.base import Number, ProviderError, VerificationStep
 from ai_phone.providers.fake import OWNED, FakeProvider
 from ai_phone.secrets import load_secrets, write_secret
 from ai_phone.setup import actions as act
@@ -461,6 +461,48 @@ def test_forward_adds_the_mobile_and_returns_the_codes(home):
     a.add_sip_line("agent", "192.0.2.10")
     with pytest.raises(ActionError, match="no phone number"):
         a.forward("agent", "+447700900123", "busy")
+
+
+def test_caller_id_verification_records_the_number_and_calls_out_as_it(home):
+    """The point of the step is that people see the person's own number, so the verified number becomes the
+    line's caller_id as well as one of its verified ids."""
+    a = make(home)
+    a.buy_number("fake", FAKE_KEY, Number(BOUGHT, 1.0, "GBP", False, "src-0"))
+    step = a.start_caller_id("fake", FAKE_KEY, "+447700900123")
+    assert step.kind == "enter_code_in_cli" and "+447700900123" in step.instructions
+    assert a.check_caller_id("fake", FAKE_KEY, step, "000000") is False
+    assert a.check_caller_id("fake", FAKE_KEY, step, "123456") is True
+    a.record_caller_id("fake", "+447700900123", "fake")
+    ln = load_config(home / "config.yaml").lines["fake"]
+    assert ln.caller_id == "+447700900123" and ln.number == BOUGHT
+    verified = raw(home)["lines"]["fake"]["verified_caller_ids"]
+    assert [(v["number"], v["provider"]) for v in verified] == [("+447700900123", "fake")]
+    assert verified[0]["verified_at"].endswith("Z")
+    a.record_caller_id("fake", "+447700900123", "fake")  # again: the entry is replaced, never doubled
+    assert len(raw(home)["lines"]["fake"]["verified_caller_ids"]) == 1
+
+
+def test_a_carrier_that_refuses_the_verification_says_so_without_the_key(home):
+    class Refuses(FakeProvider):
+        def start_caller_id_verification(self, e164):
+            raise ProviderError(f"rejected (key {FAKE_KEY['FAKE_API_KEY']})")
+
+        def complete_caller_id_verification(self, step, code):
+            raise ProviderError(f"gone (key {FAKE_KEY['FAKE_API_KEY']})", retryable=True)
+
+    a = make(home, provider_loader=lambda name, key, secret=None: Refuses(key=key))
+    with pytest.raises(ActionError) as start:
+        a.start_caller_id("fake", FAKE_KEY, "+447700900123")
+    assert "Could not start the check" in str(start.value) and FAKE_KEY["FAKE_API_KEY"] not in str(start.value)
+    with pytest.raises(ActionError) as check:
+        a.check_caller_id("fake", FAKE_KEY, VerificationStep("enter_code_in_cli", "", {"e164": "+447700900123"}), "123456")
+    assert "Could not reach Fake" in str(check.value) and FAKE_KEY["FAKE_API_KEY"] not in str(check.value)
+
+
+def test_record_caller_id_needs_a_line(home):
+    a = make(home, "inbound: {greeting: Hi}\n")
+    with pytest.raises(ActionError, match="no line ghost"):
+        a.record_caller_id("ghost", "+447700900123", "fake")
 
 
 # ---- lines by hand ---------------------------------------------------------------------------

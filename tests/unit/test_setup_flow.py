@@ -10,7 +10,7 @@ import ai_phone
 from ai_phone.config import InboundConfig
 from ai_phone.lines.forward import divert_codes
 from ai_phone.pipeline.prompts import DISCLOSURE
-from ai_phone.providers.base import Number
+from ai_phone.providers.base import Number, VerificationStep
 from ai_phone.setup import flow
 from ai_phone.setup.actions import ActionError, Current, LineResult, Machine
 from ai_phone.setup.flow import BRAIN, CALLERS, CHECK, DONE, LINE, VOICE, WELCOME
@@ -140,7 +140,7 @@ class FakeActions:
         return [a for n, a in self.calls if n == name]
 
     def changes(self):
-        return [n for n, _ in self.calls if n.startswith(("save_", "add_", "buy_", "attach_", "forward"))]
+        return [n for n, _ in self.calls if n.startswith(("save_", "add_", "buy_", "attach_", "forward", "record_"))]
 
     # what the flow reads
     def machine(self):
@@ -219,6 +219,19 @@ class FakeActions:
     def forward(self, line_id, mobile, when):
         self._call("forward", line_id, mobile, when)
         return divert_codes(when, self.cur.lines[line_id]["number"])
+
+    def start_caller_id(self, carrier, creds, number):
+        """The fake carrier's step: a code texted to the number, and "123456" is the one it sent."""
+        return self._call("start_caller_id", carrier, dict(creds), number) or \
+            VerificationStep("enter_code_in_cli", f"Enter the 6-digit code sent to {number}", {"e164": number})
+
+    def check_caller_id(self, carrier, creds, step, code):
+        seeded = self._call("check_caller_id", carrier, dict(creds), step, code)
+        return code == "123456" if seeded is None else seeded
+
+    def record_caller_id(self, line_id, number, carrier):
+        self._call("record_caller_id", line_id, number, carrier)
+        self.cur.lines[line_id]["caller_id"] = number
 
     def add_sip_line(self, name, host):
         line_id = self._call("add_sip_line", name, host) or name
@@ -421,6 +434,7 @@ def test_twilio_new_number_buys_only_after_confirmation():
         ("How should people reach your agent?", "A phone number"), ("Which carrier?", "Twilio"), *choose_a_number,
         ("Buy +15550100001 for $1.15/month?", "Buy +15550100001"),
         ("Also forward your own mobile to it?", "No"),
+        CALLER_ID_NO,
         ("Everything works", "Continue"),
         FINISH,
     ])
@@ -476,6 +490,7 @@ def test_telnyx_existing_number_and_forward():
         ("Your mobile number", ["+447700900123"]),
         ("When should calls go to your agent?", "When I'm busy"),
         ("Dial this on your mobile", "Done"),
+        CALLER_ID_NO,
         ("Everything works", "Continue"),
         FINISH,
     ])
@@ -509,12 +524,196 @@ def test_back_in_the_forward_questions_never_returns_to_the_purchase():
         ("Also forward your own mobile to it?", "Yes"),
         ("Your mobile number", "<back>"),
         ("Also forward your own mobile to it?", "No"),
+        CALLER_ID_NO,
         ("Everything works", "<quit>"),
     ])
     actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"})
     drive(ui, actions)
     assert len(actions.args("attach_number")) == 1 and not actions.args("forward")
     assert ui.menu("Also forward")[3] is False  # the number is connected: there is no going back to it
+
+
+CALLER_ID_NO = ("Show your own number when the agent calls out?", "No")
+
+
+def connect_a_number(*after, forwarding=(("Also forward your own mobile to it?", "No"),)):
+    """Connect +15550100007 on the saved Telnyx key, skip forwarding, then whatever the test is about."""
+    return ScriptedUI([
+        *add_a_line("Telnyx"),
+        ("Use the saved Telnyx key?", "Use the saved key"),
+        ("A new number, or one already on", "One already on my Telnyx account"),
+        ("Which number?", "+15550100007"),
+        ("Connect +15550100007 to ai-phone?", "Connect +15550100007"),
+        *forwarding,
+        *after,
+    ])
+
+
+def test_caller_id_verification_saves_the_verified_mobile_and_shows_it_on_the_done_page():
+    ui = connect_a_number(
+        ("Show your own number when the agent calls out?", "Yes"),
+        ("Your mobile number", ["+447700900123"]),
+        ("Enter the code", ["123456"]),
+        ("Everything works", "Continue"),
+        FINISH,
+    )
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "KEYsaved"})
+    outcome = drive(ui, actions)
+    assert outcome.code == 0
+    assert actions.args("start_caller_id") == [("telnyx", {"TELNYX_API_KEY": "KEYsaved"}, "+447700900123")]
+    assert actions.args("record_caller_id") == [("telnyx", "+447700900123", "telnyx")]
+    ask_page = ui.questions("Show your own number")[0]
+    assert ask_page.detail == ("People you call see your mobile number instead of +15550100007. Telnyx sends one code "
+                               "to your phone to prove it is yours; no paperwork.")
+    assert ui.menu("Show your own number")[2:] == (0, False)  # No is the default, and there is no going back
+    assert [o.label for o in ui.menu("Show your own number")[1]] == ["No", "Yes"]
+    assert ui.questions("Enter the code")[0].detail == "Enter the 6-digit code sent to +447700900123"
+    assert "Asking Telnyx to verify +447700900123…" in ui.labels
+    assert "telnyx   +15550100007   Telnyx number · calls out as +447700900123" in outcome.summary
+    assert all("KEYsaved" not in page_text(p) for p in ui.pages)
+
+
+def test_the_mobile_typed_for_forwarding_is_offered_again_for_the_caller_id():
+    ui = connect_a_number(
+        ("Show your own number when the agent calls out?", "Yes"),
+        ("Your mobile number", [""]),  # Enter takes the number typed for forwarding
+        ("Enter the code", ["123456"]),
+        ("Everything works", "<quit>"),
+        forwarding=(("Also forward your own mobile to it?", "Yes"),
+                    ("Your mobile number", ["+447700900123"]),
+                    ("When should calls go to your agent?", "All calls"),
+                    ("Dial this on your mobile", "Done")),
+    )
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"})
+    drive(ui, actions)
+    assert actions.args("start_caller_id") == [("telnyx", {"TELNYX_API_KEY": "k"}, "+447700900123")]
+    assert [f.default for f in ui.fields if f.label == "Mobile number"] == ["", "+447700900123"]
+
+
+def test_a_wrong_code_is_asked_again_and_the_right_one_still_saves_it():
+    ui = connect_a_number(
+        ("Show your own number when the agent calls out?", "Yes"),
+        ("Your mobile number", ["+447700900123"]),
+        ("Enter the code", ["000000"]),
+        ("Enter the code", ["123456"]),
+        ("Everything works", "<quit>"),
+    )
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"})
+    drive(ui, actions)
+    assert [p.error for p in ui.questions("Enter the code")] == ["", "", "That code was not accepted.", ""]
+    assert [a[3] for a in actions.args("check_caller_id")] == ["000000", "123456"]
+    assert actions.args("record_caller_id") == [("telnyx", "+447700900123", "telnyx")]
+
+
+def test_three_wrong_codes_give_up_without_saving_anything():
+    ui = connect_a_number(
+        ("Show your own number when the agent calls out?", "Yes"),
+        ("Your mobile number", ["+447700900123"]),
+        ("Enter the code", ["000000"]),
+        ("Enter the code", ["000001"]),
+        ("Enter the code", ["000002"]),
+        ("Verification did not complete", "Continue"),
+        ("Everything works", "<quit>"),
+    )
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"})
+    drive(ui, actions)
+    assert len(actions.args("check_caller_id")) == 3 and not actions.args("record_caller_id")
+    gave_up = ui.questions("Verification did not complete")[0]
+    assert "uv run ai-phone lines verify-caller-id telnyx +447700900123" in gave_up.detail
+    assert ui.menu("Verification did not complete")[3] is False
+
+
+def test_no_asks_the_carrier_nothing():
+    ui = connect_a_number(CALLER_ID_NO, ("Everything works", "<quit>"))
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"})
+    drive(ui, actions)
+    assert not actions.args("start_caller_id") and not actions.args("record_caller_id")
+    assert actions.changes() == ["attach_number"]
+
+
+def test_a_carrier_that_will_not_start_the_check_says_so_and_asks_again():
+    ui = connect_a_number(
+        ("Show your own number when the agent calls out?", "Yes"),
+        ("Your mobile number", ["+447700900123"]),
+        ("Show your own number when the agent calls out?", "No"),
+        ("Everything works", "<quit>"),
+    )
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"},
+                          start_caller_id=ActionError("Could not reach Telnyx: timed out"))
+    drive(ui, actions)
+    first, second = ui.questions("Show your own number")
+    assert first.error == "" and second.error == "Could not reach Telnyx: timed out"
+    assert not actions.args("record_caller_id")
+
+
+def test_back_from_the_mobile_number_returns_to_the_caller_id_question():
+    ui = connect_a_number(
+        ("Show your own number when the agent calls out?", "Yes"),
+        ("Your mobile number", "<back>"),
+        ("Show your own number when the agent calls out?", "No"),
+        ("Everything works", "<quit>"),
+    )
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"})
+    drive(ui, actions)
+    assert len(actions.args("attach_number")) == 1 and not actions.args("start_caller_id")
+
+
+def test_a_carrier_that_calls_the_phone_waits_for_the_code_to_be_keyed_in(monkeypatch):
+    monkeypatch.setattr(flow, "CALLER_ID_POLL_SEC", 0)
+    on_phone = VerificationStep("enter_code_on_phone", "Telnyx is calling +447700900123. Key in 314159.", {"e164": "x"})
+    ui = connect_a_number(
+        ("Show your own number when the agent calls out?", "Yes"),
+        ("Your mobile number", ["+447700900123"]),
+        ("Everything works", "<quit>"),
+    )
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}, start_caller_id=on_phone,
+                          check_caller_id=Seq(False, False, True))
+    drive(ui, actions)
+    assert [a[3] for a in actions.args("check_caller_id")] == [None, None, None]
+    assert actions.args("record_caller_id") == [("telnyx", "+447700900123", "telnyx")]
+    assert "Waiting for you to enter the code on the call… (up to 2 minutes)" in ui.labels
+    assert ui.questions("Telnyx is calling you")[0].body == on_phone.instructions
+
+
+def test_a_call_the_person_never_answers_times_out(monkeypatch):
+    monkeypatch.setattr(flow, "CALLER_ID_POLL_SEC", 0)
+    monkeypatch.setattr(flow, "CALLER_ID_WAIT_SEC", 0)
+    on_phone = VerificationStep("enter_code_on_phone", "Telnyx is calling. Key in 314159.", {"e164": "x"})
+    ui = connect_a_number(
+        ("Show your own number when the agent calls out?", "Yes"),
+        ("Your mobile number", ["+447700900123"]),
+        ("Verification did not complete", "Continue"),
+        ("Everything works", "<quit>"),
+    )
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}, start_caller_id=on_phone,
+                          check_caller_id=False)
+    drive(ui, actions)
+    assert len(actions.args("check_caller_id")) == 1 and not actions.args("record_caller_id")
+
+
+def test_the_caller_id_step_is_only_for_a_carrier_number_that_is_ready():
+    """A SIP address has no carrier to ask, and a pending number is not usable yet."""
+    ui = ScriptedUI([
+        *add_a_line(), ("Your Twilio credentials", ["ACsid", "tokSECRET"]),
+        ("A new number, or one already on", "A new number"),
+        ("Where should the number be?", ["", ""]),
+        ("Pick a number", "+15550100001"),
+        ("Buy +15550100001 for $1.15/month?", "Buy +15550100001"),
+        ("The number is not ready yet", "Continue"),
+        ("Everything works", "<quit>"),
+    ])
+    pending = FakeActions(exists=True, buy_number=LineResult("twilio", 2, ["order pending"]))
+    drive(ui, pending)
+    assert not ui.questions("Show your own number") and not pending.args("start_caller_id")
+
+    ui = ScriptedUI([
+        ("Give your AI", "Add a line"), ("How should people reach your agent?", "A SIP address"),
+        ("Name your SIP address", ["agent", "192.0.2.10"]),
+        ("Everything works", "<quit>"),
+    ])
+    sip = FakeActions(exists=True)
+    drive(ui, sip)
+    assert not ui.questions("Show your own number") and not sip.args("start_caller_id")
 
 
 def test_no_owned_numbers_offers_to_buy_one():
@@ -581,6 +780,7 @@ def test_a_forward_that_cannot_be_saved_is_asked_again():
         ("Your mobile number", ["+447700900123"]),
         ("When should calls go to your agent?", "All calls"),
         ("Also forward your own mobile to it?", "No"),
+        CALLER_ID_NO,
         ("Everything works", "<quit>"),
     ])
     actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}, forward=ActionError(broken))
@@ -921,6 +1121,7 @@ def test_a_cancel_after_a_purchase_names_the_number():
         ("Your mobile number", ["+447700900123"]),
         ("When should calls go to your agent?", "All calls"),
         ("Dial this on your mobile", "Done"),
+        CALLER_ID_NO,
         ("Everything works", "<quit>"),
     ])
     outcome = drive(ui, FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "k"}))

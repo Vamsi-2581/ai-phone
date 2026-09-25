@@ -346,6 +346,37 @@ class Actions:
             self._edit(change)
         return codes
 
+    def start_caller_id(self, carrier: str, creds: dict[str, str], number: str):
+        """Ask the carrier to prove the person owns `number`. The step says how they finish it."""
+        from ai_phone.providers.base import ProviderError
+        try:
+            return self._provider(carrier, creds).start_caller_id_verification(number)
+        except ProviderError as e:
+            raise self._carrier_error(carrier, creds, e, "Could not start the check") from None
+
+    def check_caller_id(self, carrier: str, creds: dict[str, str], step, code: str | None) -> bool:
+        """Whether the carrier has accepted it yet: with the code they texted, or None while the call is waiting."""
+        from ai_phone.providers.base import ProviderError
+        try:
+            return self._provider(carrier, creds).complete_caller_id_verification(step, code)
+        except ProviderError as e:
+            raise self._carrier_error(carrier, creds, e, "Could not check the code") from None
+
+    def record_caller_id(self, line_id: str, number: str, carrier: str) -> None:
+        """The carrier accepted it: remember the verified number and call out as it, which is the point of the step
+        (`ai-phone lines verify-caller-id` only records it, and says to set caller_id by hand)."""
+        def change(raw: dict) -> None:
+            ln = _section(raw, "lines").get(line_id)
+            if not isinstance(ln, dict):
+                raise ActionError(f"no line {line_id} to verify a number for")
+            ln = raw["lines"][line_id]
+            verified = [v for v in (ln.get("verified_caller_ids") or []) if v.get("number") != number]
+            verified.append({"number": number, "provider": carrier,
+                             "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+            ln["verified_caller_ids"] = verified
+            ln["caller_id"] = number
+        self._edit(change)
+
     # ---- lines by hand ---------------------------------------------------------------------------
 
     def lan_address(self) -> str:
