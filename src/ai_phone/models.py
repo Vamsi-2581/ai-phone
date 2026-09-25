@@ -2,8 +2,8 @@
 Weights live in the Hugging Face cache, where the backends load them from. The daemon never downloads."""
 from __future__ import annotations
 
-import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -15,6 +15,7 @@ STT = "mlx-community/parakeet-tdt-0.6b-v2"
 TTS = "mlx-community/Kokoro-82M-bf16"
 BIG_MEMORY_GB = 32
 DOWNLOADING = ".ai-phone-downloading"  # in a repo's cache folder while `pull` has not finished it
+SHARD_RE = re.compile(r"-of-(\d+)\.safetensors$")
 
 
 @dataclass(frozen=True)
@@ -104,18 +105,27 @@ def local_path(repo: str) -> Path | None:
         return None
     if not (path / "config.json").is_file() or not any(path.glob("*.safetensors")):
         return None
-    index = path / "model.safetensors.index.json"
-    # The index is the authority only for a sharded layout. A repo that ships one consolidated model.safetensors
-    # can carry a stale index naming shards it does not have (mlx-community/gemma-3-4b-it-4bit does, and loads
-    # fine); trusting it there would make `pull` fetch that repo again on every run.
-    if index.exists() and not (path / "model.safetensors").is_file():
-        try:
-            shards = set(json.loads(index.read_text())["weight_map"].values())
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            return None
-        if not all((path / shard).is_file() for shard in shards):
-            return None
-    return path
+    return path if _weights_complete(path) else None
+
+
+def _weights_complete(path: Path) -> bool:
+    """Whether the snapshot holds a whole set of weights, judged on the shard filenames: one of them names its own
+    total (`model-00001-of-00002.safetensors` says there are two). That is the only description of the weights
+    that cannot go stale — several mlx-community repos ship a `model.safetensors.index.json` left over from a
+    different layout (gemma-3-4b-it-4bit names two shards beside its one consolidated file; gemma-3-12b-it-4bit
+    names five beside its two real ones), and both load fine. A download stopped part-way leaves its files named
+    `.incomplete`, so the glob does not count them."""
+    if (path / "model.safetensors").is_file():
+        return True  # one consolidated file is the whole model
+    present: dict[int, set[str]] = {}
+    for f in path.glob("*.safetensors"):
+        found = SHARD_RE.search(f.name)
+        if found:
+            present.setdefault(int(found.group(1)), set()).add(f.name)
+    if not present:
+        return True  # some other naming: that weights are there at all is as much as can be checked
+    total = max(present)
+    return len(present[total]) == total
 
 
 def missing(tier: str, brain_kind: str) -> list[str]:

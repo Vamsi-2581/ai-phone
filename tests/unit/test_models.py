@@ -99,28 +99,43 @@ def test_local_path_needs_config_and_weights(tmp_path, monkeypatch):
 
 
 def snapshot(tmp_path, monkeypatch):
-    """A cache whose Kokoro snapshot holds a config and one weights file."""
+    """A cache whose Kokoro snapshot holds a config and one consolidated weights file."""
     hub = tmp_path / "hub"
     snap = hub / "models--mlx-community--Kokoro-82M-bf16" / "snapshots" / "abc123"
     snap.mkdir(parents=True)
     (snap / "config.json").write_text("{}")
-    (snap / "model-00001-of-00002.safetensors").write_bytes(b"x")
+    (snap / "model.safetensors").write_bytes(b"x")
     monkeypatch.setattr(models, "_hub_root", lambda: hub)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo, **k: str(snap))
     return snap
 
 
-def test_local_path_needs_every_shard_the_index_names(tmp_path, monkeypatch):
+def test_local_path_needs_every_shard_the_filenames_declare(tmp_path, monkeypatch):
+    """A shard names its own total: `model-00001-of-00002.safetensors` says there are two. That is the one
+    description of the weights that cannot go stale, so it is what completeness is judged on."""
     snap = snapshot(tmp_path, monkeypatch)
-    assert models.local_path(TTS) == snap  # no index: one file is the whole model
-    index = snap / "model.safetensors.index.json"
-    index.write_text('{"metadata": {}, "weight_map": {"a.weight": "model-00001-of-00002.safetensors", '
-                     '"b.weight": "model-00002-of-00002.safetensors"}}')
-    assert models.local_path(TTS) is None
+    (snap / "model.safetensors").unlink()
+    (snap / "model-00001-of-00002.safetensors").write_bytes(b"x")
+    assert models.local_path(TTS) is None  # one of the two: a download that stopped part-way
     (snap / "model-00002-of-00002.safetensors").write_bytes(b"x")
     assert models.local_path(TTS) == snap
+
+
+def test_local_path_ignores_an_index_that_describes_another_layout(tmp_path, monkeypatch):
+    """Several mlx-community repos ship a leftover index: gemma-3-4b-it-4bit names two shards beside its one
+    consolidated file, gemma-3-12b-it-4bit names five beside its two real ones. Believing it would make `pull`
+    fetch those repos again on every run."""
+    snap = snapshot(tmp_path, monkeypatch)
+    (snap / "model.safetensors").unlink()
+    for i in (1, 2):
+        (snap / f"model-0000{i}-of-00002.safetensors").write_bytes(b"x")
+    index = snap / "model.safetensors.index.json"
+    index.write_text('{"metadata": {"total_size": 1}, "weight_map": '
+                     + str({f"w{i}": f"model-0000{i}-of-00005.safetensors" for i in range(1, 6)}).replace("'", '"')
+                     + "}")
+    assert models.local_path(TTS) == snap
     index.write_text("{not json")
-    assert models.local_path(TTS) is None
+    assert models.local_path(TTS) == snap  # unreadable too: the filenames already answered the question
 
 
 def test_an_interrupted_pull_is_not_downloaded(tmp_path, monkeypatch):
@@ -148,9 +163,7 @@ def test_local_path_trusts_a_consolidated_weights_file_over_a_stale_index(tmp_pa
     """Some repos ship one `model.safetensors` and leave behind an index naming shards they do not have
     (mlx-community/gemma-3-4b-it-4bit does, and loads fine). The model is whole: the index is not the authority
     when the consolidated file is there, or `pull` would fetch that repo again on every run."""
-    snap = snapshot(tmp_path, monkeypatch)
-    (snap / "model-00001-of-00002.safetensors").unlink()
-    (snap / "model.safetensors").write_bytes(b"x")
+    snap = snapshot(tmp_path, monkeypatch)  # one consolidated model.safetensors
     (snap / "model.safetensors.index.json").write_text(
         '{"metadata": {"total_size": 8600158944}, "weight_map": {"a.weight": "model-00001-of-00002.safetensors", '
         '"b.weight": "model-00002-of-00002.safetensors"}}')
