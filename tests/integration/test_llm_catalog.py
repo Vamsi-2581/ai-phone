@@ -1,10 +1,15 @@
-"""Every model the wizard offers must really load and answer on this Mac. This is the one test that downloads:
-an entry whose weights are not cached is fetched here, so offline mode is lifted — for this file only, and put
-back afterwards, so the other integration tests keep their "nothing is downloaded" guarantee. An entry that
-cannot load or cannot generate does not belong in the catalog.
+"""Every model the wizard offers must really load and answer on this Mac. An entry that cannot load or cannot
+generate does not belong in the catalog.
 
-    timeout 3600 uv run pytest tests/integration/test_llm_catalog.py -q -m integration -p no:cacheprovider
+This test never downloads on its own: an entry whose weights are not in the Hugging Face cache is skipped, named,
+so a run says which entries are still unverified rather than quietly fetching gigabytes. Set
+`AI_PHONE_TEST_DOWNLOAD=1` to let it fetch the missing ones — that is the only thing in the suite allowed to
+download, and it lifts offline mode for these tests only and puts it back afterwards.
+
+    HF_HUB_OFFLINE=1 timeout 3600 uv run pytest tests/integration/test_llm_catalog.py -q -m integration -p no:cacheprovider
+    AI_PHONE_TEST_DOWNLOAD=1 timeout 3600 uv run pytest tests/integration/test_llm_catalog.py -q -m integration -p no:cacheprovider
 """
+import os
 import time
 
 import pytest
@@ -14,12 +19,16 @@ from ai_phone import models
 pytestmark = pytest.mark.integration
 SYS = "You are ai-phone, a phone assistant. Answer in one short sentence."
 REPLY_BUDGET_SEC = 30
+MAY_DOWNLOAD = os.environ.get("AI_PHONE_TEST_DOWNLOAD") == "1"
 
 
 @pytest.fixture
-def may_download(monkeypatch):
-    """huggingface_hub reads HF_HUB_OFFLINE once, into a module constant, so the env var alone would not lift it
-    (another integration module may already have set it). monkeypatch puts both back after the test."""
+def downloading_allowed(monkeypatch):
+    """Lift offline mode, but only when the run asked to download. huggingface_hub reads HF_HUB_OFFLINE once, into
+    a module constant, so the env var alone would not lift it (another integration module may already have set it);
+    monkeypatch puts both back after the test."""
+    if not MAY_DOWNLOAD:
+        return
     from huggingface_hub import constants
 
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
@@ -28,13 +37,15 @@ def may_download(monkeypatch):
 
 
 @pytest.mark.parametrize("entry", list(models.CATALOG.values()), ids=list(models.CATALOG))
-def test_every_catalog_model_loads_and_answers(entry, may_download, record_property):
-    from huggingface_hub import snapshot_download
-
+def test_every_catalog_model_loads_and_answers(entry, downloading_allowed, record_property):
     from ai_phone.services.backends.mlx_lm_backend import make_llm
 
     if models.local_path(entry.repo) is None:
-        snapshot_download(entry.repo)  # the one download this suite is allowed to make
+        if not MAY_DOWNLOAD:
+            pytest.skip(f"not downloaded: {entry.repo} (AI_PHONE_TEST_DOWNLOAD=1 fetches it)")
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(entry.repo)
 
     llm = make_llm(entry.repo)
     warm = llm.warmup(SYS)
