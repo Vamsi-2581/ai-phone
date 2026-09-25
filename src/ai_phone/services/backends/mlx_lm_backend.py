@@ -89,7 +89,10 @@ class MlxLmLLM:
             mx.eval(self._model(mx.array(self._prefix_ids)[None], cache=cache))
         self._snap = cache
         list(self.stream(0, [{"role": "system", "content": compose_prompt(fixed, None)}, {"role": "user", "content": "Hello?"}], 8))
-        return {"warm_ms": (time.monotonic_ns() - t) / 1e6, "prefix_tokens": float(len(self._prefix_ids)), **wired}
+        # system_role_folded travels in the dict because the log line above runs in the worker child, where
+        # logging is not configured; the daemon's ready line prints this dict
+        return {"warm_ms": (time.monotonic_ns() - t) / 1e6, "prefix_tokens": float(len(self._prefix_ids)),
+                "system_role_folded": self._fold_system, **wired}
 
     def stream(self, gen_id: int, messages: list[Message], max_tokens: int):
         from mlx_lm import stream_generate

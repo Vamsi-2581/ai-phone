@@ -599,6 +599,28 @@ def test_list_never_offers_to_resume_a_journal_that_has_no_number(home: Path, ca
     )
 
 
+def test_list_keeps_the_undo_for_a_legacy_journal_that_names_a_bought_number(home: Path, capsys):
+    """Journals from older versions record the number under `order`/`number` and have no `target` step, so they are
+    not resumable — but the number is bought and billing. Calling that "nothing created yet" and offering only
+    `--local-only` would drop the one local record of a number that keeps costing money."""
+    old = Journal.open(home / "lines", "old", "fake")
+    old.start("number", name="+442079460002")
+    capsys.readouterr()
+    assert main(["lines", "list"]) == 0
+    assert capsys.readouterr().out == (
+        "Unfinished setups\n"
+        "  old          +442079460002  bought · pending           "
+        "undo: ai-phone lines remove old --key-env <NAME>\n"
+    )
+    old.set_state("rollback_failed")  # and the carrier-portal guidance is still reachable for them
+    assert main(["lines", "list"]) == 0
+    assert capsys.readouterr().out == (
+        "Unfinished setups\n"
+        "  old          +442079460002  bought · rollback_failed   "
+        "finish in the carrier portal, then: ai-phone lines remove old --local-only\n"
+    )
+
+
 def test_list_without_lines_or_journals_still_suggests_adding_one(home: Path, capsys):
     assert main(["lines", "list"]) == 0
     assert capsys.readouterr().out == "no lines configured; try: ai-phone lines add telnyx --key-env TELNYX_API_KEY\n"

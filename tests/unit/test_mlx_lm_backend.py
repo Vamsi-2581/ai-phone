@@ -72,3 +72,29 @@ def test_a_template_broken_for_another_reason_is_not_mistaken_for_a_missing_syst
     assert model._system_role_supported() is True
     with pytest.raises(ValueError, match="this template is broken"):
         model._ids([{"role": "user", "content": "Hello?"}])
+
+
+def test_warmup_reports_whether_the_system_role_was_folded(monkeypatch):
+    """The fold's log line runs in the worker child, where logging is not configured, so nobody reads it. The
+    daemon's ready line prints warmup()'s dict, so the flag has to travel in there."""
+    import mlx.core as mx
+    import mlx_lm
+    import mlx_lm.models.cache
+
+    from ai_phone.services.backends import mlx_memory
+
+    tok = Tokenizer(no_system=True)
+    monkeypatch.setattr(mlx_lm, "load", lambda model_id: (lambda *a, **k: None, tok))
+    monkeypatch.setattr(mlx_lm, "stream_generate", lambda *a, **k: iter(()))
+    monkeypatch.setattr(mlx_lm.models.cache, "make_prompt_cache", lambda model: [])
+    monkeypatch.setattr(mx, "eval", lambda *a, **k: None)
+    monkeypatch.setattr(mlx_memory, "begin_wiring", lambda on: None)
+    monkeypatch.setattr(mlx_memory, "wire_resident", lambda model, on: {})
+
+    folded = MlxLmLLM("org/no-system").warmup(SYS, wire_memory=False)
+    assert folded["system_role_folded"] is True
+    assert folded["warm_ms"] > 0
+
+    monkeypatch.setattr(mlx_lm, "load", lambda model_id: (lambda *a, **k: None, Tokenizer()))
+    kept = MlxLmLLM("org/with-system").warmup(SYS, wire_memory=False)
+    assert kept["system_role_folded"] is False

@@ -56,6 +56,7 @@ def test_every_catalog_model_loads_and_answers(entry, downloading_allowed, recor
     # and a 24 GB Mac must not fail a good 12B entry for paging reasons
     warm = llm.warmup(SYS, wire_memory=False)
     assert warm["warm_ms"] > 0
+    assert warm["system_role_folded"] in (True, False)  # a template with no system role is handled, not fatal
 
     t = time.monotonic()
     text = "".join(llm.stream(1, [{"role": "system", "content": SYS},
@@ -65,6 +66,8 @@ def test_every_catalog_model_loads_and_answers(entry, downloading_allowed, recor
     assert "<think>" not in text, f"{entry.key} leaked a thinking block: {text[:120]!r}"
     assert took < REPLY_BUDGET_SEC, f"{entry.key} took {took:.1f}s to answer"
     record_property("warm_ms", round(warm["warm_ms"]))
+    record_property("system_role_folded", warm["system_role_folded"])
     record_property("first_token_ms", round(llm.last_timings["first_token_ms"]))
     print(f"\n{entry.key:10s} {entry.repo:46s} warm {warm['warm_ms'] / 1000:5.1f}s  "
-          f"first token {llm.last_timings['first_token_ms']:6.0f} ms  reply {text.strip()[:60]!r}")
+          f"first token {llm.last_timings['first_token_ms']:6.0f} ms  "
+          f"{'folded system role  ' if warm['system_role_folded'] else ''}reply {text.strip()[:60]!r}")

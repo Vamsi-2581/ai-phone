@@ -499,17 +499,21 @@ def _unfinished_row(line_id: str, setup: JournalSetup) -> str:
     local_only = f"ai-phone lines remove {line_id} --local-only"
     if setup.state == "?":  # the file could not be read: claim nothing about what it holds
         return f"  {line_id:12s} unreadable · remove: {local_only}"
-    if setup.number is None or not setup.resumable:
-        # `target` is the first step provision_flow writes, before any carrier call, so a journal without it
-        # reached no carrier step — and there is nothing for `resume` to pick up
+    if setup.number is None or setup.number == "?":
+        # No number under any key this or an older version wrote, so nothing was bought and there is nothing to
+        # resume. (`target` is the first step provision_flow writes, before any carrier call.)
         return f"  {line_id:12s} nothing created yet · remove: {local_only}"
     where = setup.number
     got = f"{'brought' if setup.brought else 'bought'} · {setup.state}"
+    undo = f"undo: ai-phone lines remove {line_id} --key-env <NAME>"
     if setup.state == "rollback_failed":  # the carrier refused the undo, so only a person can clear it
         how = f"finish in the carrier portal, then: {local_only}"
+    elif not setup.resumable:
+        # a journal from an older version: it names a bought number but has no `target` step for `resume` to
+        # pick up. The number is still billing, so the way out is the undo, never --local-only.
+        how = undo
     else:
-        how = (f"resume: ai-phone lines resume {line_id} --key-env <NAME>   "
-               f"undo: ai-phone lines remove {line_id} --key-env <NAME>")
+        how = f"resume: ai-phone lines resume {line_id} --key-env <NAME>   {undo}"
     return f"  {line_id:12s} {where:14s} {got:26s} {how}"
 
 
