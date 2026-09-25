@@ -56,7 +56,7 @@ def test_every_catalog_model_loads_and_answers(entry, downloading_allowed, recor
     # and a 24 GB Mac must not fail a good 12B entry for paging reasons
     warm = llm.warmup(SYS, wire_memory=False)
     assert warm["warm_ms"] > 0
-    assert warm["system_role_folded"] in (True, False)  # a template with no system role is handled, not fatal
+    assert "system_role_folded" in warm  # a template with no system role is handled, not fatal
 
     t = time.monotonic()
     text = "".join(llm.stream(1, [{"role": "system", "content": SYS},

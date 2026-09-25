@@ -77,9 +77,9 @@ def test_a_template_broken_for_another_reason_is_not_mistaken_for_a_missing_syst
 def test_warmup_reports_whether_the_system_role_was_folded(monkeypatch):
     """The fold's log line runs in the worker child, where logging is not configured, so nobody reads it. The
     daemon's ready line prints warmup()'s dict, so the flag has to travel in there."""
-    import mlx.core as mx
-    import mlx_lm
-    import mlx_lm.models.cache
+    mx = pytest.importorskip("mlx.core", reason="MLX-only (macOS)")
+    mlx_lm = pytest.importorskip("mlx_lm", reason="MLX-only (macOS)")
+    pytest.importorskip("mlx_lm.models.cache", reason="MLX-only (macOS)")
 
     from ai_phone.services.backends import mlx_memory
 
