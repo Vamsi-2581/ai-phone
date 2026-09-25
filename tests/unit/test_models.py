@@ -144,6 +144,20 @@ def test_an_interrupted_pull_is_not_downloaded(tmp_path, monkeypatch):
     assert not marker.exists() and models.local_path(TTS) == snap
 
 
+def test_local_path_trusts_a_consolidated_weights_file_over_a_stale_index(tmp_path, monkeypatch):
+    """Some repos ship one `model.safetensors` and leave behind an index naming shards they do not have
+    (mlx-community/gemma-3-4b-it-4bit does, and loads fine). The model is whole: the index is not the authority
+    when the consolidated file is there, or `pull` would fetch that repo again on every run."""
+    snap = snapshot(tmp_path, monkeypatch)
+    (snap / "model-00001-of-00002.safetensors").unlink()
+    (snap / "model.safetensors").write_bytes(b"x")
+    (snap / "model.safetensors.index.json").write_text(
+        '{"metadata": {"total_size": 8600158944}, "weight_map": {"a.weight": "model-00001-of-00002.safetensors", '
+        '"b.weight": "model-00002-of-00002.safetensors"}}')
+    assert models.local_path(TTS) == snap
+    assert models.missing("t4", "openai_compatible") == []  # so `pull` says it is already downloaded
+
+
 def test_missing_lists_absent_repos(monkeypatch, tmp_path):
     monkeypatch.setattr(models, "local_path", lambda r: tmp_path if r == STT else None)
     assert models.missing("t4", "local") == [TTS, LLM["t4"]]

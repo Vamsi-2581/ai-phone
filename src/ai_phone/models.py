@@ -105,7 +105,10 @@ def local_path(repo: str) -> Path | None:
     if not (path / "config.json").is_file() or not any(path.glob("*.safetensors")):
         return None
     index = path / "model.safetensors.index.json"
-    if index.exists():
+    # The index is the authority only for a sharded layout. A repo that ships one consolidated model.safetensors
+    # can carry a stale index naming shards it does not have (mlx-community/gemma-3-4b-it-4bit does, and loads
+    # fine); trusting it there would make `pull` fetch that repo again on every run.
+    if index.exists() and not (path / "model.safetensors").is_file():
         try:
             shards = set(json.loads(index.read_text())["weight_map"].values())
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
