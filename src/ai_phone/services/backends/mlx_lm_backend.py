@@ -11,11 +11,13 @@ template quirks (thinking blocks, generation markers) cannot desynchronise it.
 from __future__ import annotations
 
 import copy
+import logging
 import time
 
 from ai_phone.pipeline.prompts import cache_probe_sections, system_prompt as compose_prompt
 from ai_phone.services.base import Message
 
+log = logging.getLogger(__name__)
 T9 = "mlx-community/Qwen3.5-9B-MLX-4bit"  # models.LLM["t9"]
 T4 = "mlx-community/Qwen3.5-4B-MLX-4bit"  # models.LLM["t4"]
 
@@ -27,12 +29,38 @@ class MlxLmLLM:
         self._prefix_ids: list[int] = []
         self._snap = None
         self._cancelled: set[int] = set()
+        self._fold_system = False  # this model's chat template has no system role
         self.last_timings: dict = {}
         self._system = "You are a phone assistant."
 
     def _ids(self, messages: list[Message]) -> list[int]:
+        if self._fold_system:
+            messages = fold_system(messages)
         out = self._tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False)
         return list(out) if not isinstance(out, str) else self._tok.encode(out)
+
+    def _system_role_supported(self) -> bool:
+        """Whether this model's chat template accepts a standalone system message; the Gemma and Mistral instruct
+        families are the well-known ones that refuse it. A template that fails without the system message too is
+        broken for some other reason, and saying so here would only hide the real error."""
+        probe = [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}]
+        try:
+            self._tok.apply_chat_template(probe, add_generation_prompt=True, enable_thinking=False)
+            return True
+        except Exception:
+            pass
+        try:
+            self._tok.apply_chat_template(probe[1:], add_generation_prompt=True, enable_thinking=False)
+        except Exception:
+            return True
+        return False
+
+    def _note_system_role(self) -> None:
+        """Checked once, at warm-up: every prompt afterwards is shaped for this template."""
+        self._fold_system = not self._system_role_supported()
+        if self._fold_system:
+            log.info("%s: the chat template has no system role; the phone instructions go at the top of the first "
+                     "user turn", self.model_id)
 
     def warmup(self, system_prompt: str = "", wire_memory: bool = True) -> dict:
         import mlx.core as mx
@@ -44,6 +72,7 @@ class MlxLmLLM:
         t = time.monotonic_ns()
         begin_wiring(wire_memory)  # before the load: MLX wires buffers as they are allocated
         self._model, self._tok = load(self.model_id)
+        self._note_system_role()  # before the first _ids: it decides how every prompt is shaped
         wired = wire_resident(self._model, wire_memory)  # the weights stay resident through idle spells
         fixed = self._system = system_prompt or "You are a phone assistant."  # the part every call shares
         pa, pb = cache_probe_sections()
@@ -97,6 +126,18 @@ class MlxLmLLM:
         saved = self.last_timings
         list(self.stream(-1, [{"role": "system", "content": compose_prompt(self._system, None)}, {"role": "user", "content": "Hi."}], 1))
         self.last_timings = saved
+
+
+def fold_system(messages: list[Message]) -> list[Message]:
+    """The system text moved to the top of the first user turn, for a template with no system role."""
+    system = "\n\n".join(str(m["content"]) for m in messages if m["role"] == "system")
+    rest = [m for m in messages if m["role"] != "system"]
+    if not system:
+        return rest
+    for i, m in enumerate(rest):
+        if m["role"] == "user":
+            return [*rest[:i], {"role": "user", "content": f"{system}\n\n{m['content']}"}, *rest[i + 1:]]
+    return [{"role": "user", "content": system}, *rest]
 
 
 def make_llm(model_id: str) -> MlxLmLLM:

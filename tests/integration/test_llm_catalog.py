@@ -1,20 +1,24 @@
 """Every model the wizard offers must really load and answer on this Mac. An entry that cannot load or cannot
 generate does not belong in the catalog.
 
-This test never downloads on its own: an entry whose weights are not in the Hugging Face cache is skipped, named,
-so a run says which entries are still unverified rather than quietly fetching gigabytes. Set
+This test never downloads on its own: it sets `HF_HUB_OFFLINE=1` at import like its sibling backend tests, and an
+entry whose weights are not in the Hugging Face cache is skipped, named, so a run says which entries are still
+unverified rather than quietly fetching gigabytes. Set
 `AI_PHONE_TEST_DOWNLOAD=1` to let it fetch the missing ones — that is the only thing in the suite allowed to
 download, and it lifts offline mode for these tests only and puts it back afterwards.
 
-    HF_HUB_OFFLINE=1 timeout 3600 uv run pytest tests/integration/test_llm_catalog.py -q -m integration -p no:cacheprovider
+    timeout 3600 uv run pytest tests/integration/test_llm_catalog.py -q -m integration -p no:cacheprovider
     AI_PHONE_TEST_DOWNLOAD=1 timeout 3600 uv run pytest tests/integration/test_llm_catalog.py -q -m integration -p no:cacheprovider
 """
 import os
-import time
 
-import pytest
+os.environ.setdefault("HF_HUB_OFFLINE", "1")  # before huggingface_hub is imported: it reads this once
 
-from ai_phone import models
+import time  # noqa: E402
+
+import pytest  # noqa: E402
+
+from ai_phone import models  # noqa: E402
 
 pytestmark = pytest.mark.integration
 SYS = "You are ai-phone, a phone assistant. Answer in one short sentence."
@@ -48,7 +52,9 @@ def test_every_catalog_model_loads_and_answers(entry, downloading_allowed, recor
         snapshot_download(entry.repo)
 
     llm = make_llm(entry.repo)
-    warm = llm.warmup(SYS)
+    # no memory wiring: this asks whether the model loads and answers, not whether it fits beside everything else,
+    # and a 24 GB Mac must not fail a good 12B entry for paging reasons
+    warm = llm.warmup(SYS, wire_memory=False)
     assert warm["warm_ms"] > 0
 
     t = time.monotonic()

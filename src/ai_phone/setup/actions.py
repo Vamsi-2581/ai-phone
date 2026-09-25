@@ -62,7 +62,7 @@ class Current:
     exists: bool
     lines: dict[str, dict]      # raw line entries by id
     brain_kind: str             # "local" | "openai_compatible"
-    tier: str                   # resolved: "t4" | "t9"
+    tier: str                   # resolved: a key from models.CATALOG, or a Hub repo id named by hand
     base_url: str
     model: str
     brain_key_saved: bool       # the brain's api_key_env has a value in secrets.env

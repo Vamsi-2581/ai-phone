@@ -216,7 +216,8 @@ class Daemon:
                        turn_log=turn_log, events=events, stop=stop, specs={s.id: s for s in specs})
             control = ControlServer(paths.socket_path(), lambda msg, send: self._control(msg, send, ctx))
             await control.start()
-            brain = self.cfg.brain.model if self.remote_brain else models.repo_for(self.tier)
+            # what actually started, not what the config asked for: --fake loads FakeLLM whatever the tier says
+            brain = "fake" if self.fake else (self.cfg.brain.model if self.remote_brain else models.repo_for(self.tier))
             log.info("ready lines=%s brain=%s model=%s warm=%s", [s.id for s in specs], self.cfg.brain.kind, brain, warm)
             print("ready", flush=True)
             while not stop.is_set():
