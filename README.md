@@ -6,7 +6,7 @@ or reach it at a SIP address; speech-to-text, the language model and text-to-spe
 default, and during a call the daemon talks to nothing but SIP/RTP (and one brain only if you chose
 one that is not on this Mac: your own endpoint, or the Claude or ChatGPT plan you already pay for).
 
-**Status: Milestone 1 (latency proof) passed; Milestone 2 (lines) code complete, its live gate pending; Milestone 3 (agent tool) code complete, its gate pending; Milestone 4 (get started: install script and setup wizard) in progress.**
+**Status: Milestone 1 (latency proof) passed; Milestone 4 (get started: install script and setup wizard) complete, verified from a fresh clone; Milestones 2 (lines) and 3 (agent tool) code complete, their live gates pending.**
 English only, one call at a time. See `architecture-essentials.md` for how it works.
 
 ## Milestone 1 numbers (Apple M5 Pro, 24 GB, 4B tier, 20 LAN calls over 8 kHz PCMU)
