@@ -1,5 +1,6 @@
 import contextlib
 import inspect
+import logging
 import os
 import subprocess
 import threading
@@ -108,6 +109,27 @@ def snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(models, "_hub_root", lambda: hub)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo, **k: str(snap))
     return snap
+
+
+def test_local_path_says_at_debug_why_the_cache_would_not_answer(tmp_path, monkeypatch, caplog):
+    """"Not downloaded" and "downloaded but the cache cannot be read" look the same from the outside, which is
+    exactly the problem somebody would be trying to work out; the reason goes to the log, not to the caller."""
+    monkeypatch.setattr(huggingface_hub, "snapshot_download",
+                        lambda repo, **k: (_ for _ in ()).throw(PermissionError(13, "Permission denied")))
+    with caplog.at_level(logging.DEBUG, logger="ai-phone.models"):
+        assert models.local_path(TTS) is None
+    assert len(caplog.records) == 1 and caplog.records[0].levelno == logging.DEBUG
+    assert TTS in caplog.records[0].getMessage() and "PermissionError" in caplog.records[0].getMessage()
+
+
+def test_local_path_logs_nothing_when_the_model_is_simply_not_downloaded(tmp_path, monkeypatch, caplog):
+    """A missing model is the ordinary case `missing` asks about on every run: it is not worth a line."""
+    def not_cached(repo, **k):
+        raise LocalEntryNotFoundError("x")
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", not_cached)
+    with caplog.at_level(logging.DEBUG, logger="ai-phone.models"):
+        assert models.local_path(TTS) is None
+    assert caplog.records == []
 
 
 def test_local_path_needs_every_shard_the_filenames_declare(tmp_path, monkeypatch):

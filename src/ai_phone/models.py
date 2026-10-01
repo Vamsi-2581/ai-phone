@@ -2,6 +2,7 @@
 Weights live in the Hugging Face cache, where the backends load them from. The daemon never downloads."""
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,8 @@ TTS = "mlx-community/Kokoro-82M-bf16"
 BIG_MEMORY_GB = 32
 DOWNLOADING = ".ai-phone-downloading"  # in a repo's cache folder while `pull` has not finished it
 SHARD_RE = re.compile(r"-of-(\d+)\.safetensors$")
+
+log = logging.getLogger("ai-phone.models")
 
 
 @dataclass(frozen=True)
@@ -97,11 +100,17 @@ def local_path(repo: str) -> Path | None:
     and every shard its index names is there. (The cache links each file in as it arrives, so a download stopped
     part-way leaves a snapshot folder behind.)"""
     from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
     if (_repo_dir(repo) / DOWNLOADING).exists():
         return None
     try:
         path = Path(snapshot_download(repo, local_files_only=True))
-    except Exception:  # not cached (LocalEntryNotFoundError) or an unreadable cache: either way, not usable
+    except LocalEntryNotFoundError:
+        return None  # not downloaded: the ordinary answer, and the one `missing` asks for on every run
+    except Exception as e:
+        # unusable all the same, but a cache the process may not read looks exactly like one that holds nothing,
+        # and that is the difference somebody staring at "not downloaded" needs
+        log.debug("%s: the Hugging Face cache would not answer: %s: %s", repo, type(e).__name__, e)
         return None
     if not (path / "config.json").is_file() or not any(path.glob("*.safetensors")):
         return None

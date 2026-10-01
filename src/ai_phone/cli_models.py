@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 from ai_phone import models, paths
 from ai_phone.config import Config, ConfigError, load_config
@@ -15,6 +16,14 @@ def _gb(n: int | None) -> str:
     return "an unknown amount" if n is None else f"{n / 1e9:.1f} GB"
 
 
+def _why(path: Path, e: Exception) -> str:
+    """One line saying what is wrong with the config, for the warning that goes before the download. A file that
+    cannot be opened at all (a directory in its place, a half-written binary) says so without a traceback."""
+    if isinstance(e, ConfigError):
+        return str(e).splitlines()[0]
+    return f"config: {path} cannot be read: {getattr(e, 'strerror', None) or type(e).__name__}"
+
+
 def _wanted() -> tuple[str, str]:
     """models.tier and brain.kind from the config. One that does not load (a voice named before the speech model is
     complete, say) must not stop the download that fixes it: its own values are used when they are valid."""
@@ -22,8 +31,8 @@ def _wanted() -> tuple[str, str]:
     try:
         cfg = load_config(path) if path.exists() else Config()
         return cfg.models.tier, cfg.brain.kind
-    except ConfigError as e:
-        why = str(e).splitlines()[0]
+    except (ConfigError, OSError, UnicodeDecodeError) as e:
+        why = _why(path, e)
     try:
         raw = read_raw(path)
     except Exception:  # not YAML at all

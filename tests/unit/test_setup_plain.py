@@ -7,7 +7,7 @@ import types
 import pytest
 
 from ai_phone.setup import flow, run_setup
-from ai_phone.setup.plain import PlainUI
+from ai_phone.setup.plain import BLANK_LIMIT, NO_ANSWER, PlainUI
 from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
 from tests.unit.test_setup_flow import FakeActions, ScriptedUI
 
@@ -140,6 +140,33 @@ def test_ask_takes_defaults_and_asks_again_until_valid(typed, capsys):
     assert typed.prompts == ["Name [agent]: ", "Desk: ", "Desk: ", "This Mac's address (192.0.2.1): ",
                              "Outbound calls per day [20]: "]
     assert capsys.readouterr().out.count("! Use lowercase letters, digits and dashes.\n") == 1
+
+
+def test_endless_blank_input_gives_up_instead_of_asking_for_ever(typed, capsys):
+    """A piped `yes ''` never ends and never answers: without a limit the required field is re-asked for ever."""
+    typed.answers += [""] * 20
+    required = lambda v: None if v else "Enter a value."  # noqa: E731
+    with pytest.raises(Cancel, match="No answer after ten tries"):
+        PlainUI().ask(LINE_PAGE, [Field("Name", validate=required)])
+    assert len(typed.prompts) == BLANK_LIMIT
+    out = capsys.readouterr().out
+    assert out.count("! Enter a value.") == BLANK_LIMIT - 1  # the tenth blank gives up instead of complaining again
+    assert NO_ANSWER in out
+
+
+def test_the_blank_count_starts_again_for_each_field_and_after_an_answer(typed, capsys):
+    """Nine blanks then a real answer is not a stuck prompt, and the next field starts its own count."""
+    required = lambda v: None if v else "Enter a value."  # noqa: E731
+    typed.answers += [""] * 9 + ["agent"] + [""] * 9 + ["desk"]
+    fields = [Field("Name", validate=required), Field("Desk", validate=required)]
+    assert PlainUI().ask(LINE_PAGE, fields) == ["agent", "desk"]
+    assert NO_ANSWER not in capsys.readouterr().out
+
+
+def test_a_blank_answer_a_field_accepts_is_not_counted_against_it(typed):
+    """An optional field takes the first empty answer, so it never reaches the limit."""
+    typed.answers += ["", ""]
+    assert PlainUI().ask(LINE_PAGE, [Field("Caller id"), Field("Note")]) == ["", ""]
 
 
 def test_a_secret_is_read_hidden_and_never_printed(typed, capsys):

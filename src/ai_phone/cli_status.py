@@ -58,9 +58,18 @@ def render_last_call(turns_path: Path) -> str:
     call = [r for r in rows if r.get(key) == last_id]
     lat = [r["first_audible_ms"] for r in call if r.get("first_audible_ms") is not None]
     p50 = f"{statistics.median(lat):.0f} ms" if lat else "n/a"
-    return (f"call {last_id}: {len(call)} turns, first audible p50 {p50}, "
-            f"rx overruns: {sum(r.get('rx_overruns', 0) for r in call)}, tx underruns: {sum(r.get('tx_underruns', 0) for r in call)}, "
-            f"brain errors: {sum(1 for r in call if r.get('brain_error'))}, direction: {call[0].get('direction', 'in')}")
+    rx = sum(r.get("rx_overruns") or 0 for r in call)
+    tx = sum(r.get("tx_underruns") or 0 for r in call)
+    out = [f"call {last_id}: {len(call)} turns, first audible p50 {p50}, "
+           f"rx overruns: {rx}, tx underruns: {tx}, "
+           f"brain errors: {sum(1 for r in call if r.get('brain_error'))}, direction: {call[0].get('direction', 'in')}"]
+    # a counter in the hundreds means the caller heard a reply with holes in it, or words of theirs were never
+    # transcribed; as a bare number among five others nobody reads it as the fault it is
+    if rx:
+        out.append(f"warning: {rx} inbound audio frames were dropped; this Mac was too busy during the call.")
+    if tx:
+        out.append(f"warning: {tx} outbound frames were late; this Mac was too busy during the call.")
+    return "\n".join(out)
 
 
 def cmd_status(a) -> int:

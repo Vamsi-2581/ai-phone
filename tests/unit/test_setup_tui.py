@@ -469,6 +469,91 @@ async def test_resizing_the_terminal_refits_the_crumbs_and_the_wordmark():
         await wait_for(pilot, app, lambda: app.outcome is not None)
 
 
+# the shape flow.done_text really produces: long rows, and more of them than a 30-row terminal can hold
+NARROW_DONE = "\n".join([
+    "Saved in ~/.ai-phone/   config.yaml and secrets.env (keys and passwords, private to you)",
+    "",
+    "Lines    main    +15550100001           Twilio number",
+    "         agent   sip:agent@192.0.2.10   SIP address",
+    "Brain    on this Mac · Qwen3.5 4B",
+    "Voice    Heart · American · female · 1.0×",
+    "",
+    "Start ai-phone",
+    "  uv run ai-phone run",
+    "",
+    "Try it",
+    "  call +15550100001 from any phone (your normal call rates)",
+    "  pjsua --local-port 5070 sip:agent@127.0.0.1   talk through this Mac's mic, free",
+])
+# the widest row of the summary, and one the page keeps in view: 81 columns, so at 70 it has to wrap
+WIDEST = "pjsua --local-port 5070 sip:agent@127.0.0.1   talk through this Mac's mic, free"
+
+
+def clipped(text: str) -> list[str]:
+    """Rows where a bordered box ran off the right edge: a top or bottom rule that lost its corner, or a middle row
+    that lost its right wall. Only the input boxes draw these characters."""
+    bad = []
+    for row in text.splitlines():
+        edge = row.strip()
+        if edge.startswith(("╭", "╰")) and not edge.endswith(("╮", "╯")):
+            bad.append(row)
+        elif "│" in edge and edge.count("│") != 2:
+            bad.append(row)
+    return bad
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("width", [70, 104])
+async def test_a_narrow_terminal_clips_no_form_row(width):
+    """A 70-column terminal is the narrowest the wizard is meant to look right in: the input boxes keep both
+    borders, every row fits, and the key hints are whole. 104 columns is the control."""
+    form = Page(2, "Your Twilio credentials", "Saved to ~/.ai-phone/secrets.env, readable only by you.")
+    app = SetupApp(lambda ui: Outcome(0) if ui.ask(form, KEY_FIELDS) else Outcome(1))
+    async with app.run_test(size=(width, 30)) as pilot:
+        await wait_for(pilot, app, showing(app, "Auth Token"))
+        rows = [row.rstrip() for row in screen_text(app).splitlines()]
+        assert clipped("\n".join(rows)) == []
+        assert max(len(row) for row in rows) <= width
+        assert any(look.FORM_KEYS in row for row in rows)
+        tops = [row for row in rows if row.strip().startswith("╭")]
+        assert len(tops) == 2 and len({len(row.strip()) for row in tops}) == 1  # both fields, the same width
+        await pilot.press("a", "enter", "b", "enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+
+
+@pytest.mark.asyncio
+async def test_a_narrow_terminal_keeps_the_menu_and_its_hints_whole():
+    """A question at 70x30 fits as it is: every option, and the whole key hint, not a cut-off one."""
+    app = SetupApp(lambda ui: Outcome(ui.choose(LINE, OPTIONS)))
+    async with app.run_test(size=(70, 30)) as pilot:
+        await wait_for(pilot, app, showing(app, "[2] A SIP address"))
+        rows = [row.rstrip() for row in screen_text(app).splitlines()]
+        assert max(len(row) for row in rows) <= 70
+        assert any(look.MENU_KEYS in row for row in rows)
+        for label in ("[1] A phone number", "[2] A SIP address", "[3] Back"):
+            assert any(label in row for row in rows)
+        await pilot.press("enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+
+
+@pytest.mark.asyncio
+async def test_a_narrow_terminal_wraps_the_done_body_instead_of_cutting_it():
+    """The Done page's summary is wider than 70 columns and taller than 30 rows, so the page scrolls — but no row
+    of it is cut off on the right, which is what a fixed width would have done."""
+    done = Page(6, "You're set up", "Everything is saved. Here's how to use it.", body=NARROW_DONE)
+    app = SetupApp(lambda ui: Outcome(ui.choose(done, [Option("Finish")], back=False)))
+    async with app.run_test(size=(70, 30)) as pilot:
+        await wait_for(pilot, app, showing(app, "Everything is saved."))
+        rows = [row.rstrip() for row in screen_text(app).splitlines()]
+        assert clipped("\n".join(rows)) == []
+        assert max(len(row) for row in rows) <= 70
+        flat = lambda text: " ".join(text.split())  # noqa: E731
+        assert not any(WIDEST in row for row in rows)  # too wide for one row at 70 columns
+        assert flat(WIDEST) in flat(" ".join(rows))  # so it wraps, whole, over two rows
+        await pilot.press("enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+
+
 @pytest.mark.asyncio
 async def test_a_long_body_fits_without_scrolling():
     # the Done page: a summary of ~22 lines, one option and the hint must fit in 40 rows

@@ -72,6 +72,24 @@ def test_pull_works_with_a_config_that_does_not_load(home, monkeypatch, capsys):
     assert asked[-1] == ("t4", "local")
 
 
+@pytest.mark.parametrize("break_it", [
+    pytest.param(lambda path: path.mkdir(), id="a directory where the config should be"),
+    pytest.param(lambda path: path.write_bytes(b"models: {tier: t9}\n\xff\xfe"), id="a file that is not text"),
+])
+def test_pull_works_with_a_config_file_it_cannot_be_read_from(home, monkeypatch, capsys, break_it):
+    """`pull` is the command that repairs a half-finished install, so it has to survive the file it reads: a config
+    that does not parse was already handled, one that cannot be opened at all printed a traceback."""
+    break_it(home / "config.yaml")
+    asked = []
+    monkeypatch.setattr(models, "missing", lambda tier, brain: asked.append((tier, brain)) or [])
+    assert main(["models", "pull"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].startswith("warning: the config does not load (config: ") and "cannot be read" in out[0]
+    assert out[0].endswith("); using the defaults")
+    assert "Traceback" not in "\n".join(out)
+    assert asked == [("t4", "local")]  # nothing in the file could be trusted: the defaults, and auto picks t4
+
+
 def test_pull_stopped_with_ctrl_c_exits_at_once(home, monkeypatch, capsys):
     """huggingface_hub joins its download threads at exit, so a normal exit would wait for the whole download."""
     import os

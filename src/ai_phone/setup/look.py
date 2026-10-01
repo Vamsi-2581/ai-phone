@@ -191,8 +191,8 @@ Center {{ height: auto; }}
 .detail {{ width: 100%; text-align: center; margin: 0 0 1 0; }}
 .error {{ width: 100%; text-align: center; color: {RED}; margin: 0 0 1 0; }}
 Question #menu {{ margin: 2 0 0 0; }}
-#form {{ height: auto; margin: 1 0 0 0; width: 66; }}
-#work {{ height: auto; margin: 1 0 0 0; width: 66; }}
+#form {{ height: auto; margin: 1 0 0 0; width: 66; max-width: 100%; }}
+#work {{ height: auto; margin: 1 0 0 0; width: 66; max-width: 100%; }}
 .label {{ margin: 1 0 0 1; }}
 Input {{ background: {BG}; border: round #2a2d4a; color: {WHITE}; padding: 0 1; }}
 Input:focus {{ border: round {ACCENT}; background: {BG}; background-tint: $foreground 0%; }}

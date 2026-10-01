@@ -69,6 +69,47 @@ def test_last_call_groups_by_the_unique_call_id_when_records_carry_one(tmp_path:
     assert out.startswith("call d4e5f6: 1 turns") and "p50 700 ms" in out and "brain errors: 0" in out
 
 
+def write_turns(path: Path, **counters) -> Path:
+    """One call of two turns, with whatever audio counters the test is about."""
+    rows = [dict({"call_id": "8", "turn": i, "first_audible_ms": 900.0, "rx_overruns": 0, "tx_underruns": 0,
+                  "direction": "in", "brain_error": None}, **(counters if i == 0 else {})) for i in range(2)]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return path
+
+
+def test_last_call_warns_when_inbound_frames_were_dropped(tmp_path: Path):
+    """The 2026-10-01 gate run lost 644 inbound frames and said so only as a number among five others: a caller
+    whose words went missing needs to be told why."""
+    out = render_last_call(write_turns(tmp_path / "turns.jsonl", rx_overruns=644)).splitlines()
+    assert out[0].startswith("call 8: 2 turns") and "rx overruns: 644" in out[0]
+    assert out[1] == "warning: 644 inbound audio frames were dropped; this Mac was too busy during the call."
+    assert len(out) == 2
+
+
+def test_last_call_warns_when_outbound_frames_were_late(tmp_path: Path):
+    out = render_last_call(write_turns(tmp_path / "turns.jsonl", tx_underruns=12)).splitlines()
+    assert out[1] == "warning: 12 outbound frames were late; this Mac was too busy during the call."
+    assert len(out) == 2
+
+
+def test_last_call_warns_about_both_directions_in_the_order_of_the_counters(tmp_path: Path):
+    out = render_last_call(write_turns(tmp_path / "turns.jsonl", rx_overruns=5, tx_underruns=7)).splitlines()
+    assert [row.split()[1] for row in out[1:]] == ["5", "7"]
+    assert "inbound" in out[1] and "outbound" in out[2]
+
+
+def test_last_call_says_nothing_about_audio_when_no_frame_was_lost(tmp_path: Path):
+    out = render_last_call(write_turns(tmp_path / "turns.jsonl"))
+    assert "warning" not in out and "rx overruns: 0, tx underruns: 0" in out
+    assert len(out.splitlines()) == 1
+
+
+def test_last_call_counters_tolerate_a_record_that_left_them_null(tmp_path: Path):
+    turns = tmp_path / "turns.jsonl"
+    turns.write_text(json.dumps({"call_id": "9", "turn": 0, "rx_overruns": None, "tx_underruns": None}) + "\n")
+    assert "rx overruns: 0" in render_last_call(turns)
+
+
 def test_a_sip_address_is_listening_not_unregistered():
     """A SIP address has no registrar, so it is never "registered"; setup's check calls it listening and status agrees,
     because "unregistered" on the line setup just called ready reads as a fault."""

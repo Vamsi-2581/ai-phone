@@ -7,6 +7,8 @@ import getpass
 from ai_phone.setup.ui import STEPS, BaseUI, Cancel, Page
 
 MARKS = {True: "✓", False: "✗", None: "○"}
+BLANK_LIMIT = 10  # a required field re-asked this many times with nothing typed is not being answered
+NO_ANSWER = "No answer after ten tries; setup cancelled."
 
 
 def spaced(text: str) -> str:
@@ -68,12 +70,18 @@ class PlainUI(BaseUI):
         for f in fields:
             # the placeholder says what an empty answer means ("optional", "leave empty to keep the saved key")
             hint = f" [{f.default}]" if f.default and not f.secret else f" ({f.placeholder})" if f.placeholder else ""
+            blanks = 0  # each field counts its own: an answer, or the next field, starts the count again
             while True:
                 if f.secret:
                     value = _read(getpass.getpass, f"{f.label}{hint}: ")
                 else:
                     value = _read(input, f"{f.label}{hint}: ")
                 value = (value if f.secret else value.strip()) or f.default  # a password may start or end with a space
+                # piped input that never ends and never answers (`yes ""`) would otherwise be re-asked for ever
+                blanks = blanks + 1 if not value else 0
+                if blanks >= BLANK_LIMIT:
+                    print(f"! {NO_ANSWER}")
+                    raise Cancel(NO_ANSWER)
                 error = f.validate(value) if f.validate else None
                 if error is None:
                     values.append(value)

@@ -1634,6 +1634,25 @@ def test_done_text_with_one_kind_of_line():
     assert lines[lines.index("Try it") + 1] == "  nothing to call yet: the number is still being set up"
 
 
+def test_a_hand_edited_provider_is_read_as_a_plain_line_not_a_crash():
+    """`provider:` is a mapping in every config ai-phone writes, but the file is the person's to edit: whatever
+    they leave there, the Done page still names the line."""
+    for odd in ("twilio", ["twilio"], 7, None):
+        assert flow.line_kind({"kind": "trunk", "number": "+15550100001", "provider": odd}) == "SIP trunk"
+        assert flow.line_kind({"kind": "sip", "user": "agent", "provider": odd}) == "SIP address"
+    assert flow.line_kind(NUMBER_LINE) == "Twilio number"  # the shape ai-phone writes still reads as the carrier
+    assert flow.line_kind(dict(NUMBER_LINE, provider={"name": "twilio"})) == "Twilio number"  # state defaults to ready
+    assert flow.line_kind({"kind": "trunk", "number": "+15550100001"}) == "SIP trunk"
+
+
+def test_the_done_page_survives_a_hand_edited_provider():
+    lines = {"odd": {"kind": "trunk", "number": "+15550100001", "provider": "twilio"}}
+    rows = flow.done_text(FakeActions(exists=True, lines=lines), flow.Session()).splitlines()
+    assert any(row.endswith("SIP trunk") for row in rows)
+    # no provider mapping to read a state from is the shape of a trunk somebody wired up by hand: it is ready
+    assert rows[rows.index("Try it") + 1] == "  call +15550100001 from any phone (your normal call rates)"
+
+
 # ---- a Claude or ChatGPT subscription as the brain ----------------------------------------------
 
 def test_new_setup_with_a_claude_subscription():
