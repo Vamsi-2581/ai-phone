@@ -116,6 +116,12 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 msg = ipc.recv(conn)
             op = msg.get("op")
             if op == "shutdown":
+                close = getattr(backend, "close", None)  # a brain that holds a CLI session ends it here
+                if close is not None:
+                    try:
+                        close()
+                    except Exception as e:
+                        print(f"[{kind}-worker] close failed: {e!r}", file=sys.stderr, flush=True)
                 break
             if op == "cancel":
                 cancelled.add(msg["gen"])
@@ -133,6 +139,17 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 partial = backend.push(gen, pcm)
                 if partial:
                     ipc.send(conn, {"ev": "partial", "gen": gen, "text": partial})
+                continue
+            if op == "llm.prepare":
+                # A call's instructions are known before its greeting plays: a brain that starts a session (a
+                # subscription CLI) starts it now, so the first reply does not pay the startup. Deliberately before
+                # the cancelled check: the gen is the one the last call ended on, which was cancelled as it ended.
+                prepare = getattr(backend, "prepare", None)  # the local and endpoint brains need no preparing
+                if prepare is not None:
+                    try:
+                        prepare(msg["system_prompt"])
+                    except BrainError as e:
+                        ipc.send(conn, {"ev": "brain_error", "gen": gen, "kind": e.kind})
                 continue
             if gen in cancelled:
                 continue

@@ -319,3 +319,31 @@ def test_voice_cannot_be_checked_before_the_model_is_downloaded(tmp_path: Path, 
     cfg = _load(tmp_path, "tts: {voice: bf_emma}\n")
     assert cfg.tts.voice == "bf_emma"
     assert cfg.warnings == ["config.tts.voice: bf_emma cannot be checked until the speech model is downloaded (ai-phone models pull)"]
+
+
+def test_a_subscription_brain_needs_no_url_or_key(tmp_path: Path):
+    cfg = _load(tmp_path, "brain:\n  kind: claude\n  model: sonnet\n")
+    assert cfg.brain.kind == "claude" and cfg.brain.model == "sonnet" and cfg.brain.cli is None
+    assert cfg.brain.api_key_env is None and cfg.warnings == []
+
+
+def test_a_subscription_brain_without_a_model_gets_its_kinds_own(tmp_path: Path):
+    assert _load(tmp_path, "brain: {kind: claude}\n").brain.model == "haiku"
+    assert _load(tmp_path, "brain: {kind: chatgpt}\n").brain.model == "gpt-5.6-luna"
+    assert _load(tmp_path, "brain: {kind: chatgpt, model: gpt-6-astra}\n").brain.model == "gpt-6-astra"
+
+
+def test_the_brain_cli_is_a_command_or_a_path_to_one(tmp_path: Path):
+    assert _load(tmp_path, "brain: {kind: claude, cli: /opt/homebrew/bin/claude}\n").brain.cli.endswith("/claude")
+    with pytest.raises(ConfigError, match="config.brain.cli"):
+        _load(tmp_path, 'brain: {kind: chatgpt, cli: "codex; rm -rf /"}\n')
+
+
+def test_a_brain_kind_nobody_has_heard_of_is_a_config_error(tmp_path: Path):
+    with pytest.raises(ConfigError, match="config.brain.kind"):
+        _load(tmp_path, "brain: {kind: gemini}\n")
+
+
+def test_a_subscription_brain_model_must_look_like_one(tmp_path: Path):
+    with pytest.raises(ConfigError, match="config.brain.model"):
+        _load(tmp_path, 'brain: {kind: claude, model: "-- --dangerously"}\n')

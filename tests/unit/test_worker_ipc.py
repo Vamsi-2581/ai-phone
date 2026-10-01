@@ -3,7 +3,9 @@ import os
 
 import pytest
 
+from ai_phone.services.backends.fake import FakeLLM
 from ai_phone.services.client import WorkerClient
+from ai_phone.services.errors import BrainError
 from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, tag_frame, untag_frame
 from ai_phone.telephony.rings import FRAME_BYTES, FrameRing
 
@@ -175,3 +177,73 @@ async def test_idle_worker_keeps_warm_and_still_serves(tmp_path):
         await c.stop()
         ring.close()
         ring.unlink()
+
+
+class PrepareProbeLLM(FakeLLM):
+    """A brain that holds a session: it says which instructions it was prepared with, or refuses to prepare at all."""
+
+    def __init__(self, fail: str | None = None):
+        super().__init__()
+        self.fail, self.prepared = fail, None
+
+    def prepare(self, system_prompt):
+        if self.fail:
+            raise BrainError(self.fail)
+        self.prepared = system_prompt
+
+    def stream(self, gen_id, messages, max_tokens):
+        yield f"prepared with {self.prepared!r}"
+
+
+PROBE = "tests.unit.test_worker_ipc:PrepareProbeLLM"
+
+
+async def _generate(c, text="hi"):
+    gen = c.next_gen()
+    c.send({"op": "llm.generate", "gen": gen, "messages": [{"role": "user", "content": text}], "max_tokens": 10})
+    evs = await _collect(c, "done", gen)
+    return "".join(e["text"] for e in evs if e["ev"] == "token")
+
+
+@pytest.mark.asyncio
+async def test_llm_prepare_reaches_a_brain_that_holds_a_session():
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", PROBE, loop, None, None, {"system_prompt": "warm"})
+    await c.start()
+    c.send({"op": "llm.prepare", "gen": c.current_gen, "system_prompt": "This call: take a message."})
+    assert await _generate(c) == "prepared with 'This call: take a message.'"
+    await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_llm_prepare_is_ignored_by_a_brain_that_needs_no_preparing():
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", "ai_phone.services.backends.fake:FakeLLM", loop, None, None, {})
+    await c.start()
+    c.send({"op": "llm.prepare", "gen": c.current_gen, "system_prompt": "This call: take a message."})
+    assert await _generate(c) == "Hello, this is a fake reply."  # no event of its own, and nothing is disturbed
+    await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_llm_prepare_runs_even_though_the_last_call_cancelled_that_generation():
+    """The daemon prepares with the generation the call before it ended on, and that one was cancelled as it ended."""
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", PROBE, loop, None, None, {"system_prompt": "warm"})
+    await c.start()
+    c.cancel(c.current_gen)
+    c.send({"op": "llm.prepare", "gen": c.current_gen, "system_prompt": "Next call."})
+    assert await _generate(c) == "prepared with 'Next call.'"
+    await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_brain_that_cannot_be_prepared_reports_it_and_keeps_serving():
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", PROBE, loop, None, None, {"system_prompt": "warm"}, factory_args={"fail": "not_logged_in"})
+    await c.start()
+    c.send({"op": "llm.prepare", "gen": c.current_gen, "system_prompt": "This call: take a message."})
+    e = await asyncio.wait_for(c.events.get(), 10)
+    assert e["ev"] == "brain_error" and e["kind"] == "not_logged_in"
+    assert await _generate(c) == "prepared with None"  # the worker is alive; the turn itself will start a session
+    await c.stop()

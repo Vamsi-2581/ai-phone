@@ -15,7 +15,7 @@ from pathlib import Path
 from ai_phone import models, paths
 from ai_phone.call_guard import DailyCounter, is_emergency
 from ai_phone.calls import CallRecord, CallRegistry, ListenerBusy
-from ai_phone.config import Config, InboundConfig, LineConfig, line_password_env
+from ai_phone.config import SUBSCRIPTION_KINDS, BrainConfig, Config, InboundConfig, LineConfig, line_password_env
 from ai_phone.control.protocol import EXIT
 from ai_phone.control.server import ControlServer
 from ai_phone.pipeline import prompts
@@ -32,14 +32,77 @@ from ai_phone.telephony.rings import FrameRing
 from ai_phone.telephony.state import LineStatus, StateFile, next_state
 
 log = logging.getLogger("ai-phone")
+FAKE_LLM = "ai_phone.services.backends.fake:FakeLLM"  # the fake brain is the same whatever the config asks for
 FACTORIES = {
     "real": {"stt": "ai_phone.services.backends.mlx_parakeet:ParakeetSTT",
-             "llm": "ai_phone.services.backends.mlx_lm_backend:make_llm",  # one factory; models.tier names the weights
+             "llm": {"local": "ai_phone.services.backends.mlx_lm_backend:make_llm",  # models.tier names the weights
+                     "openai_compatible": "ai_phone.services.backends.openai_compat:make_openai",
+                     "claude": "ai_phone.services.backends.cli_brain:make_claude",
+                     "chatgpt": "ai_phone.services.backends.cli_brain:make_codex"},
              "tts": "ai_phone.services.backends.mlx_kokoro:KokoroTTS"},
     "fake": {"stt": "ai_phone.services.backends.fake:FakeSTT",
-             "llm": "ai_phone.services.backends.fake:FakeLLM",  # the fake brain is the same whatever the tier says
+             "llm": {"local": FAKE_LLM, "openai_compatible": FAKE_LLM, "claude": FAKE_LLM, "chatgpt": FAKE_LLM},
              "tts": "ai_phone.services.backends.fake:FakeTTS"},
 }
+SUBSCRIPTION_FIRST_TOKEN_MS = 12000  # a plan's first word takes seconds: its own CLI starts, then the provider answers
+LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
+BRAIN_WARNINGS = {
+    "claude": ("Brain: your Claude subscription. What callers say, the instructions and the conversation are sent to "
+               "Anthropic through Claude Code (not audio)."),
+    "chatgpt": ("Brain: your ChatGPT subscription. What callers say, the instructions and the conversation are sent to "
+                "OpenAI through Codex (not audio)."),
+}
+
+
+def subscription_first_token_ms(b: BrainConfig) -> int:
+    """The deadline for a plan's first word. Four seconds is the default for a model on this Mac; a number the person
+    set themselves is the one that counts."""
+    default = BrainConfig().first_token_timeout_ms
+    return SUBSCRIPTION_FIRST_TOKEN_MS if b.first_token_timeout_ms == default else b.first_token_timeout_ms
+
+
+def brain_warning(cfg: Config) -> str | None:
+    """What the person is told at start-up about where the words of their calls go. None for a brain on this Mac."""
+    b = cfg.brain
+    if b.kind in BRAIN_WARNINGS:
+        return BRAIN_WARNINGS[b.kind]
+    if b.kind == "openai_compatible":
+        host = b.base_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+        if host not in LOOPBACK:
+            return (f"Brain: {b.base_url}. Transcripts of what callers say, the system prompt and the conversation "
+                    "history are sent there (not audio). What that service keeps is up to that service.")
+    return None
+
+
+def llm_worker(cfg: Config, tier: str, fake: bool, system_prompt: str, secrets: dict, wire: dict) -> dict:
+    """What the brain worker needs: which backend, how to warm it, how to build it, how often to touch it when idle.
+
+    `--fake` stands in for whatever would run on this Mac and for a subscription plan (a trial start must never spend
+    a turn of the person's plan). An OpenAI-compatible endpoint is a server the config names, so that one is used
+    either way.
+    """
+    b = cfg.brain
+    warm = {"system_prompt": system_prompt}
+    if b.kind == "openai_compatible":
+        key = secrets.get(b.api_key_env) if b.api_key_env else None
+        return {"factory": FACTORIES["real"]["llm"][b.kind], "warm_args": warm, "keep_warm_sec": 0.0,
+                "factory_args": {"base_url": b.base_url, "model": b.model, "api_key": key,
+                                 "connect_timeout_ms": b.connect_timeout_ms,
+                                 "first_token_timeout_ms": b.first_token_timeout_ms,
+                                 "stream_idle_timeout_ms": b.stream_idle_timeout_ms,
+                                 "max_response_chars": b.max_response_chars}}
+    if fake:
+        return {"factory": FACTORIES["fake"]["llm"][b.kind], "warm_args": warm, "factory_args": None, "keep_warm_sec": 0.0}
+    if b.kind in SUBSCRIPTION_KINDS:
+        return {"factory": FACTORIES["real"]["llm"][b.kind], "warm_args": warm, "keep_warm_sec": 0.0,
+                "factory_args": {"model": b.model, "cli": b.cli,
+                                 "first_token_timeout_ms": subscription_first_token_ms(b),
+                                 "stream_idle_timeout_ms": b.stream_idle_timeout_ms,
+                                 "max_response_chars": b.max_response_chars}}
+    return {"factory": FACTORIES["real"]["llm"]["local"], "warm_args": {**warm, **wire},
+            "factory_args": {"model_id": models.repo_for(tier)}, "keep_warm_sec": cfg.models.keep_warm_sec}
+
+
 APOLOGY = "Sorry, I lost my train of thought. Could you say that again?"
 GOODBYE = "I'm having trouble thinking right now. Please call back later. Goodbye."
 HANGUP_FIRST_WAIT_SEC = 30.0   # `hangup`: how long the call (and a `--say` goodbye) may take to end before hanging up again
@@ -53,7 +116,7 @@ class Daemon:
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         self.cfg, self.tier, self.log_dir, self.fake, self.lan = cfg, tier, Path(log_dir).expanduser(), fake, lan
         self.secrets = load_secrets(paths.secrets_path())
-        self.remote_brain = cfg.brain.kind == "openai_compatible"
+        self.remote_brain = cfg.brain.kind != "local"  # the brain is outside this Mac: an endpoint, or a plan through its CLI
         self._take_secrets_from_environment()
         self._drop_secret_environment()
         self.line_status: dict[str, LineStatus] = {}
@@ -134,7 +197,9 @@ class Daemon:
 
     def _write_state(self) -> None:
         """state.json is for `ai-phone status`; a write that fails (a full disk) is logged and never stops a call."""
-        brain = {"kind": self.cfg.brain.kind, "base_url": self.cfg.brain.base_url if self.remote_brain else None}
+        b = self.cfg.brain
+        brain = {"kind": b.kind, "base_url": b.base_url if b.kind == "openai_compatible" else None,
+                 "model": "fake" if self.fake else (b.model if self.remote_brain else models.repo_for(self.tier))}
         try:
             self.state_file.write(self.line_status, self.active_call, brain)
         except OSError as e:
@@ -163,20 +228,12 @@ class Daemon:
         wa = {} if self.fake else {"wire_memory": self.cfg.models.wire_memory}  # the MLX backends pin their weights
         kw = self.cfg.models.keep_warm_sec
         stt = WorkerClient("stt", F["stt"], loop, stt_in, None, dict(wa), keep_warm_sec=kw)
-        if self.remote_brain:
-            b = self.cfg.brain
-            key = self.secrets.get(b.api_key_env) if b.api_key_env else None
-            host = b.base_url.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
-            if host not in ("127.0.0.1", "localhost", "::1", "[::1]"):
-                log.warning("Brain: %s. Transcripts of what callers say, the system prompt and the conversation history are sent there "
-                            "(not audio). What that service keeps is up to that service.", b.base_url)
-            llm = WorkerClient("llm", "ai_phone.services.backends.openai_compat:make_openai", loop, None, None, {"system_prompt": default_prompt},
-                               factory_args={"base_url": b.base_url, "model": b.model, "api_key": key, "connect_timeout_ms": b.connect_timeout_ms,
-                                             "first_token_timeout_ms": b.first_token_timeout_ms, "stream_idle_timeout_ms": b.stream_idle_timeout_ms,
-                                             "max_response_chars": b.max_response_chars})
-        else:
-            llm = WorkerClient("llm", F["llm"], loop, None, None, {"system_prompt": default_prompt, **wa},
-                               factory_args=None if self.fake else {"model_id": models.repo_for(self.tier)}, keep_warm_sec=kw)
+        warning = brain_warning(self.cfg)
+        if warning:
+            log.warning("%s", warning)
+        spec = llm_worker(self.cfg, self.tier, self.fake, default_prompt, self.secrets, wa)
+        llm = WorkerClient("llm", spec["factory"], loop, None, None, spec["warm_args"],
+                           factory_args=spec["factory_args"], keep_warm_sec=spec["keep_warm_sec"])
         tts = WorkerClient("tts", F["tts"], loop, None, tts_out, dict(wa),
                            factory_args=None if self.fake else {"voice": self.cfg.tts.voice, "speed": self.cfg.tts.speed}, keep_warm_sec=kw)
         tel: Telephony | None = None
@@ -609,9 +666,13 @@ class Daemon:
         # an outbound call without --prompt falls back to prompts.DEFAULT_CALL_SECTION (calling on the owner's behalf);
         # an incoming call never does: blank inbound instructions mean the take-a-message default
         section = rec.prompt if out else (self.cfg.inbound.instructions.strip() or InboundConfig().instructions)
+        system = prompts.system_prompt(ctx["fixed"], section)
+        # the instructions are settled before the greeting plays: a brain that holds a session starts it now, so the
+        # first reply of the call does not wait for a CLI to come up (every other brain ignores this)
+        llm.send({"op": "llm.prepare", "gen": llm.current_gen, "system_prompt": system})
         tc = TurnController(self.cfg.conversation, tel.port, stt, llm, tts, rx, tx, stt_in, tts_out,
                             Endpointer(vad, self.cfg.conversation.endpoint_silence_ms), ctx["greeting"],
-                            prompts.system_prompt(ctx["fixed"], section), on_turn,
+                            system, on_turn,
                             prompt_frames=cached["prompt"], warning_frames=cached["warning"],
                             rtp_last_rx_ns=lambda: tel.port.last_rx_ns, apology_frames=cached["apology"],
                             goodbye_frames=cached["goodbye"], opening_frames=ctx["disclosure"] if out else None,

@@ -398,8 +398,14 @@ class FakeTC:
 class Worker:
     current_gen = 1
 
+    def __init__(self):
+        self.sent = []
+
     def cancel(self, gen):
         pass
+
+    def send(self, msg):
+        self.sent.append(msg)
 
 
 class Ring:
@@ -462,6 +468,8 @@ async def test_run_call_logs_turns_with_the_call_and_mode_and_finishes_the_recor
     assert d.active_call is None
     tc = FakeTC.last
     assert tc.args[11] == prompts.system_prompt("FIXED", "Book a table for two.")
+    # the brain is told this call's instructions before the greeting plays, so a session can be ready for the first reply
+    assert c["llm"].sent == [{"op": "llm.prepare", "gen": 1, "system_prompt": tc.args[11]}]
     assert tc.kw["generate_opening"] is True and tc.kw["opening_text"] == prompts.DISCLOSURE
     assert tc.kw["opening_frames"] == [b"d"] and tc.kw["direction"] == "out" and isinstance(tc.kw["replies"], ModelReplies)
 

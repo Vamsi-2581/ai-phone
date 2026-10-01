@@ -4,7 +4,7 @@ sip:        transports and NAT for the whole daemon
 lines:      one entry per line (trunk or sip); each is a pjsua2 Account
 inbound:    what the agent says and does when someone calls and no AI is listening
 calls:      outbound limits and relay-mode timing
-brain:      local model or an OpenAI-compatible endpoint
+brain:      a model on this Mac, an OpenAI-compatible endpoint, or the person's own Claude / ChatGPT plan
 tts:        the voice ai-phone speaks with, and how fast
 """
 from __future__ import annotations
@@ -30,6 +30,8 @@ USER_RE = re.compile(r"^[A-Za-z0-9]{4,32}$")          # trunk credentials: what 
 SIP_USER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")     # sip lines: the user part of an AOR
 E164_RE = re.compile(r"^\+[1-9][0-9]{6,14}$")
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+CLI_RE = re.compile(r"^[A-Za-z0-9._~/-]{1,256}$")     # brain.cli: a name to look for on PATH, or a path to one
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,128}$")
 _HOST = r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
 HOST_RE = re.compile(rf"^{_HOST}(?::[0-9]{{1,5}})?$")
 SIP_URI_RE = re.compile(rf"^sip:{_HOST}(?::[0-9]{{1,5}})?(?:;transport=(?:udp|tcp|tls))?$")
@@ -130,13 +132,22 @@ class CallsConfig:
     relay_reply_timeout_sec: int = 25
 
 
+# What a subscription brain runs when the config names no model: Claude Code's fastest alias, and the fastest model
+# a ChatGPT plan lists (measured; see README "Any brain").
+SUBSCRIPTION_MODELS = {"claude": "haiku", "chatgpt": "gpt-5.6-luna"}
+SUBSCRIPTION_KINDS = tuple(SUBSCRIPTION_MODELS)
+
+
 @dataclass
 class BrainConfig:
-    kind: Literal["local", "openai_compatible"] = "local"
-    base_url: str = "http://127.0.0.1:1234/v1"
+    kind: Literal["local", "openai_compatible", "claude", "chatgpt"] = "local"
+    base_url: str = "http://127.0.0.1:1234/v1"   # openai_compatible only; ignored by the other kinds
     model: str = "local"
-    api_key_env: str | None = None
+    api_key_env: str | None = None               # openai_compatible only; a subscription brain needs no key
+    cli: str | None = None                       # claude / chatgpt: where the CLI is; null = look for it on PATH
     connect_timeout_ms: int = 2000
+    # a subscription brain's first word takes seconds (its own CLI, then the provider), so the daemon raises this to
+    # 12000 for those kinds while it is still the default below; set it yourself and your number is the one used
     first_token_timeout_ms: int = 4000
     stream_idle_timeout_ms: int = 4000
     max_response_chars: int = 2000
@@ -467,6 +478,12 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
         _require(loopback or u.scheme == "https", "config.brain.base_url: a brain that is not on this machine must use https")
         if br.api_key_env is not None:
             _require(bool(ENV_RE.fullmatch(br.api_key_env)), "config.brain.api_key_env: must match " + ENV_RE.pattern)
+    if br.kind in SUBSCRIPTION_KINDS:
+        if br.model == BrainConfig().model:  # "local" names a model on this Mac: for a plan, take the kind's own default
+            br.model = SUBSCRIPTION_MODELS[br.kind]
+        _require(bool(MODEL_RE.fullmatch(br.model)), f"config.brain.model: {br.model!r} is not a model name")
+        if br.cli is not None:
+            _require(bool(CLI_RE.fullmatch(br.cli)), "config.brain.cli: expected a command name or a path to one")
     from ai_phone import voices
     t = cfg.tts
     _require(bool(voices.VOICE_RE.fullmatch(t.voice)), f"config.tts.voice: {t.voice!r} is not an English voice (like af_heart or bm_george)")

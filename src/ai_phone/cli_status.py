@@ -14,7 +14,8 @@ from ai_phone.telephony.state import StateError, StateFile
 def render_status(state: dict, alive: bool) -> str:
     rows = [f"daemon {'running' if alive else 'not running'} (state written {time.strftime('%H:%M:%S', time.localtime(state.get('written_at', 0)))})"]
     b = state.get("brain") or {}
-    rows.append(f"brain: {b.get('kind', 'local')}" + (f" at {b['base_url']}" if b.get("base_url") else ""))
+    rows.append(f"brain: {b.get('kind', 'local')}" + (f" ({b['model']})" if b.get("model") else "")
+                + (f" at {b['base_url']}" if b.get("base_url") else ""))
     rows.append(f"{'line':12s} {'kind':5s} {'state':12s} {'address':28s} registrar / error")
     for lid, l in (state.get("lines") or {}).items():
         extra = l.get("last_error") or (l.get("registrar") or "")
