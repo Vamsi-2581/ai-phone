@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from ai_phone.cli import main
-from ai_phone.cli_status import render_last_call, render_status
+from ai_phone.cli_status import line_state, render_last_call, render_status
 
 STATE = {"written_at": 1.0, "brain": {"kind": "local", "base_url": None}, "active_call": None,
          "lines": {"main": {"id": "main", "kind": "trunk", "address": "+442079460000", "state": "registered", "registrar": "sip.telnyx.com",
@@ -67,3 +67,19 @@ def test_last_call_groups_by_the_unique_call_id_when_records_carry_one(tmp_path:
     turns.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     out = render_last_call(turns)
     assert out.startswith("call d4e5f6: 1 turns") and "p50 700 ms" in out and "brain errors: 0" in out
+
+
+def test_a_sip_address_is_listening_not_unregistered():
+    """A SIP address has no registrar, so it is never "registered"; setup's check calls it listening and status agrees,
+    because "unregistered" on the line setup just called ready reads as a fault."""
+    out = render_status(STATE, alive=True)
+    assert "unregistered" not in out
+    assert "agents" in out and "listening" in out
+    assert "main" in out and "registered" in out  # a trunk still reports what the registrar said
+
+
+def test_line_state_leaves_every_other_state_alone():
+    assert line_state({"kind": "sip", "state": "unregistered"}) == "listening"
+    assert line_state({"kind": "trunk", "state": "unregistered"}) == "unregistered"
+    assert line_state({"kind": "sip", "state": "degraded"}) == "degraded"
+    assert line_state({}) == "?"

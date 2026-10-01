@@ -8,7 +8,7 @@ from pathlib import Path
 import yaml
 
 from ai_phone import paths
-from ai_phone.lines.journal import line_lock
+from ai_phone.lines.journal import line_lock, private_mkdir
 
 
 def read_raw(path: Path) -> dict:
@@ -20,7 +20,9 @@ def read_raw(path: Path) -> dict:
 
 def write_raw(path: Path, raw: dict) -> None:
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # the config shares the ai-phone home with the secrets file, which secrets.py keeps 0700: a setup run that saves
+    # no key never calls secrets.py, so the home must be private whichever of the two writes to it first
+    private_mkdir(path.parent)
     fd, tmp = tempfile.mkstemp(prefix=".config-", dir=path.parent)
     try:
         os.fchmod(fd, 0o600)

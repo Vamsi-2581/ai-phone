@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from ai_phone.lines.credentials import generate_sip_password, generate_sip_user
-from ai_phone.lines.journal import Journal, line_lock
+from ai_phone.lines.journal import Journal, line_lock, private_mkdir
 
 
 def test_journal_lifecycle(tmp_path: Path):
@@ -90,3 +90,20 @@ def test_lock_file_is_private_and_never_a_symlink(tmp_path: Path):
     with line_lock(d):
         pass
     assert stat.S_IMODE((d / ".lock").stat().st_mode) == 0o600
+
+
+def test_the_lock_makes_every_directory_it_creates_private(tmp_path: Path):
+    """Taking the lock is what creates ~/.ai-phone on a first run, so the home it makes on the way to lines/ is
+    0700 as well, not just lines/ itself."""
+    home = tmp_path / "home" / ".ai-phone"
+    with line_lock(home / "lines"):
+        pass
+    assert stat.S_IMODE((home / "lines").stat().st_mode) == 0o700
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    assert stat.S_IMODE((tmp_path / "home").stat().st_mode) == 0o700
+
+
+def test_private_mkdir_leaves_a_directory_that_is_already_there_alone(tmp_path: Path):
+    (tmp_path / "there").mkdir(mode=0o755)
+    private_mkdir(tmp_path / "there")
+    assert stat.S_IMODE((tmp_path / "there").stat().st_mode) == 0o755

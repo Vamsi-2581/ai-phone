@@ -11,6 +11,14 @@ from ai_phone.control.client import probe
 from ai_phone.telephony.state import StateError, StateFile
 
 
+
+def line_state(line: dict) -> str:
+    """What to call a line's state. A SIP address has no registrar to register with, so its "unregistered" would read
+    as a fault; setup's own check calls it listening, and so does this."""
+    state = line.get("state", "?")
+    return "listening" if line.get("kind") == "sip" and state == "unregistered" else state
+
+
 def render_status(state: dict, alive: bool) -> str:
     rows = [f"daemon {'running' if alive else 'not running'} (state written {time.strftime('%H:%M:%S', time.localtime(state.get('written_at', 0)))})"]
     b = state.get("brain") or {}
@@ -19,7 +27,7 @@ def render_status(state: dict, alive: bool) -> str:
     rows.append(f"{'line':12s} {'kind':5s} {'state':12s} {'address':28s} registrar / error")
     for lid, l in (state.get("lines") or {}).items():
         extra = l.get("last_error") or (l.get("registrar") or "")
-        rows.append(f"{lid:12s} {l.get('kind', '?'):5s} {l.get('state', '?'):12s} {l.get('address', ''):28s} {extra}")
+        rows.append(f"{lid:12s} {l.get('kind', '?'):5s} {line_state(l):12s} {l.get('address', ''):28s} {extra}")
     ac = state.get("active_call")
     if not ac:
         rows.append("active call: none")

@@ -17,10 +17,22 @@ LINE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")  # same rule as config.LINE_ID_RE;
 STATES = ("pending", "ready", "failed", "rollback_failed")
 
 
+def private_mkdir(d: Path) -> None:
+    """Create `d`, and any directory missing above it, 0700. Everything ai-phone makes lives in the ai-phone home
+    beside the config and the secrets file, so no directory it creates on the way there is world-readable: plain
+    `mkdir(parents=True)` would leave the home itself at the umask's 0755 and only the last directory private."""
+    missing, p = [], Path(d)
+    while not p.exists() and p != p.parent:
+        missing.append(p)
+        p = p.parent
+    for p in reversed(missing):
+        p.mkdir(mode=0o700, exist_ok=True)
+
+
 def _private_dir(d: Path) -> Path:
     if d.is_symlink():
         raise RuntimeError(f"{d} is a symlink; refusing to use it")
-    d.mkdir(parents=True, exist_ok=True)
+    private_mkdir(d)
     os.chmod(d, 0o700)
     return d
 
