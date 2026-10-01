@@ -11,11 +11,11 @@
 
 ## 1. Purpose and shape
 
-ai-phone is a single daemon that owns one or more SIP lines (each its own registration or SIP address) and one phone conversation at a time across them. It registers to SIP trunks or PBXs, answers and places calls, and runs a streaming speech-to-text → language model → text-to-speech pipeline on the host machine by default. During a call it makes no network connections other than SIP signalling and RTP media to the peer, plus HTTP(S) to the one brain endpoint the user configured if they chose a remote brain instead of the local model (Milestone 2 amendment, §14a). **[D]**
+ai-phone is a single daemon that owns one or more SIP lines (each its own registration or SIP address) and one phone conversation at a time across them. It registers to SIP trunks or PBXs, answers and places calls, and runs a streaming speech-to-text → language model → text-to-speech pipeline on the host machine by default. During a call it makes no network connections other than SIP signalling and RTP media to the peer, plus — only if the user chose a brain that is not on this machine — HTTP(S) to the one endpoint they configured, or the CLI of their own Claude or ChatGPT plan, which talks HTTPS to its provider (Milestone 2 amendment, §14a; Milestone 4, §14a.7). **[D]**
 
 Shape in one line: **a telephony layer that knows nothing about models, a model layer that knows nothing about telephony, and an asyncio pipeline between them that owns the conversation.**
 
-Non-goals that shape the architecture: single-call, English-only, no web UI, no cloud fallback, no external model server required (a user may point the brain at an OpenAI-compatible endpoint, §14a.7), no SMS through launch.
+Non-goals that shape the architecture: single-call, English-only, no web UI, no cloud fallback, no external model server required (a user may point the brain at an OpenAI-compatible endpoint, or at the Claude or ChatGPT plan they already pay for, §14a.7), no SMS through launch.
 
 ### 1.1 Context diagram
 
@@ -51,7 +51,7 @@ Non-goals that shape the architecture: single-call, English-only, no web UI, no 
 | `llm-worker` | Language model backend (mlx-lm / llama-cpp-python) | Largest memory; isolated crash domain |
 | `tts-worker` | Text-to-speech backend (Kokoro) | Same |
 
-Workers are children of the main process (`multiprocessing`, spawn start method on both platforms for consistency). There is no external model server in the default install: Ollama, vLLM and similar are excluded as a dependency **[D]** (they conflict with one-command install and would appear in the isolation firewall log). Since Milestone 2 the user may *choose* an OpenAI-compatible endpoint as the brain (`brain.kind: openai_compatible`, §14a.7); that is their configuration, announced at start, not something ai-phone installs or needs.
+Workers are children of the main process (`multiprocessing`, spawn start method on both platforms for consistency). There is no external model server in the default install: Ollama, vLLM and similar are excluded as a dependency **[D]** (they conflict with one-command install and would appear in the isolation firewall log). Since Milestone 2 the user may *choose* an OpenAI-compatible endpoint as the brain (`brain.kind: openai_compatible`, §14a.7), and since Milestone 4 the Claude or ChatGPT plan they already pay for, through the CLI they are logged into (`claude` / `chatgpt`, a child process of the LLM worker); that is their configuration, announced at start, not something ai-phone installs or needs.
 
 VAD runs **in the main process** **[P]**: Silero is small (~2 MB) and its per-chunk cost (~1 ms for 32 ms of audio on Apple Silicon) is far below the frame budget; keeping it in-process removes an IPC hop from the endpointing path, which is 300 of the 900 ms budget.
 
@@ -631,7 +631,7 @@ Downloads what the config needs and is not on this Mac yet (§5.5), for the tier
 
 The daemon is carrier-free: it registers one pjsua2 `Account` per configured line over shared UDP/TCP(/TLS) transports and routes calls and caller IDs by line. Provisioning is a CLI concern (`ai-phone lines …`) behind a `Provider` protocol with a resumable journal; the daemon never imports `ai_phone.providers` (a test pins this). Outbound calls run through a minimal control socket (extended in Milestone 3, §7.2). The language-model worker has a second backend that streams from any OpenAI-compatible endpoint and reports recoverable `brain_error` events instead of dying. Configuration applies at daemon restart; live reload and IP-change handling are later work.
 
-**Amended invariants.** During a call, ai-phone opens no network connection except SIP/RTP to the peer and HTTP(S), with its DNS lookup, to the one configured brain endpoint (the default brain is the local model and uses no socket). STUN and `trusted_peers` DNS resolution happen at daemon start only. One daemon, one or more lines, one call at a time across all of them; every telephony event carries `line_id`. Registration retry is PJSIP's own scheme (nominally 5 s, then every 30 s, each randomised by up to 10 s); the gate "re-registered within 60 s" is for induced transport loss with the carrier reachable. Latency is daemon-side (t0 → t5), on the PSTN leg as on the LAN.
+**Amended invariants.** During a call, ai-phone opens no network connection except SIP/RTP to the peer and HTTP(S), with its DNS lookup, to the one configured brain: an endpoint, or (Milestone 4) the Claude Code / Codex CLI the LLM worker drives, which talks HTTPS to its own provider (the default brain is the local model and uses no socket). STUN and `trusted_peers` DNS resolution happen at daemon start only. One daemon, one or more lines, one call at a time across all of them; every telephony event carries `line_id`. Registration retry is PJSIP's own scheme (nominally 5 s, then every 30 s, each randomised by up to 10 s); the gate "re-registered within 60 s" is for induced transport loss with the carrier reachable. Latency is daemon-side (t0 → t5), on the PSTN leg as on the LAN.
 
 **Grammar** (validated with `fullmatch` in `config.py`, re-checked by `LineSpec.from_config` for anything that ends up in a SIP header): line id `^[a-z0-9-]{1,32}$`; trunk SIP user `^[A-Za-z0-9]{4,32}$` (the carriers' credential rule), sip-line user `^[A-Za-z0-9._-]{1,64}$`; E.164 `^\+[1-9][0-9]{6,14}$`; env var `^[A-Z_][A-Z0-9_]*$`; host `host[:port]`; registrar/proxy `sip:host[:port][;transport=udp|tcp|tls]` (never `sips:`); AOR `sip:user@host[:port]`; display name printable ASCII 1–64 without `"` or `\`. Name-addr strings are built only from validated parts, never escaped.
 
@@ -702,12 +702,14 @@ calls:                                              # Milestone 3 (§14b.8, §14
   relay_reply_timeout_sec: 25
 
 brain:
-  kind: local                                       # local | openai_compatible
+  kind: local                                       # local | openai_compatible | claude | chatgpt
   base_url: "http://127.0.0.1:1234/v1"              # openai_compatible; https required unless loopback
-  model: "qwen3.5-4b"
-  api_key_env: null
+  model: "qwen3.5-4b"                               # claude: haiku|sonnet|opus (default haiku); chatgpt: a model the
+                                                    # plan lists (default gpt-5.6-luna, the fastest measured)
+  api_key_env: null                                 # openai_compatible only; a subscription brain needs no key
+  cli: null                                         # claude/chatgpt: path to the CLI; null = `claude`/`codex` on PATH
   connect_timeout_ms: 2000
-  first_token_timeout_ms: 4000
+  first_token_timeout_ms: 4000                      # the daemon passes 12000 for claude/chatgpt while this is 4000
   stream_idle_timeout_ms: 4000
   max_response_chars: 2000
 
@@ -812,6 +814,32 @@ ai-phone status                                    # per-line registration rows 
 - `services/backends/openai_compat.py`: an `LLMBackend` that POSTs `<base_url>/chat/completions` with `stream: true`, the call's system prompt (§14b.4; without the hostname/chip line the local brain gets) and the capped history, and yields `delta.content` tokens to the same clause chunker. Cancel closes the HTTP response. Redirects are not followed. TLS certificate verification on; `api_key_env` is sent as `Authorization: Bearer` and never logged.
 - Failure rules: connect timeout, first-token timeout, idle timeout, non-2xx, malformed SSE, or `max_response_chars` exceeded → the backend raises `BrainError(kind)`; the LLM worker catches it and emits a typed IPC event `{"ev": "brain_error", "gen": <gen_id>, "kind": <kind>}` instead of dying (today any backend exception is a fatal worker error, so `run_worker` gains this catch for the generate path only). The controller, on `brain_error` for the current gen: first cancels that generation exactly like a barge-in (workers drop the gen, the outbound ring is flushed, a new `gen_id` is issued) so no partial model output is spoken over the apology, then plays the cached phrase "Sorry, I lost my train of thought. Could you say that again?", records `brain_error=<kind>` in the turn, returns to `LISTENING`; on the second consecutive `brain_error` in a call: cached goodbye and BYE. The counter resets on a turn that completes. No automatic retry (the caller is waiting). A stale-gen `brain_error` is discarded like any stale result.
 - Latency is recorded per turn exactly as for the local brain (`llm_first_clause_ms`), not gated.
+
+**A subscription as the brain** (Milestone 4, 2026-10-01). `brain.kind: claude` or `chatgpt` makes the plan the person
+already pays for the agent, with no API key: `services/backends/cli_brain.py` drives the CLI they are logged into.
+`ClaudeCodeLLM` runs `claude -p --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --settings
+'{"alwaysThinkingEnabled": false}' --input-format stream-json --output-format stream-json --include-partial-messages
+--system-prompt <prompt> --model <model> --tools ""` and writes one `{"type":"user",…}` line per turn; text arrives as
+`stream_event` deltas and `result` ends the turn (`--bare` must not be used: it skips the keychain login, and every
+CLAUDE* variable is removed from the child's environment or the CLI takes itself for a nested session). `CodexLLM`
+speaks `codex app-server`'s JSON-RPC 2.0 over stdio: `initialize` → `initialized` → `thread/start` (ephemeral,
+`sandbox: read-only`, `approvalPolicy: never`, `baseInstructions`, the model always named explicitly because the
+person's own default may be one the plan forbids) → `turn/start` per turn, `item/agentMessage/delta` until
+`turn/completed`, `turn/interrupt` to cancel. Both run in `~/.ai-phone/brain/` (0700, empty), so no CLAUDE.md,
+AGENTS.md or project settings of the person's own are read, and `-c mcp_servers={}` keeps their MCP servers out of
+every Codex thread (measured: thread start 1130 ms → 170 ms). One session per call: the session remembers the
+instructions and the conversation it was given, so a turn sends only the newest thing the caller said; a different
+system prompt, or a history that is not this session's continuation, starts a new session. A reply the caller talked
+over comes back marked `[interrupted]`, so an assistant turn is matched by its place in the conversation, not its
+words. The worker's new `llm.prepare` op (sent by the daemon as soon as a call's instructions are composed, before the
+greeting plays, and ignored by backends without `prepare`) starts the session so the first reply does not pay the
+startup. `warmup` spends one tiny turn ("Say OK.") to prove the login and throws that session away; failures are the
+same `BrainError` kinds as the endpoint brain plus `cli_missing`, `not_logged_in` and `model_not_allowed`.
+`max_tokens` cannot be imposed on a CLI, so a reply past `max_response_chars` ends the turn. Nothing of the
+conversation is logged: timings and the model only, with the CLI's own stderr at debug, truncated. Measured on this
+Mac (first word, a call's first turn): Claude Code 2.1.286 + Haiku 2.4–5.5 s, then about 1 s; codex-cli 0.157.1 +
+gpt-5.6-luna 3.9–4.4 s, then 1.1–1.9 s — so the daemon raises `first_token_timeout_ms` to 12000 for these kinds while
+the config still holds the 4000 a model on this Mac gets.
 
 
 **Differences between the approved design and what was built** (each came out of a review or a test): Telnyx orders carry `customer_reference "ai-phone:<line-id>"` and an unfinished order is reconciled by that reference; a delivered order whose number is not yet listed stays `pending`; Twilio provisioning is one journal step per carrier request (credential list, credential, domain, domain mapping, number, trunk, trunk credential list), each reconciled by name; `lines resume` re-runs `provision()` (idempotent through the journal) rather than `poll()`, using a `target` step written first; pending results are written only if the line loads; `carrier_ready` is journaled only for ready results; the brain backend streams in a helper thread so the first-token and idle deadlines are enforced by the consumer (headers and SSE keepalives included) and `[DONE]` ends the stream at once; `brain_error` cancels the generation like a barge-in, keeps the partial reply in history as `[interrupted]`, holds the apology until the PJSIP-side flush has happened, and the goodbye drains before the BYE; `MediaActive` and `Dtmf` carry `line_id`; a single `threading.Lock` makes the one-call claim atomic between the PJSIP thread and the asyncio thread; the outbound answer timer is owned by its call; `dialling` is queued before `makeCall` and a synchronous failure closes the sequence with `rejected`. Two more came out of the Telnyx spike (2026-09-03): incoming requests are assigned to a line by `line_for_request` (request-URI/To user and host, then the trunk's registrar/trusted proxies) through `AiEndpoint.onSelectAccount`, because PJSIP's own scoring handed a LAN INVITE for the `sip` line to the registered trunk; and the MLX workers wire their model memory at warm-up with `conversation.reply_timeout_sec` as the backstop, because a busy host paged the idle models out and the first transcript took 10 s.
@@ -956,7 +984,7 @@ The three phrases are synthesised at daemon start, like the apology and the good
 - **Emergency numbers are never dialled** (`call_guard.is_emergency`, the first check in the daemon's `call` handler, so every client is covered; exit 13). A target is refused when its digits equal 000, 100, 101, 102, 103, 108, 110, 112, 118, 119, 190, 911 or 999: alone, behind a 1–3 digit country code, or behind an international access prefix (00 or 011) and such a country code. A `sip:` target is checked by its user part when that part has no letters (only digits, spaces and `+ . _ - ( )`). Extensions that look like an emergency number (100, 1000, 4112) are refused too; call such extensions by a name with letters.
 - **Daily limit** (`calls.daily_limit`; 0 means no limit; exit 14). It is checked before dialling. Every dial attempt the SIP stack accepted counts, busy and unanswered calls included, per local day. The count lives in `~/.ai-phone/calls-today.json` (`{"date", "count"}`, written to a temporary file, synced and renamed), so a restart does not reset it. It is a file of its own because the daemon rewrites `state.json` whole on every registration change. A missing or malformed file, or one from another day, reads as 0. If the count cannot be written after the dial (a full disk, an unwritable `~/.ai-phone`), the call is hung up at once and refused with exit 7; its record ends `rejected` with `ended_by: error` and the detail "could not update the daily call counter: …", so no attempt escapes the limit. A `call` handler that fails for any other reason also hangs up a call that has not been answered, so the phone never goes on ringing with nobody behind it.
 - **Call length** stays capped by `conversation.max_call_sec` (600 s) in both modes; the silence, RTP and brain-error rules are unchanged.
-- **Where transcripts go.** Transcripts leave ai-phone only through the command that asked for them (each turn also stays in `turns.jsonl`, as before), and, with a remote brain (`brain.kind: openai_compatible`, §14a.7), through that endpoint during the call: what callers say, the call's system prompt and the conversation so far go there on every turn in phone agent mode. If the calling AI runs on a cloud model, that service sees them. The README says so next to the examples.
+- **Where transcripts go.** Transcripts leave ai-phone only through the command that asked for them (each turn also stays in `turns.jsonl`, as before), and, with a brain that is not on this machine (`brain.kind: openai_compatible`, `claude` or `chatgpt`, §14a.7), through that endpoint — or through the person's own logged-in CLI, to Anthropic or OpenAI — during the call: what callers say, the call's system prompt and the conversation so far go there on every turn in phone agent mode. If the calling AI runs on a cloud model, that service sees them. The README says so next to the examples.
 
 ### 14b.9 Configuration
 
@@ -1002,6 +1030,7 @@ Each came out of planning or a review:
 | 2026-09-02 | Python; Go rejected by owner; TS/Swift/Rust evaluated and rejected | [D] |
 | 2026-09-02 | PJSIP via pjsua2, vendored into the platform wheel; AGPLv3 | [D] |
 | 2026-09-02 | Hand-rolled asyncio pipeline for M1; Pipecat only if it deletes more code than it adds | [D] |
+| 2026-10-01 | **A subscription can be the brain** (`brain.kind: claude` / `chatgpt`, §14a.7): ai-phone drives the CLI the person is already logged into (Claude Code's stream-json session, `codex app-server`'s JSON-RPC), because that is the only way to use a paid plan without an API key. One session per call in an empty private directory, with no tools and none of their own settings; `llm.prepare` starts it while the greeting plays. Cost if wrong: a brain slower to the first word than the model on this Mac (measured 2.4–5.5 s for Haiku, 3.9–4.4 s for gpt-5.6-luna, against 874 ms p50 locally), and the conversation leaves the Mac — both documented, and the daemon says so at start | [D] |
 | 2026-09-02 (amended 2026-09-03) | LLM in the daemon's own worker process; no Ollama or any external model server is required. Since Milestone 2 the user may configure an OpenAI-compatible endpoint as the brain (§14a.7); that is their choice, announced at start, not a dependency | [D] |
 | 2026-09-02 | mlx-audio for STT/TTS/VAD on Mac; parakeet-mlx fallback only | [D] |
 | 2026-09-02 | Media port at 16 kHz; VAD in main process; three workers; shared-memory audio, JSON control | [D]/[P] as marked |

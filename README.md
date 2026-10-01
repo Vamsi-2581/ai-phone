@@ -3,8 +3,8 @@
 A phone line answered by an AI that runs on your own machine. Give an agent a real number (a new one
 bought with your own Telnyx or Twilio key, or one already on that account), divert your own phone to it,
 or reach it at a SIP address; speech-to-text, the language model and text-to-speech run locally by
-default, and during a call the daemon talks to nothing but SIP/RTP (and a brain endpoint only if you
-configured one).
+default, and during a call the daemon talks to nothing but SIP/RTP (and one brain only if you chose
+one that is not on this Mac: your own endpoint, or the Claude or ChatGPT plan you already pay for).
 
 **Status: Milestone 1 (latency proof) passed; Milestone 2 (lines) code complete, its live gate pending; Milestone 3 (agent tool) code complete, its gate pending; Milestone 4 (get started: install script and setup wizard) in progress.**
 English only, one call at a time. See `architecture-essentials.md` for how it works.
@@ -70,7 +70,9 @@ ai-phone status
 # The brain on this Mac: one of t4, t9, qwen2b, llama3b, gemma4b, mistral7b, gemma12b (the catalog in models.py),
 # auto to pick by memory, or any mlx-lm 4-bit repo id
 #   models: {tier: gemma4b}
-# Or any brain: LM Studio, llama.cpp, or your own agent behind an OpenAI-compatible endpoint
+# Or a brain that is not on this Mac (see "Any brain" below)
+#   brain: {kind: claude, model: haiku}                 # your Claude plan, through the Claude Code login
+#   brain: {kind: chatgpt, model: gpt-5.6-luna}         # your ChatGPT plan, through the Codex login
 #   brain: {kind: openai_compatible, base_url: "http://127.0.0.1:1234/v1", model: "…"}
 # And the voice
 #   tts: {voice: bf_emma, speed: 1.0}   (English voices: af_/am_ American, bf_/bm_ British)
@@ -83,6 +85,26 @@ During a call the daemon opens no network connection except SIP/RTP to the peer 
 What an incoming call hears is set by one `inbound:` section of the config: a greeting that plays on every incoming
 call, and the instructions ai-phone's own model follows when no AI is waiting in `ai-phone listen` (the example config
 takes a message).
+
+## Any brain
+
+The agent's words can come from a model on this Mac, from a plan you already pay for, or from any
+OpenAI-compatible server. Speech-to-text and the voice always run here, whichever you pick. `ai-phone setup`
+asks, and the daemon says at start where the words of a call go.
+
+| Brain | First word (measured here) | What leaves this Mac | What it needs |
+|---|---|---|---|
+| **On this Mac** (default) | 874 ms p50 on the 4B tier | nothing: no socket is opened | about 4 GB of models |
+| **Your Claude subscription** | 2.4–5.5 s on a call's first turn, about 1 s after | what callers say, the call's instructions and the conversation go to Anthropic (not audio) | `claude` installed and logged in; your plan's own limits apply |
+| **Your ChatGPT subscription** | 3.9–4.4 s on a call's first turn, 1.1–1.9 s after | the same, to OpenAI | `codex` installed and logged in; your plan's own limits apply |
+| **Your own endpoint** | whatever that server does | the same, to that server | an OpenAI-compatible URL, `https` unless it is on this Mac; a key if it wants one |
+
+A subscription brain uses no API key: ai-phone drives the CLI you are already logged into (`claude -p`, or
+`codex app-server`) in an empty private directory, with no tools and none of your own project settings, and
+streams its words to the caller. Install them with `npm install -g @anthropic-ai/claude-code` (then `claude`
+and `/login`) or `npm install -g @openai/codex` (then `codex login`). A plan is a second or two slower to the
+first word than the model on this Mac, and it is not private; what it buys is a much stronger brain on the
+phone than 24 GB of memory can hold.
 
 ## Use it from your AI (Milestone 3)
 
@@ -147,10 +169,11 @@ its result).
 | 14 | daily outbound call limit reached |
 | 130 | interrupted with Ctrl-C |
 
-Transcripts leave ai-phone only through the command that asked for them, and, if you configured a remote brain
-(`brain.kind: openai_compatible`), through that endpoint during a phone agent call: what callers say and the
-conversation so far go there on every turn, with the call's instructions. If your agent runs on a cloud model, that
-service sees the transcript.
+Transcripts leave ai-phone only through the command that asked for them, and, if you chose a brain that is not on
+this Mac (`brain.kind: openai_compatible`, `claude` or `chatgpt`), through that endpoint — or through your own
+logged-in CLI, to Anthropic or OpenAI — during a phone agent call: what callers say and the conversation so far go
+there on every turn, with the call's instructions. If your agent runs on a cloud model, that service sees the
+transcript.
 
 ## License
 

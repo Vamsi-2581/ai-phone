@@ -56,9 +56,15 @@ models:
                              # something else first and the first reply after a quiet spell is not seconds late. 0 = off
 
 brain:
-  kind: local                # local | openai_compatible (any /v1/chat/completions server: LM Studio, llama.cpp, your own agent)
-  base_url: "http://127.0.0.1:1234/v1"
-  model: "local"
+  kind: local                # local | openai_compatible (any /v1/chat/completions server: LM Studio, llama.cpp, your own
+                             # agent) | claude | chatgpt (the plan you already pay for, through the CLI you are logged
+                             # into: no API key, and the plan's own limits apply)
+  base_url: "http://127.0.0.1:1234/v1"   # openai_compatible only; https unless it is on this machine
+  model: "local"             # the endpoint's model name; for claude haiku | sonnet | opus (default haiku), for chatgpt
+                             # a model the plan lists (default gpt-5.6-luna, the fastest measured on a call)
+  cli: null                  # claude / chatgpt: where that CLI is; null = look for `claude` or `codex` on PATH
+  # first_token_timeout_ms defaults to 4000, which is for a model on this Mac: the daemon gives a subscription brain
+  # 12000 unless you set a number here yourself (its first word takes seconds — its CLI starts, then the provider).
 
 tts:
   voice: af_heart   # English voices from the speech model: af_/am_ American, bf_/bm_ British (ai-phone setup lists them)

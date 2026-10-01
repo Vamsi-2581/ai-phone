@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 
 import pytest
@@ -247,3 +248,37 @@ async def test_a_brain_that_cannot_be_prepared_reports_it_and_keeps_serving():
     assert e["ev"] == "brain_error" and e["kind"] == "not_logged_in"
     assert await _generate(c) == "prepared with None"  # the worker is alive; the turn itself will start a session
     await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_subscription_brain_through_the_real_worker(tmp_path, monkeypatch):
+    """The whole wiring the daemon uses: the factory args it passes, warm-up, llm.prepare, then a turn — against the
+    fake CLI, so no plan is spent."""
+    from tests.unit.test_cli_brain import FAKE_CLI
+
+    exe = tmp_path / "fake-cli"
+    exe.write_text(FAKE_CLI)
+    exe.chmod(0o755)
+    spec = tmp_path / "script.json"
+    spec.write_text(json.dumps({"protocol": "claude", "log": str(tmp_path / "cli.jsonl"),
+                                "turns": [{"deltas": ["OK"]}, {"deltas": ["Hello", " there."]}]}))
+    monkeypatch.setenv("AI_PHONE_FAKE_CLI", str(spec))
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path / "home"))
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", "ai_phone.services.backends.cli_brain:make_claude", loop, None, None,
+                     {"system_prompt": "You are a phone assistant."},
+                     factory_args={"model": "haiku", "cli": str(exe), "first_token_timeout_ms": 12000,
+                                   "stream_idle_timeout_ms": 4000, "max_response_chars": 2000})
+    timings = await c.start()
+    assert timings["model"] == "haiku" and timings["cli_version"] == "9.9.9 (fake)"  # the login was proved
+    c.send({"op": "llm.prepare", "gen": c.current_gen, "system_prompt": "This call: take a message."})
+    gen = c.next_gen()
+    c.send({"op": "llm.generate", "gen": gen, "messages": [{"role": "system", "content": "This call: take a message."},
+                                                           {"role": "user", "content": "Hi"}], "max_tokens": 60})
+    evs = await _collect(c, "done", gen)
+    assert "".join(e["text"] for e in evs if e["ev"] == "token") == "Hello there."
+    await c.stop()
+    log = [json.loads(l) for l in (tmp_path / "cli.jsonl").read_text().splitlines()]
+    assert [r["event"] for r in log] == ["start", "turn", "start", "turn"]  # the probe's session, then the call's
+    assert [r["text"] for r in log if r["event"] == "turn"] == ["Say OK.", "Hi"]
+    assert log[-1]["system"] == "This call: take a message."  # prepare's session is the one the turn used
