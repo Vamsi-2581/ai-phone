@@ -72,6 +72,21 @@ def test_pull_works_with_a_config_that_does_not_load(home, monkeypatch, capsys):
     assert asked[-1] == ("t4", "local")
 
 
+def test_a_subscription_config_that_does_not_load_downloads_no_language_model(home, monkeypatch, capsys):
+    """A config on a Claude or ChatGPT plan needs the speech models and no LLM. Recovery used to know only two kinds,
+    so an unrelated mistake in such a config read as `local` and started a multi-gigabyte download nobody asked for."""
+    from ai_phone import voices
+    monkeypatch.setattr(voices, "installed_voices", lambda root=None: ["af_heart"])
+    for kind in ("claude", "chatgpt"):
+        (home / "config.yaml").write_text(f"brain: {{kind: {kind}, model: haiku}}\ntts: {{voice: bf_emma}}\n")
+        asked = []
+        monkeypatch.setattr(models, "missing", lambda tier, brain: asked.append((tier, brain)) or [])
+        assert main(["models", "pull"]) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[0].endswith(f"using brain.kind {kind} from it"), out[0]
+        assert asked == [("t4", kind)]
+
+
 @pytest.mark.parametrize("break_it", [
     pytest.param(lambda path: path.mkdir(), id="a directory where the config should be"),
     pytest.param(lambda path: path.write_bytes(b"models: {tier: t9}\n\xff\xfe"), id="a file that is not text"),

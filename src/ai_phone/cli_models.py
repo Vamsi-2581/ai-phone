@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from ai_phone import models, paths
-from ai_phone.config import Config, ConfigError, load_config
+from ai_phone.config import BRAIN_KINDS, Config, ConfigError, load_config
 from ai_phone.lines.config_writer import read_raw
 
 STOPPED = "Stopped. Run it again to continue where it left off."
@@ -41,7 +41,7 @@ def _wanted() -> tuple[str, str]:
     tier = (raw.get("models") if isinstance(raw.get("models"), dict) else {}).get("tier")
     kind = (raw.get("brain") if isinstance(raw.get("brain"), dict) else {}).get("kind")
     tier = tier if isinstance(tier, str) and models.known_tier(tier) else None
-    kind = kind if kind in ("local", "openai_compatible") else None
+    kind = kind if kind in BRAIN_KINDS else None
     used = " and ".join(f"{k} {v}" for k, v in (("models.tier", tier), ("brain.kind", kind)) if v)
     print(f"warning: the config does not load ({why}); " + (f"using {used} from it" if used else "using the defaults"))
     return tier or Config().models.tier, kind or Config().brain.kind

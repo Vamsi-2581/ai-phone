@@ -1,7 +1,8 @@
 """One real turn through each subscription CLI: the protocols, the login and the timings, against the live thing.
 
 Each test is skipped unless that CLI is installed and logged in. When it runs it spends one tiny turn of the owner's
-own plan (and prints what it measured, so `-s` shows how fast the first word was).
+own plan (and prints what it measured, so `-s` shows how fast the first word was). That one turn also re-checks the
+tool boundary: a session that reached for a tool would be marked spent.
 """
 import shutil
 import subprocess
@@ -28,6 +29,8 @@ def _turn(brain, label: str) -> str:
         t1 = time.monotonic()
         said = "".join(brain.stream(1, [{"role": "system", "content": PROMPT}, {"role": "user", "content": ASK}], 60))
         took = time.monotonic() - t1
+        # a tool call, an MCP server or an approval request marks the session spent; a phone turn must produce none
+        spent = brain._spent
     except BrainError as e:
         if e.kind in ("not_logged_in", "cli_missing"):
             pytest.skip(f"{label}: {e}")
@@ -38,6 +41,7 @@ def _turn(brain, label: str) -> str:
           f"first word after {brain.last_timings['first_token_ms']:.0f} ms, said {said.strip()!r}")
     assert said.strip(), "the CLI said nothing"
     assert took < LIMIT_SEC, f"the reply took {took:.1f} s"
+    assert not spent, "the session reached for a tool of its own"
     return said
 
 

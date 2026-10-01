@@ -186,10 +186,13 @@ class FakeActions:
         found = self._call("cli_installed", kind)
         return True if found is None else found
 
-    def test_subscription(self, kind):
-        probe = self._call("test_subscription", kind)
-        return probe or {"model": self.cur.model if self.cur.brain_kind == kind else SUBSCRIPTION_MODELS[kind],
-                         "cli_version": CLI_VERSION[kind], "warm_ms": 1200.0}
+    def login_status(self, kind):
+        return self._call("login_status", kind) or {"plan": "max" if kind == "claude" else "pro"}
+
+    def test_subscription(self, kind, model=None):
+        probe = self._call("test_subscription", kind, model)
+        model = model or (self.cur.model if self.cur.brain_kind == kind else SUBSCRIPTION_MODELS[kind])
+        return probe or {"model": model, "cli_version": CLI_VERSION[kind], "warm_ms": 1200.0}
 
     def brain_models(self, kind):
         found = self._call("brain_models", kind)
@@ -1684,7 +1687,10 @@ def test_new_setup_with_a_claude_subscription():
     assert "The words of every call go to Claude through Claude Code" in ui.questions("Which model?")[0].detail
     assert actions.changes() == ["save_brain_subscription", "add_sip_line", "save_voice", "save_callers"]
     assert actions.args("save_brain_subscription") == [("claude", "haiku")]
-    assert actions.args("test_subscription") == [("claude",)] * 2  # the brain step, then the Check page
+    # one request of the plan for the whole run: the model that was picked, which the Check page then finds proved
+    assert actions.args("test_subscription") == [("claude", "haiku"), ("claude", None)]
+    assert actions.args("login_status") == [("claude",)]  # the login itself costs nothing
+    assert "Asking Claude to answer once with Haiku…" in ui.labels
     assert Check("Brain", "Claude (Haiku) · logged in", True) in ui.questions("Everything works")[0].checks
     assert "Brain    your Claude subscription · Haiku" in outcome.summary
     assert "nothing leaves this Mac" not in outcome.summary
@@ -1739,7 +1745,8 @@ def test_a_cli_that_is_not_installed_says_how_to_install_it():
     page = ui.questions("Codex is not installed")[0]
     assert page.body == "npm install -g @openai/codex\ncodex login"
     assert page.detail == "ai-phone reaches your ChatGPT plan through it. Install it, log in, then check again."
-    assert actions.args("test_subscription") == [("chatgpt",)] * 2 and not page.error
+    assert actions.args("login_status") == [("chatgpt",)] and not page.error  # only once the CLI is there
+    assert actions.args("test_subscription") == [("chatgpt", "gpt-5.6-luna"), ("chatgpt", None)]
 
 
 def test_a_cli_that_is_not_logged_in_shows_what_to_run():
@@ -1752,11 +1759,14 @@ def test_a_cli_that_is_not_logged_in_shows_what_to_run():
         ("A few things need attention", "Continue"),
         FINISH,
     ])
-    actions = FakeActions(exists=True, test_subscription=Seq(ActionError(told), None, None))
+    actions = FakeActions(exists=True, login_status=Seq(ActionError(told), None))
     drive(ui, actions)
     page = ui.questions("cannot use your Claude plan yet")[0]
     assert page.error == told and page.body == "npm install -g @anthropic-ai/claude-code\nclaude, then type /login"
     assert actions.args("save_brain_subscription") == [("claude", "haiku")]
+    # the login was established twice without inference; the plan answered once, for the model that was picked
+    assert actions.args("login_status") == [("claude",)] * 2
+    assert actions.args("test_subscription") == [("claude", "haiku"), ("claude", None)]
 
 
 def test_back_from_the_login_page_goes_back_to_the_brain_menu():
@@ -1788,6 +1798,67 @@ def test_a_subscription_brain_that_cannot_be_saved_is_asked_again():
     assert drive(ui, actions).code == 1
     assert ui.questions("Which model?")[1].error == broken and ui.menu("Which model?")[2] == 0
     assert actions.args("save_brain_subscription") == [("claude", "haiku"), ("claude", "sonnet")]
+
+
+def test_choosing_a_different_model_still_spends_one_request():
+    """The probe used to run before the menu, so a person who picked anything but the default paid again at the Check
+    step: "one request per setup" was not true of the ordinary path. The request is now the chosen model's."""
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My ChatGPT subscription"),
+        ("Which model?", "gpt-6-astra"),          # not the default the menu offers
+        ("A few things need attention", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions(exists=True)
+    drive(ui, actions)
+    assert actions.args("save_brain_subscription") == [("chatgpt", "gpt-6-astra")]
+    # once, for the model that was picked. The Check step asks for the model the config now names, and finds it proved.
+    assert actions.args("test_subscription") == [("chatgpt", "gpt-6-astra"), ("chatgpt", None)]
+    assert actions.args("login_status") == [("chatgpt",)]
+    assert "Asking ChatGPT to answer once with gpt-6-astra…" in ui.labels
+    assert "Picking one sends a single short request to your plan" in ui.questions("Which model?")[0].detail
+
+
+def test_a_model_the_plan_does_not_allow_leaves_the_others_on_the_menu():
+    """The saved or default model is one this plan refuses. The probe used to run before the menu, so the page said
+    "choose another model" and the only way on was the same failing probe. The menu is now where the answer is."""
+    told = "Your plan does not allow that model. Choose another one."
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My ChatGPT subscription"),
+        ("Which model?", "<default>"),           # the saved one: refused
+        ("Which model?", "gpt-6-astra"),         # the one that works, straight from the same menu
+        ("A few things need attention", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions(exists=True, test_subscription=Seq(ActionError(told), None, None))
+    actions.cur.brain_kind, actions.cur.model = "chatgpt", "gpt-5.6-luna"
+    drive(ui, actions)
+    second = ui.questions("Which model?")[1]
+    assert second.error == told, "the sentence is on the menu that offers the others"
+    again = [m for m in ui.menus if "Which model?" in m[0]][1]
+    assert again[2] == 0, "the refused model is still the one the cursor is on"
+    assert [o.label for o in again[1]] == ["gpt-5.6-luna", "gpt-6-astra"], "every model the plan lists is still offered"
+    assert actions.args("save_brain_subscription") == [("chatgpt", "gpt-6-astra")]
+    assert actions.args("test_subscription")[:2] == [("chatgpt", "gpt-5.6-luna"), ("chatgpt", "gpt-6-astra")]
+
+
+def test_a_cli_logged_in_with_an_api_key_says_what_to_do_about_it():
+    told = ("codex is set up to use an API key, which is billed per request. ai-phone runs your subscription instead: "
+            "remove the key, then log in with: codex login")
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My ChatGPT subscription"),
+        ("cannot use your ChatGPT plan yet", "Check again"),
+        ("Which model?", "<default>"),
+        ("A few things need attention", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions(exists=True, login_status=Seq(ActionError(told), None))
+    drive(ui, actions)
+    assert ui.questions("cannot use your ChatGPT plan yet")[0].error == told
+    assert actions.args("test_subscription")[0] == ("chatgpt", "gpt-5.6-luna"), "no turn until the login is a plan"
 
 
 def test_a_login_that_stops_working_is_a_failed_check_row():

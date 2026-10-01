@@ -9,10 +9,16 @@ given, so the next turn of the same call sends only the newest thing the caller 
 history that is not the continuation of what this session has heard, start a new session. `prepare()` starts the
 session for a call before the greeting plays, so the first reply does not pay the startup.
 
+A caller's words are model input, so a session that can reach a tool is a way into this Mac from the phone. Both
+sessions are started tool-free and both refuse to run otherwise: Claude Code takes `--tools ""` and says what it came
+up with, and Codex is given a home of its own and every tool feature turned off, then watched: a tool call, an MCP
+server or an approval request ends the turn as a `tool_use` failure instead of answering the caller.
+
 Failures raise BrainError with a kind the controller logs, exactly like the endpoint brain; there are no retries,
-because the caller is waiting on the line. What leaves this Mac is the instructions, what callers say and the
-conversation (not audio), through the person's own CLI to their provider. Nothing here logs any of it: only timings,
-the model, and whatever the CLI itself writes to stderr, at debug level and truncated.
+because the caller is waiting on the line. A provider's own words never travel in the exception: the kind is what the
+daemon and the wizard see, the text goes to the debug log. What leaves this Mac is the instructions, what callers say
+and the conversation (not audio), through the person's own CLI to their provider, on the login they already have and
+never on an API key (the variables that would re-route either CLI are dropped at the subprocess boundary).
 """
 from __future__ import annotations
 
@@ -48,8 +54,52 @@ DRAIN_MS = 2000                # how long a turn we stopped reading may take to 
 STDOUT_BUDGET = 1 << 20        # bytes of output one call may print (plus the reply cap) before we take it for a runaway
 HANDSHAKE_SEC = 10.0           # how long starting a session may take, when that is longer than the token deadline
 CLOSE_SEC = 2.0                # how long the CLI may take to exit after its stdin closes
-VERSION_SEC = 15.0             # how long `<cli> --version` may take
+VERSION_SEC = 15.0             # how long `<cli> --version` may take, and `claude auth status`
 STDERR_CHARS = 400             # how much of one of the CLI's own stderr lines reaches the log
+
+# Anything that would move a CLI off the login the person has: a key or token it would bill instead of the plan, and a
+# base URL or token file that would send the call somewhere else. `ANTHROPIC_API_KEY` is the one that matters most --
+# Claude Code prefers it over the keychain login, so with it set the whole premise of this brain is quietly false and
+# every call is charged per token. None of these crosses into either CLI.
+PROVIDER_ENV_PREFIXES = ("ANTHROPIC_", "OPENAI_", "AWS_", "AZURE_", "GOOGLE_", "GCLOUD_", "VERTEX_", "BEDROCK_")
+PROVIDER_ENV_SUFFIXES = ("_API_KEY", "_AUTH_TOKEN", "_ACCESS_TOKEN", "_BASE_URL", "_TOKEN_FILE", "_API_BASE")
+
+# Codex: the feature flags that carry its tools (`codex features list`; `--disable <name>` is `-c features.<name>=false`).
+# There is no single switch and no `tools` setting for them -- the app-server's own `tools` table holds only web search
+# -- so a phone brain names every one of them.
+CODEX_TOOLS_OFF = ("shell_tool", "unified_exec", "unified_exec_tty", "view_image", "image_generation", "sleep_tool",
+                   "browser_use", "browser_use_external", "browser_use_full_cdp_access", "in_app_browser",
+                   "computer_use", "apps", "plugins", "hooks", "multi_agent", "goals", "worktrees", "shell_snapshot",
+                   "skill_search", "skill_mcp_dependency_install", "tool_suggest", "tool_call_mcp_elicitation",
+                   "memories", "realtime_conversation")
+# The only thread items a tool-free session produces; every other kind in the protocol is a tool having been called.
+# `plan` is not here because the one tool that could produce it is off in the config above (measured: Codex warns about
+# a setting it does not recognise, and it warns about none of these).
+CODEX_SAID = frozenset({"userMessage", "agentMessage", "reasoning", "contextCompaction"})
+# requests the app-server makes of its client on a tool's behalf. Each one blocks the turn until it is answered, so
+# each gets an answer and ends the turn. (`account/chatgptAuthTokens/refresh` and `attestation/generate` are the
+# server's own business and are deliberately not here.)
+CODEX_APPROVALS = frozenset({"item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                             "item/permissions/requestApproval"})
+CODEX_ASKS = CODEX_APPROVALS | {"item/tool/call", "item/tool/requestUserInput", "mcpServer/elicitation/request",
+                                "openai/form"}
+# the home a session is given: the person's own holds their MCP servers, hooks, plugins, skills and AGENTS.md, and
+# `-c mcp_servers={}` does not remove them (measured: ten of the owner's started inside our thread), so a session gets
+# a home with nothing in it but this file and a link to their login.
+CODEX_CONFIG = """# written by ai-phone for its own phone sessions; not the person's own Codex configuration
+web_search = "disabled"
+project_doc_max_bytes = 0
+include_environment_context = false
+include_apps_instructions = false
+include_permissions_instructions = false
+include_collaboration_mode_instructions = false
+check_for_update_on_startup = false
+
+[tools]
+web_search = false
+update_plan = { enabled = false }
+experimental_request_user_input = { enabled = false }
+"""
 
 
 @dataclass(frozen=True)
@@ -121,6 +171,29 @@ def _pump_stderr(stream, name: str) -> None:
         pass
 
 
+def _classify(cli: str, said: str) -> BrainError:
+    """A failure the CLI reported, as a kind, and only a kind.
+
+    Whatever a provider says is unbounded third-party prose that may quote the instructions, what a caller said, or a
+    key. It decides the kind here and then goes to the debug log; the exception that travels to the controller, the
+    worker's parent, the daemon's log and the wizard's page carries none of it.
+    """
+    low = " ".join(said.split()).lower()
+    log.debug("%s brain: the CLI reported a failure: %s", cli, " ".join(said.split())[:400])
+    if "not supported when using" in low or "does not have access to" in low or "model_not_found" in low:
+        return BrainError("model_not_allowed", "that model is not on this plan")
+    if any(w in low for w in ("401", "unauthorized", "not logged in", "codex login", "log in", "/login", "authenticat")):
+        return BrainError("not_logged_in", f"{cli} is not logged in")
+    if any(w in low for w in ("rate limit", "429", "usage limit", "quota")):
+        return BrainError("rate_limited", f"{cli} says the plan's limit is reached")
+    return BrainError("failed", f"{cli} ended the turn with an error")
+
+
+def _routes_elsewhere(name: str) -> bool:
+    """Would this variable bill someone's API account, or send the call to an endpoint that is not their provider?"""
+    return name.startswith(PROVIDER_ENV_PREFIXES) or name.endswith(PROVIDER_ENV_SUFFIXES)
+
+
 def _kill_group(p: subprocess.Popen) -> None:
     """Kill the CLI and whatever it started (a Node runtime starts children of its own), not only the process we hold."""
     try:
@@ -140,6 +213,7 @@ class CliBrain:
     """
 
     cli_name = ""      # the executable to look for on PATH
+    asks_at_warmup = True  # False when the subclass establishes the login as part of starting a session
 
     def __init__(self, model: str, cli: str | None = None, first_token_timeout_ms: int = 12000,
                  stream_idle_timeout_ms: int = 4000, max_response_chars: int = 2000, drain_timeout_ms: int = DRAIN_MS):
@@ -156,13 +230,25 @@ class CliBrain:
         self._system: str | None = None    # the instructions this session was started with
         self._seen: list[Message] = []     # the conversation this session has been given, as the controller gave it
         self._in_flight = False            # a turn we stopped reading: drain it before sending the next one
+        self._spent = False                # this session failed in a way that makes it unsafe to reuse
+        self._plan = ""                    # what the CLI calls the plan this login is on
 
     # ---- the brain protocol ----------------------------------------------------------------------
+    def login(self) -> dict:
+        """What the CLI says about the login, without inference: {"plan": <what it calls the plan>}.
+
+        Spends no turn, so the wizard can establish that a person is logged in before it offers them a model. A login
+        that is an API key is refused here, not billed: this brain exists to run on a subscription.
+        """
+        return {"plan": ""}
+
     def warmup(self, system_prompt: str = "") -> dict:
-        """Prove the CLI is installed and the person is logged in, with one tiny turn. The probe is thrown away with
-        its session, so no call inherits it."""
+        """Prove the CLI is installed, that the person is logged in on their plan, and that a session comes up
+        tool-free, with one tiny turn. The probe is thrown away with its session, so no call inherits it."""
         t = time.monotonic_ns()
         version = self.cli_version()
+        if self.asks_at_warmup:
+            self._plan = str(self.login().get("plan", ""))
         self.close()
         try:
             said = "".join(self.stream(0, [{"role": "system", "content": system_prompt or PROBE_PROMPT},
@@ -171,7 +257,8 @@ class CliBrain:
             self.close()
         if not said.strip():
             raise BrainError("failed", f"{self.cli} answered nothing")
-        return {"warm_ms": (time.monotonic_ns() - t) / 1e6, "model": self.model, "cli_version": version}
+        return {"warm_ms": (time.monotonic_ns() - t) / 1e6, "model": self.model, "cli_version": version,
+                "plan": self._plan}
 
     def prepare(self, system_prompt: str) -> None:
         """Have a session ready for a call with these instructions, without spending a turn.
@@ -180,7 +267,7 @@ class CliBrain:
         restart would cost the startup this call is trying to avoid). Any session that has taken a turn is closed, so
         nothing of the last call can carry into this one.
         """
-        if self._alive() and self._system == system_prompt and not self._seen and not self._in_flight:
+        if self._alive() and self._system == system_prompt and not self._seen and not self._in_flight and not self._spent:
             return
         self.close()
         self._start(system_prompt)
@@ -242,7 +329,7 @@ class CliBrain:
         given up on must not cost the caller the wait as well as the drain.
         """
         p, self._proc, self._q, self._system = self._proc, None, None, None
-        self._seen, self._in_flight = [], False
+        self._seen, self._in_flight, self._spent = [], False, False
         if p is None:
             return
         if hard:
@@ -270,7 +357,7 @@ class CliBrain:
 
     # ---- sessions --------------------------------------------------------------------------------
     def _begin(self, system: str, prior: list[Message], newest: Message) -> None:
-        theirs = self._alive() and system == self._system and self._continues(prior)
+        theirs = self._alive() and system == self._system and self._continues(prior) and not self._spent
         if theirs and self._settle():
             self._send(str(newest.get("content") or ""))
             self._seen.append(dict(newest))
@@ -338,7 +425,8 @@ class CliBrain:
                                  start_new_session=True)
         except OSError as e:
             raise BrainError("cli_missing", f"{self.cli} would not start: {type(e).__name__}") from None
-        self._proc, self._q, self._system, self._seen, self._in_flight = p, queue.Queue(), system_prompt, [], False
+        self._proc, self._q, self._system, self._seen = p, queue.Queue(), system_prompt, []
+        self._in_flight, self._spent = False, False
         threading.Thread(target=_pump, args=(p.stdout, self._q, STDOUT_BUDGET + 100 * self.max_chars),
                          name=f"{self.cli_name}-brain", daemon=True).start()
         threading.Thread(target=_pump_stderr, args=(p.stderr, self.cli_name), name=f"{self.cli_name}-brain-err",
@@ -361,20 +449,34 @@ class CliBrain:
         return d
 
     def _env(self) -> dict[str, str]:
-        return dict(os.environ)
+        """The child's environment, without the variables that would take it off the person's own login.
+
+        The worker already drops anything that looks like a secret, but the setup wizard starts a backend in its own
+        process, and `ANTHROPIC_API_KEY` is not a secret by that rule and is set on plenty of developer machines. It
+        wins over the keychain login, so leaving it in makes "no API key" false and bills every call.
+        """
+        return {k: v for k, v in os.environ.items() if not _routes_elsewhere(k) and not self._own_env(k)}
+
+    def _own_env(self, name: str) -> bool:
+        """A variable of this CLI's own that a session must not inherit (a nested run, someone else's home)."""
+        return False
 
     def _alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
     def cli_version(self) -> str:
+        r = self._run(["--version"])
+        said = ((r.stdout if r else "") or (r.stderr if r else "") or "").strip()
+        return said.splitlines()[0][:60] if said else "unknown"
+
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess | None:
+        """One short, non-streaming run of the CLI (its version, its login status). None means it would not run."""
         exe = self._executable()
         try:
-            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=VERSION_SEC,
-                               env=self._env(), cwd=str(self._workdir()))
+            return subprocess.run([exe, *args], capture_output=True, text=True, timeout=VERSION_SEC,
+                                  env=self._env(), cwd=str(self._workdir()))
         except (OSError, subprocess.SubprocessError):
-            return "unknown"
-        said = (r.stdout or r.stderr or "").strip()
-        return said.splitlines()[0][:60] if said else "unknown"
+            return None
 
     # ---- talking to the CLI ----------------------------------------------------------------------
     def _write(self, line: str) -> None:
@@ -436,6 +538,22 @@ class ClaudeCodeLLM(CliBrain):
 
     cli_name = "claude"
 
+    def login(self) -> dict:
+        """`claude auth status --json`: it says whether there is a login and what kind, and costs no turn."""
+        r = self._run(["auth", "status", "--json"])
+        if r is None:
+            raise BrainError("cli_missing", "claude would not run")
+        try:
+            said = json.loads(r.stdout or "{}")
+        except ValueError:
+            said = {}
+        if not isinstance(said, dict) or not said.get("loggedIn"):
+            raise BrainError("not_logged_in", "claude is not logged in")
+        if said.get("authMethod") == "api_key":
+            # the variable itself is already gone from _env(), so this is a key saved in the CLI's own settings
+            raise BrainError("api_key_login", "claude is set up to use an API key, not a subscription")
+        return {"plan": str(said.get("subscriptionType") or "")[:40]}
+
     def _args(self, system_prompt: str) -> list[str]:
         return ["-p", "--verbose", "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config",
                 "--settings", json.dumps({"alwaysThinkingEnabled": False}),
@@ -443,8 +561,8 @@ class ClaudeCodeLLM(CliBrain):
                 "--system-prompt", system_prompt, "--model", self.model,
                 "--tools", ""]  # last: --tools takes every argument that follows it
 
-    def _env(self) -> dict[str, str]:
-        return {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+    def _own_env(self, name: str) -> bool:
+        return name.startswith("CLAUDE")
 
     def _send(self, text: str) -> None:
         self._write(json.dumps({"type": "user", "message": {"role": "user", "content": text}}))
@@ -459,26 +577,29 @@ class ClaudeCodeLLM(CliBrain):
             return "note", None
         if what == "result":
             if obj.get("is_error"):
-                said = " ".join(str(obj.get("result") or obj.get("subtype") or "").split())[:160]
-                low = said.lower()
-                if "not logged in" in low or "log in" in low or "/login" in low:
-                    return "error", BrainError("not_logged_in", "claude is not logged in")
-                return "error", BrainError("failed", said)
+                return "error", _classify("claude", str(obj.get("result") or obj.get("subtype") or ""))
             return "end", None
         if what == "system" and obj.get("subtype") == "init":
             if obj.get("tools"):
-                return "error", BrainError("failed", "the CLI came up with tools of its own; a phone brain gets none")
+                return "error", BrainError("tool_use", "the CLI came up with tools of its own; a phone brain gets none")
         return "note", None
 
 
 class CodexLLM(CliBrain):
     """`codex app-server`: JSON-RPC 2.0 over stdio, one ephemeral thread per call.
 
-    The model is always named, because the person's own default may be one their plan does not allow; their MCP
-    servers are kept out of every thread, because they start with it and cost a second.
+    The model is always named, because the person's own default may be one their plan does not allow.
+
+    Codex has no single setting that turns the model's tools off, so a phone session gets all three of what it does
+    have: every tool feature disabled by name (`--disable shell_tool`, …), a CODEX_HOME of ai-phone's own so none of
+    the person's MCP servers, hooks, plugins, skills or AGENTS.md is in it, and a read-only sandbox that approves
+    nothing. Then it is watched: a thread that did not come up inside that sandbox does not take a turn, and a tool
+    call, an MCP server or an approval request during one is a `tool_use` failure, not an answer. A caller's words
+    are model input, and nothing a caller can say may reach a tool.
     """
 
     cli_name = "codex"
+    asks_at_warmup = False  # every session starts with account/read, so warm-up needs no app-server of its own
 
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
@@ -488,18 +609,88 @@ class CodexLLM(CliBrain):
         self._turn_id: str | None = None
 
     def _args(self, system_prompt: str) -> list[str]:
-        return ["app-server", "-c", "mcp_servers={}", "-c", f'model_reasoning_effort="{CODEX_EFFORT}"']
+        off = [a for feature in CODEX_TOOLS_OFF for a in ("--disable", feature)]
+        return ["app-server", *off, "-c", f'model_reasoning_effort="{CODEX_EFFORT}"']
+
+    def _own_env(self, name: str) -> bool:
+        return name.startswith("CODEX_")
+
+    def _env(self) -> dict[str, str]:
+        return {**super()._env(), "CODEX_HOME": str(self._codex_home())}
+
+    def _codex_home(self) -> Path:
+        """A CODEX_HOME of ai-phone's own: the config below, and a link to the login the person already has.
+
+        The link is why no copy of their tokens is made: Codex reads and refreshes the one file they logged in to. If
+        it ever leaves a file of its own here instead, that file goes (ai-phone's home is not a place to keep someone
+        else's credentials) and the link is made again.
+        """
+        d = paths.home() / "brain" / "codex"
+        private_mkdir(d)
+        if stat.S_IMODE(d.stat().st_mode) != 0o700:
+            d.chmod(0o700)
+        cfg = d / "config.toml"
+        if not cfg.exists() or cfg.read_text() != CODEX_CONFIG:
+            cfg.write_text(CODEX_CONFIG)
+        theirs = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
+        link = d / "auth.json"
+        if link.is_symlink() and link.readlink() == theirs:
+            return d
+        if link.is_symlink() or link.exists():
+            log.debug("codex brain: replacing what was left at %s with the link to the login", link)
+            link.unlink()
+        if not theirs.exists():
+            raise BrainError("not_logged_in", "codex is not logged in")
+        link.symlink_to(theirs)
+        return d
+
+    def login(self) -> dict:
+        """`account/read` on a fresh app-server: it says whose login this is, and starts no thread, so no turn."""
+        self.close()
+        self._spawn(None)
+        try:
+            self._handshake()
+            return self._account()
+        finally:
+            self.close()
+
+    def _account(self) -> dict:
+        r = self._await(self._request("account/read", {}))
+        account = ((r.get("result") or {}).get("account") or {})
+        kind = str(account.get("type") or "")
+        if not kind:
+            raise BrainError("not_logged_in", "codex is not logged in")
+        if kind != "chatgpt":
+            raise BrainError("api_key_login", "codex is logged in with an API key, not a ChatGPT plan")
+        self._plan = str(account.get("planType") or "")[:40]
+        return {"plan": self._plan}
 
     def _opened(self) -> None:
         self._handshake()
+        self._account()  # before the thread, so a session is never started on an account that bills per token
         r = self._await(self._request("thread/start", {"ephemeral": True, "cwd": str(self._workdir()),
                                                       "baseInstructions": self._system or PROBE_PROMPT,
                                                       "sandbox": "read-only", "approvalPolicy": "never",
-                                                      "model": self.model}))
-        self._thread = ((r.get("result") or {}).get("thread") or {}).get("id")
+                                                      "model": self.model,
+                                                      "config": {"sandbox_mode": "read-only",
+                                                                 "web_search": "disabled",
+                                                                 "tools": {"web_search": False}}}))
+        result = r.get("result") or {}
+        self._thread = (result.get("thread") or {}).get("id")
         self._turn_req = self._turn_id = None
         if not self._thread:
             raise BrainError("failed", "codex started no thread")
+        self._confined(result)
+
+    def _confined(self, result: dict) -> None:
+        """What the thread says it came up as. A requirements file, an MDM policy or a version that reads one of these
+        settings differently can hand back a thread with more reach than was asked for; that thread does not take a
+        turn. This is the Claude side's `tools == []` for a protocol that reports no tool list of its own."""
+        sandbox = result.get("sandbox") or {}
+        approval, kind = result.get("approvalPolicy"), sandbox.get("type")
+        if kind != "readOnly" or sandbox.get("networkAccess") or approval != "never":
+            log.debug("codex brain: the thread came up sandbox=%r approval=%r", sandbox, approval)
+            raise BrainError("tools_unknown", "codex started a session with more reach than a phone brain gets")
 
     def _handshake(self) -> None:
         self._await(self._request("initialize", {"clientInfo": {"name": "ai-phone", "version": _client_version()}}))
@@ -544,15 +735,46 @@ class CodexLLM(CliBrain):
 
     def _event(self, obj: dict) -> tuple[str, object]:
         method, prm = obj.get("method"), obj.get("params") or {}
+        if method == "mcpServer/startupStatus/updated":
+            # the person's own servers, attaching to our thread: their tools would be in the model's list
+            log.info("codex brain: an MCP server joined the session; a phone brain gets no tools")
+            self._spent = True
+            return "error", BrainError("tool_use", "an MCP server joined the session; a phone brain gets no tools")
+        if method == "configWarning":
+            log.debug("codex brain: codex ignored settings: %s", str(prm.get("summary"))[:STDERR_CHARS])
+            self._spent = True
+            return "error", BrainError("tools_unknown", "codex ignored settings a phone brain depends on")
+        if method in CODEX_ASKS and obj.get("id") is not None:
+            self._deny(obj["id"], method)  # it waits on an answer; one tool is one too many, so it gets a no and an end
+            self._spent = True
+            return "error", BrainError("tool_use", "the session asked to run something; a phone brain gets no tools")
+        if method == "item/started":
+            item = str((prm.get("item") or {}).get("type") or "")
+            if item and item not in CODEX_SAID:
+                log.info("codex brain: the session reached for a tool (%s); ending the turn", item)
+                self._spent = True
+                return "error", BrainError("tool_use", "the session reached for a tool; a phone brain gets none")
         if method == "item/agentMessage/delta":
+            if not self._ours(prm):
+                return "note", None  # an earlier turn's words: they are not an answer to what was just asked
             return "delta", prm.get("delta") or ""
         if method == "turn/completed":
             turn = prm.get("turn") or {}
+            if not self._ours(prm, turn.get("id")):
+                return "note", None
             status = turn.get("status")
             if status in ("completed", "interrupted"):  # interrupted is our own doing: the turn is over either way
                 return "end", None
             return "error", self._failure(turn.get("error") or {"message": f"the turn {status}"})
         if method == "error":
+            if not self._ours(prm):
+                return "note", None
+            if prm.get("willRetry"):
+                # a Codex error is not the end of a turn: this one is being retried and its own turn/completed is
+                # still to come. Treating it as the end would leave that completion to be read as the next turn's.
+                log.info("codex brain: the turn failed and codex is retrying it")
+                return "note", None
+            self._spent = True  # whatever still arrives for this turn must not be read as the next turn's
             return "error", self._failure(prm.get("error") or {})
         if obj.get("id") is not None and obj.get("id") == self._turn_req:
             if obj.get("error"):
@@ -560,14 +782,28 @@ class CodexLLM(CliBrain):
             self._turn_id = ((obj.get("result") or {}).get("turn") or {}).get("id")
         return "note", None
 
+    def _ours(self, prm: dict, turn_id: str | None = None) -> bool:
+        """Is this event the turn that is running? Codex names the thread and the turn on everything it sends; a
+        session that has had one turn fail can still be sent another, and the first one's events must not be read as
+        the second one's answer."""
+        thread = prm.get("threadId")
+        if thread is not None and self._thread is not None and thread != self._thread:
+            return False
+        turn = turn_id if turn_id is not None else prm.get("turnId")
+        if turn is None or self._turn_id is None:  # before turn/start has been answered there is nothing to compare
+            return True
+        return turn == self._turn_id
+
+    def _deny(self, rid: int, method: str) -> None:
+        answer = ({"result": {"decision": "denied"}} if method in CODEX_APPROVALS
+                  else {"error": {"code": -32601, "message": "ai-phone grants no tools"}})
+        try:
+            self._write(json.dumps({"jsonrpc": "2.0", "id": rid, **answer}))
+        except BrainError:
+            pass  # the session is going anyway
+
     def _failure(self, err: dict) -> BrainError:
-        said = " ".join(str(err.get("message") if isinstance(err, dict) else err or "").split())[:200]
-        low = said.lower()
-        if "not supported when using codex with a chatgpt account" in low:
-            return BrainError("model_not_allowed", f"{self.model} is not on this plan")
-        if any(w in low for w in ("401", "unauthorized", "not logged in", "codex login", "log in", "authenticat")):
-            return BrainError("not_logged_in", "codex is not logged in")
-        return BrainError("failed", said)
+        return _classify(self.cli_name, str(err.get("message") if isinstance(err, dict) else err or ""))
 
     def _interrupt(self) -> None:
         if self._thread and self._turn_id:

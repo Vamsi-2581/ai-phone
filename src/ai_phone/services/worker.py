@@ -165,8 +165,16 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 # ours sits idle between calls. The next call's llm.prepare starts a fresh one.
                 _release(kind, backend)
                 continue
+            if op == "llm.generate" and conn.poll(0):
+                # Everything above is synchronous, and `prepare()` of a subscription brain is a second of it: a
+                # caller who hangs up during session startup has their generate, cancel and release waiting in the
+                # pipe together. Reading the cancels first is what makes the hangup free — one turn of a plan is sent
+                # the moment backend.stream() is asked for a token, and the mid-stream check comes too late for it.
+                _drain_cancel(conn, cancelled, backend, gen, pending)
             if gen in cancelled:
                 continue
+            if op == "llm.generate" and any(m.get("op") in ("llm.release", "shutdown") for m in pending):
+                continue  # the call is already over; the release waiting behind this turn is the proof
             if op == "stt.finalize":
                 tail = b"".join(_drain_stt(ain, gen))  # frames pushed after the last announcement
                 if tail:
@@ -198,6 +206,13 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                     ipc.send(conn, {"ev": "chunk", "gen": gen, "seq": msg["seq"], "nframes": n % 5})
                 ipc.send(conn, {"ev": "done", "gen": gen, "seq": msg["seq"], "timings": getattr(backend, "last_timings", {})})
                 _trim_memory()
+    except BrainError as e:
+        # A brain that will not warm up or will not prepare fails here, outside the per-turn handler. Only the kind
+        # travels: the traceback would carry the provider's own words into the daemon's log, where the already-fixed
+        # wizard page no longer puts them. The exit code is what the supervisor reads.
+        print(f"[{kind}-worker] the brain failed: {e.kind}", file=sys.stderr, flush=True)
+        ipc.send(conn, {"ev": "error", "message": f"the brain failed: {e.kind}"})
+        raise SystemExit(1) from None
     except Exception as e:  # report, then exit non-zero so the supervisor restarts us
         ipc.send(conn, {"ev": "error", "message": f"{e}\n{traceback.format_exc()}"})
         raise

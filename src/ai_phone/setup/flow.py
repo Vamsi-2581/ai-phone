@@ -323,7 +323,13 @@ def brain(ui, actions, session: Session) -> None:
 
 def brain_subscription(ui, actions, session: Session, cur, kind: str) -> None:
     """A plan the person already pays for: ai-phone drives the CLI they are logged into, so there is no key to type.
-    What has to be true is that the CLI is installed and logged in, and the pages say how when it is not."""
+    What has to be true is that the CLI is installed and logged in, and the pages say how when it is not.
+
+    The login is established without inference, so the only thing a setup run spends is the one request that proves
+    the model they picked answers. That order matters both ways round: it is the truth of "one request per setup"
+    (choosing a different model used to cost a second one at the Check step), and it means a model the plan does not
+    allow is a sentence on the menu that offers the others, not a page that sends them back to the same failure.
+    """
     plan = PLANS[kind]
     while True:
         if not actions.cli_installed(kind):
@@ -333,7 +339,7 @@ def brain_subscription(ui, actions, session: Session, cur, kind: str) -> None:
             continue
         waiting = Page(BRAIN, f"Your {plan.name} subscription")
         try:
-            busy(ui, session, waiting, f"Checking your {plan.name} login…", lambda: actions.test_subscription(kind))
+            busy(ui, session, waiting, f"Checking your {plan.name} login…", lambda: actions.login_status(kind))
             # Claude Code's models are three names it always takes; a ChatGPT plan is asked which ones it allows
             choices = (busy(ui, session, waiting, f"Asking which models your {plan.name} plan allows…",
                             lambda: actions.brain_models(kind)) if kind == "chatgpt" else actions.brain_models(kind))
@@ -344,14 +350,17 @@ def brain_subscription(ui, actions, session: Session, cur, kind: str) -> None:
             continue
         break
     detail = (f"Logged in. The words of every call go to {plan.name} through {plan.cli}; a faster model starts "
-              "talking sooner.")
+              "talking sooner. Picking one sends a single short request to your plan, to check it answers.")
     default = next((i for i, m in enumerate(choices) if m.id == cur.model), 0) if cur.brain_kind == kind else 0
     error = ""
     while True:
         i = ui.choose(Page(BRAIN, "Which model?", detail, error=error),
                       [Option(m.name, m.note) for m in choices], default=default)
+        chosen = choices[i]
         try:
-            actions.save_brain_subscription(kind, choices[i].id)
+            busy(ui, session, waiting, f"Asking {plan.name} to answer once with {chosen.name}…",
+                 lambda: actions.test_subscription(kind, chosen.id))
+            actions.save_brain_subscription(kind, chosen.id)
             session.note("the brain")
             return
         except ActionError as e:

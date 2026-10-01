@@ -131,7 +131,8 @@ class Actions:
         self.player = player or KokoroPlayer()
         self.provider_loader = provider_loader
         self.http = http  # tests pass a client with a mock transport
-        self._probed: dict[tuple[str, str], dict] = {}  # a login already proved in this run, by (kind, model)
+        self._probed: dict[tuple[str, str], dict] = {}  # a model already proved in this run, by (kind, model)
+        self._logged_in: dict[str, dict] = {}           # a login already established in this run, by kind
 
     # ---- what is there ---------------------------------------------------------------------------
 
@@ -266,19 +267,47 @@ class Actions:
         if e.kind in ("first_token_timeout", "idle_timeout"):
             return ActionError(f"{cli} did not answer within {PROBE_MS // 1000} seconds. Try again, or pick another brain.")
         if e.kind == "model_not_allowed":
-            return ActionError(f"Your plan does not allow {self._brain_model(kind)}. Choose another model.")
-        # anything else (a rate limit, an org policy, a provider incident) comes with the CLI's own text, which is
-        # unbounded third-party prose: the kind is enough for the person, the detail belongs in the log
+            return ActionError("Your plan does not allow that model. Choose another one.")
+        if e.kind == "api_key_login":
+            return ActionError(f"{cli} is set up to use an API key, which is billed per request. ai-phone runs your "
+                               f"subscription instead: remove the key, then log in with: {LOGIN[kind]}")
+        if e.kind in ("tool_use", "tools_unknown"):
+            return ActionError(f"{cli} gives a call's session tools of its own, and what callers say must not reach "
+                               f"anything that can read this Mac. Update {cli}, then check again.")
+        if e.kind == "rate_limited":
+            return ActionError(f"Your {cli} plan has reached its limit for now. Try again later, or pick another brain.")
+        # anything else (an org policy, a provider incident) was classified from the CLI's own text, which is
+        # unbounded third-party prose: the kind is enough for the person, the detail is already in the debug log
         log.debug("%s brain probe failed: %s", cli, e)
         return ActionError(f"{cli} could not answer ({e.kind}). Try again, or pick another brain.")
 
-    def test_subscription(self, kind: str) -> dict:
-        """One tiny turn through the person's own CLI: it proves the CLI runs and that they are logged in.
+    def login_status(self, kind: str) -> dict:
+        """Is the person logged in on this plan, and is it a plan and not an API key? No inference, so no turn.
 
-        A proved login is remembered for the rest of the run, so a setup run spends one turn of their plan and not
-        one per page. A failure is never remembered: the point of "Check again" is to try once more.
+        This is what the wizard establishes before it offers models, so that choosing one is the only thing a setup
+        run spends. Remembered for the run; a failure is not, because "Check again" has to mean it.
         """
-        model = self._brain_model(kind)
+        if kind in self._logged_in:
+            return self._logged_in[kind]
+        brain = self._brain(kind, self._brain_model(kind))
+        try:
+            said = brain.login()
+        except BrainError as e:
+            raise self._brain_trouble(kind, e) from None
+        finally:
+            brain.close()
+        self._logged_in[kind] = {"plan": str(said.get("plan") or "")}
+        return self._logged_in[kind]
+
+    def test_subscription(self, kind: str, model: str | None = None) -> dict:
+        """One tiny turn through the person's own CLI, against the model that will take the calls: it proves the plan
+        answers with that model and that the session comes up with no tools.
+
+        A proved model is remembered for the rest of the run, so a setup run spends one turn of their plan and not one
+        per page: the Check step asks for the model the config now names, which is this one. A failure is never
+        remembered: the point of "Check again" is to try once more.
+        """
+        model = model or self._brain_model(kind)
         if (kind, model) in self._probed:
             return self._probed[(kind, model)]
         brain = self._brain(kind, model)

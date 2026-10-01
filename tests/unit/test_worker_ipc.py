@@ -283,7 +283,8 @@ async def test_a_subscription_brain_through_the_real_worker(tmp_path, monkeypatc
     assert "".join(e["text"] for e in evs if e["ev"] == "token") == "Hello there."
     await c.stop()
     log = [json.loads(l) for l in (tmp_path / "cli.jsonl").read_text().splitlines()]
-    assert [r["event"] for r in log] == ["start", "turn", "start", "turn"]  # the probe's session, then the call's
+    # the login is read first and costs no turn, then the probe's session, then the call's
+    assert [r["event"] for r in log] == ["login", "start", "turn", "start", "turn"]
     assert [r["text"] for r in log if r["event"] == "turn"] == ["Say OK.", "Hi"]
     assert log[-1]["system"] == "This call: take a message."  # prepare's session is the one the turn used
 
@@ -311,4 +312,82 @@ async def test_llm_release_is_nothing_to_a_brain_with_no_session():
     await c.start()
     c.send({"op": "llm.release", "gen": c.current_gen})
     assert await _generate(c) == "Hello, this is a fake reply."
+    await c.stop()
+
+
+def _fake_cli(tmp_path, monkeypatch, protocol, turns, **extra):
+    """The fake CLI from the backend tests, ready for the real worker to drive."""
+    from tests.unit.test_cli_brain import FAKE_CLI
+
+    exe = tmp_path / "fake-cli"
+    exe.write_text(FAKE_CLI)
+    exe.chmod(0o755)
+    spec = tmp_path / "script.json"
+    spec.write_text(json.dumps({"protocol": protocol, "log": str(tmp_path / "cli.jsonl"), "turns": turns, **extra}))
+    monkeypatch.setenv("AI_PHONE_FAKE_CLI", str(spec))
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path / "home"))
+    return str(exe)
+
+
+def _cli_log(tmp_path):
+    path = tmp_path / "cli.jsonl"
+    return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+
+@pytest.mark.asyncio
+async def test_a_hangup_during_session_startup_spends_no_turn(tmp_path, monkeypatch):
+    """A caller who hangs up while the session is still coming up. `prepare()` is a second of synchronous work, so the
+    generate, the cancel and the release all arrive while it runs; the worker used to read the generate first and send
+    the turn, and only check for the cancel once a token had come back — by which time the plan had been billed."""
+    exe = _fake_cli(tmp_path, monkeypatch, "codex", [{"deltas": ["OK"]}, {"deltas": ["Hello."]}], thread_ms=900)
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", "ai_phone.services.backends.cli_brain:make_codex", loop, None, None,
+                     {"system_prompt": "You are a phone assistant."},
+                     factory_args={"model": "gpt-5.6-luna", "cli": exe, "first_token_timeout_ms": 12000,
+                                   "stream_idle_timeout_ms": 4000, "max_response_chars": 2000})
+    await c.start()
+    turns_after_warmup = len([r for r in _cli_log(tmp_path) if r["event"] == "turn"])
+    c.send({"op": "llm.prepare", "gen": c.current_gen, "system_prompt": "This call: take a message."})
+    gen = c.next_gen()
+    c.send({"op": "llm.generate", "gen": gen, "messages": [{"role": "system", "content": "This call: take a message."},
+                                                           {"role": "user", "content": "Hi"}], "max_tokens": 60})
+    c.cancel(gen)                                  # the caller hangs up while the session is still starting
+    c.send({"op": "llm.release", "gen": gen})
+    await asyncio.sleep(2.5)                       # long enough for the session to come up and the turn to be sent
+    assert len([r for r in _cli_log(tmp_path) if r["event"] == "turn"]) == turns_after_warmup, "a turn was still sent"
+    assert not any(e.get("ev") == "token" for e in _drain(c)), "the caller is gone; nothing to say"
+    # and the worker is still the one the next call uses
+    assert await _generate_on(c, "Hi again") == "Hello."
+    await c.stop()
+
+
+def _drain(c):
+    out = []
+    while not c.events.empty():
+        out.append(c.events.get_nowait())
+    return out
+
+
+async def _generate_on(c, text):
+    gen = c.next_gen()
+    c.send({"op": "llm.generate", "gen": gen, "messages": [{"role": "system", "content": "This call: take a message."},
+                                                           {"role": "user", "content": text}], "max_tokens": 60})
+    evs = await _collect(c, "done", gen, timeout=20.0)
+    return "".join(e["text"] for e in evs if e["ev"] == "token")
+
+
+@pytest.mark.asyncio
+async def test_a_brain_that_fails_to_warm_up_reports_the_kind_and_nothing_else(tmp_path, monkeypatch):
+    """A warm-up failure is raised outside the per-turn handler: the worker sent the exception and its traceback, and
+    the daemon logged them. Whatever a provider said in that failure is not the daemon's log's business."""
+    sentinel = "zq7-sentinel-the-provider-said-this"
+    exe = _fake_cli(tmp_path, monkeypatch, "claude", [{"deltas": [], "fail": f"Overloaded: {sentinel}"}])
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", "ai_phone.services.backends.cli_brain:make_claude", loop, None, None,
+                     {"system_prompt": "You are a phone assistant."},
+                     factory_args={"model": "haiku", "cli": exe})
+    with pytest.raises(RuntimeError) as e:
+        await c.start()
+    assert "the brain failed: failed" in str(e.value) and sentinel not in str(e.value)
+    assert "Traceback" not in str(e.value)
     await c.stop()

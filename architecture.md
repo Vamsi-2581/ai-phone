@@ -822,19 +822,42 @@ already pays for the agent, with no API key: `services/backends/cli_brain.py` dr
 --system-prompt <prompt> --model <model> --tools ""` and writes one `{"type":"user",…}` line per turn; text arrives as
 `stream_event` deltas and `result` ends the turn (`--bare` must not be used: it skips the keychain login, and every
 CLAUDE* variable is removed from the child's environment or the CLI takes itself for a nested session). `CodexLLM`
-speaks `codex app-server`'s JSON-RPC 2.0 over stdio: `initialize` → `initialized` → `thread/start` (ephemeral,
-`sandbox: read-only`, `approvalPolicy: never`, `baseInstructions`, the model always named explicitly because the
-person's own default may be one the plan forbids) → `turn/start` per turn, `item/agentMessage/delta` until
+speaks `codex app-server`'s JSON-RPC 2.0 over stdio: `initialize` → `initialized` → `account/read` → `thread/start`
+(ephemeral, `sandbox: read-only`, `approvalPolicy: never`, `baseInstructions`, the model always named explicitly
+because the person's own default may be one the plan forbids) → `turn/start` per turn, `item/agentMessage/delta` until
 `turn/completed`, `turn/interrupt` to cancel. Both run in `~/.ai-phone/brain/` (0700, empty), so no CLAUDE.md,
-AGENTS.md or project settings of the person's own are read, and `-c mcp_servers={}` keeps their MCP servers out of
-every Codex thread (measured: thread start 1130 ms → 170 ms). One session per call: the session remembers the
+AGENTS.md or project settings of the person's own are read. One session per call: the session remembers the
 instructions and the conversation it was given, so a turn sends only the newest thing the caller said; a different
 system prompt, or a history that is not this session's continuation, starts a new session. A reply the caller talked
 over comes back marked `[interrupted]`, so an assistant turn is matched by its place in the conversation, not its
 words. The worker's new `llm.prepare` op (sent by the daemon as soon as a call's instructions are composed, before the
 greeting plays, and ignored by backends without `prepare`) starts the session so the first reply does not pay the
-startup. `warmup` spends one tiny turn ("Say OK.") to prove the login and throws that session away; failures are the
-same `BrainError` kinds as the endpoint brain plus `cli_missing`, `not_logged_in` and `model_not_allowed`.
+startup. `warmup` reads the login first without inference (`claude auth status --json`, Codex's `account/read`) and
+refuses an API-key login, then spends one tiny turn ("Say OK.") to prove the plan answers and throws that session away;
+failures are the same `BrainError` kinds as the endpoint brain plus `cli_missing`, `not_logged_in`, `api_key_login`,
+`rate_limited`, `model_not_allowed`, `tool_use` and `tools_unknown`, and they carry a kind only — a provider's own
+words are classified and then go to the debug log, never into the exception the worker, the daemon's log or a wizard
+page sees.
+
+**The tool boundary** (2026-10-01). What a caller says is model input, so a session that can reach a tool is a way
+into this Mac from the phone. Claude Code takes `--tools ""` and reports its tool list on the `system`/`init` line,
+which must be empty or the turn is `BrainError("tool_use")`. Codex has no equivalent: its config `tools` table holds
+only web search, its `default_tools_enabled`/`omit_tools_from` settings belong to app connectors, its sandbox cannot
+be narrower than read-only (which still reads the whole disk), and the protocol has no request that lists the tools a
+thread has. Measured against codex-cli 0.157.1: `-c mcp_servers={}` is silently ignored and ten of the owner's MCP
+servers started inside an ai-phone thread. So a Codex session is confined three ways and then watched. (1) Every tool
+feature is disabled by name — `--disable shell_tool --disable unified_exec --disable view_image --disable apps …`,
+the flags behind `codex features list`. (2) `CODEX_HOME` is `~/.ai-phone/brain/codex/` (0700), holding only a
+config.toml ai-phone writes and a symlink to the person's own `auth.json`, so the login is theirs and no copy of their
+tokens is made, while their MCP servers, hooks, plugins, skills and AGENTS.md are all absent. (3) `thread/start` asks
+for `sandbox: read-only` with no network and `approvalPolicy: never`, and the thread's own answer is checked: anything
+else (a requirements file, an MDM policy, a newer CLI) is `BrainError("tools_unknown")` before a turn is spent — the
+mirror of the Claude side's assertion. Then, during a turn, an `item/started` whose item is not a user message, an
+agent message, reasoning or a compaction, an `mcpServer/startupStatus/updated`, a `configWarning`, or any
+`…/requestApproval` request (which is answered `denied`) is `BrainError("tool_use")`: the turn ends, the words it had
+started to say are not delivered, and the session is marked spent so the rest of the call gets a new one. Verified
+against the real CLI with one probe turn: asked to read a file outside its directory and `/etc/hosts`, the session
+produced only `userMessage`, `reasoning`, `agentMessage` and said it could not reach them.
 `max_tokens` cannot be imposed on a CLI, so a reply past `max_response_chars` ends the turn, and the reader stops a
 session that prints more than one call's worth of output (`BrainError("too_long")`). Nothing of the conversation is
 logged: timings and the model only, with the CLI's own stderr at debug, truncated. The session belongs to one call:

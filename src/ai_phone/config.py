@@ -136,6 +136,9 @@ class CallsConfig:
 # a ChatGPT plan lists (measured; see README "Any brain").
 SUBSCRIPTION_MODELS = {"claude": "haiku", "chatgpt": "gpt-5.6-luna"}
 SUBSCRIPTION_KINDS = tuple(SUBSCRIPTION_MODELS)
+# every brain a config may name. Anything that reads brain.kind out of a config too broken to load (models pull's
+# recovery) takes the kinds from here, so a new one is never silently read as the default.
+BRAIN_KINDS = ("local", "openai_compatible", *SUBSCRIPTION_KINDS)
 
 
 @dataclass

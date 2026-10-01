@@ -10,6 +10,8 @@ import json
 import logging
 import os
 import stat
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -83,8 +85,17 @@ if "--version" in sys.argv:
     print(SPEC.get("version", "9.9.9 (fake)"))
     raise SystemExit(0)
 
+if sys.argv[1:3] == ["auth", "status"]:
+    """`claude auth status --json`, which the backend reads before it spends a turn."""
+    note(event="login", argv=sys.argv[1:])
+    print(json.dumps(SPEC.get("login", {"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "max"})))
+    raise SystemExit(0)
+
 note(event="start", argv=sys.argv[1:], cwd=os.getcwd(), entries=sorted(os.listdir(".")),
-     claude_env=sorted(k for k in os.environ if k.startswith("CLAUDE")))
+     claude_env=sorted(k for k in os.environ if k.startswith("CLAUDE")),
+     provider_env=sorted(k for k in os.environ if k.startswith(("ANTHROPIC", "OPENAI", "AWS"))
+                         or k.endswith(("_API_KEY", "_BASE_URL"))),
+     codex_home=os.environ.get("CODEX_HOME"))
 
 if SPEC["protocol"] == "claude":
     if SPEC.get("init_at_start"):
@@ -124,16 +135,32 @@ else:
             note(event="initialized")
         elif method == "model/list":
             out({"jsonrpc": "2.0", "id": mid, "result": {"data": SPEC.get("models", [])}})
+        elif method == "account/read":
+            note(event="account")
+            out({"jsonrpc": "2.0", "id": mid,
+                 "result": {"account": SPEC.get("account", {"type": "chatgpt", "planType": "pro"})}})
         elif method == "thread/start":
+            time.sleep(SPEC.get("thread_ms", 0) / 1000)  # a session that takes a while to come up, as a real one does
             note(event="thread", system=prm.get("baseInstructions"), model=prm.get("model"), cwd=prm.get("cwd"),
-                 sandbox=prm.get("sandbox"), approval=prm.get("approvalPolicy"), ephemeral=prm.get("ephemeral"))
+                 sandbox=prm.get("sandbox"), approval=prm.get("approvalPolicy"), ephemeral=prm.get("ephemeral"),
+                 config=prm.get("config"))
             if SPEC.get("thread_error"):
                 out({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": SPEC["thread_error"]}})
             else:
-                out({"jsonrpc": "2.0", "id": mid, "result": {"thread": {"id": "th1"}, "model": prm.get("model")}})
+                # what the thread says it came up as; `came_up` in the script asks for a thread with more reach
+                came = SPEC.get("came_up") or {"sandbox": {"type": "readOnly", "networkAccess": False},
+                                               "approvalPolicy": "never"}
+                out({"jsonrpc": "2.0", "id": mid, "result": {"thread": {"id": "th1"}, "model": prm.get("model"), **came}})
+                for name in SPEC.get("mcp_servers") or []:
+                    out({"jsonrpc": "2.0", "method": "mcpServer/startupStatus/updated",
+                         "params": {"threadId": "th1", "name": name, "status": "ready"}})
+                if SPEC.get("config_warning"):
+                    out({"jsonrpc": "2.0", "method": "configWarning", "params": {"summary": SPEC["config_warning"]}})
         elif method == "turn/interrupt":
             note(event="interrupt", turn=prm.get("turnId"))
             out({"jsonrpc": "2.0", "id": mid, "result": {}})
+        elif method is None and mid is not None:
+            note(event="answer", id=mid, result=msg.get("result"))  # what the client said to a request of ours
         elif method == "turn/start":
             note(event="turn", text=(prm.get("input") or [{}])[0].get("text"), effort=prm.get("effort"))
             d, n = directive(), n + 1
@@ -154,14 +181,40 @@ else:
                     else:
                         waiting.append(line)
 
+            if d.get("tool"):  # the session reaching for one of the model's own tools
+                out({"jsonrpc": "2.0", "method": "item/started",
+                     "params": {"threadId": "th1", "turnId": turn_id,
+                                "item": {"type": d["tool"], "id": "x1", "command": "cat /etc/hosts"}}})
+            if d.get("approval"):  # a tool asking the client's permission: it blocks until it is answered
+                out({"jsonrpc": "2.0", "id": 9001, "method": "item/commandExecution/requestApproval",
+                     "params": {"threadId": "th1", "turnId": turn_id, "command": "cat /etc/hosts"}})
+            out({"jsonrpc": "2.0", "method": "item/started",
+                 "params": {"threadId": "th1", "turnId": turn_id, "item": {"type": "agentMessage", "id": "i1"}}})
             said = deltas(d, lambda c: out({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
                                             "params": {"threadId": "th1", "turnId": turn_id, "itemId": "i1", "delta": c}}),
                           interrupted)
             for line in cut:
                 waiting.append(line)
-            if d.get("fail"):
+            if d.get("retry"):
+                # the real shape of a retryable failure: an error that is NOT the end of the turn, then the turn's own
+                # completion. `retry_deltas` is what the retry says before it completes.
+                out({"jsonrpc": "2.0", "method": "error",
+                     "params": {"threadId": "th1", "turnId": turn_id, "willRetry": True,
+                                "error": {"message": d["retry"]}}})
+                for chunk in d.get("retry_deltas") or []:
+                    out({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+                         "params": {"threadId": "th1", "turnId": turn_id, "itemId": "i1", "delta": chunk}})
+                out({"jsonrpc": "2.0", "method": "turn/completed",
+                     "params": {"threadId": "th1", "turn": {"id": turn_id, "items": [], "status": "completed"}}})
+            elif d.get("fail"):
                 out({"jsonrpc": "2.0", "method": "error",
                      "params": {"threadId": "th1", "turnId": turn_id, "willRetry": False, "error": {"message": d["fail"]}}})
+                if d.get("then_completed"):
+                    # what the review found: a failed turn's own completion still arrives, and must not be read as
+                    # the answer to whatever is asked next
+                    out({"jsonrpc": "2.0", "method": "turn/completed",
+                         "params": {"threadId": "th1", "turn": {"id": turn_id, "items": [], "status": "failed",
+                                                                "error": {"message": d["fail"]}}}})
             else:
                 status = "interrupted" if cut else "completed"
                 out({"jsonrpc": "2.0", "method": "turn/completed",
@@ -531,7 +584,7 @@ def test_an_init_line_queued_before_the_turn_is_read_in_its_turn(cli):
     try:
         with pytest.raises(BrainError) as e:
             list(brain.stream(1, talk("Hi"), 120))
-        assert e.value.kind == "failed" and "tools" in str(e.value)
+        assert e.value.kind == "tool_use" and "tools" in str(e.value)
     finally:
         brain.close()
 
@@ -542,7 +595,7 @@ def test_a_cli_that_came_up_with_tools_of_its_own_is_refused(cli):
     try:
         with pytest.raises(BrainError) as e:
             list(brain.stream(1, talk("Hi"), 120))
-        assert e.value.kind == "failed" and "tools" in str(e.value)
+        assert e.value.kind == "tool_use" and "tools" in str(e.value)
     finally:
         brain.close()
 
@@ -629,15 +682,15 @@ def test_codex_speaks_the_handshake_and_one_turn_per_message(cli):
         assert "".join(brain.stream(2, talk("Hi", "Hello.", "More"), 120)) == "Again."
     finally:
         brain.close()
-    assert [r["event"] for r in cli.log][:4] == ["start", "initialize", "initialized", "thread"]
+    assert [r["event"] for r in cli.log][:5] == ["start", "initialize", "initialized", "account", "thread"]
     assert cli.events("initialize")[0]["client"]["name"] == "ai-phone"
     thread = cli.events("thread")[0]
     assert thread["system"] == PROMPT and thread["model"] == "gpt-5.6-luna" and thread["ephemeral"] is True
     assert thread["sandbox"] == "read-only" and thread["approval"] == "never"
     argv = cli.events("start")[0]["argv"]
     assert argv[0] == "app-server"
-    assert "mcp_servers={}" in argv, "the person's own MCP servers would start with every thread"
     assert 'model_reasoning_effort="low"' in argv
+    assert thread["config"] == {"sandbox_mode": "read-only", "web_search": "disabled", "tools": {"web_search": False}}
     assert [r["text"] for r in cli.events("turn")] == ["Hi", "More"]
     assert len(cli.events("thread")) == 1
 
@@ -698,7 +751,9 @@ def test_codex_model_that_the_plan_does_not_allow_says_which_one(cli):
     try:
         with pytest.raises(BrainError) as e:
             list(brain.stream(1, talk("Hi"), 120))
-        assert e.value.kind == "model_not_allowed" and "gpt-5.6-luna" in str(e.value)
+        # the kind is what the wizard turns into a sentence naming the model; the provider's own words (the status
+        # code, whatever it quoted back) stay in the debug log
+        assert e.value.kind == "model_not_allowed" and "400" not in str(e.value)
     finally:
         brain.close()
 
@@ -732,7 +787,7 @@ def test_codex_warmup_proves_the_login(cli):
         t = brain.warmup(PROMPT)
     finally:
         brain.close()
-    assert sorted(t) == ["cli_version", "model", "warm_ms"]
+    assert sorted(t) == ["cli_version", "model", "plan", "warm_ms"]
     assert t["model"] == "gpt-5.6-luna" and t["cli_version"] == "codex-cli 0.157.1" and t["warm_ms"] > 0
     assert [r["text"] for r in cli.events("turn")] == ["Say OK."]
 
@@ -786,3 +841,278 @@ def test_closing_the_brain_ends_the_cli(cli):
     brain.close()
     assert proc.poll() is not None, "the CLI is still running"
     assert brain._proc is None and brain.close() is None  # closing twice is how the worker shuts down
+
+
+# ---- the tool boundary: a caller's words must not reach anything that can touch this Mac ----------
+
+def test_codex_is_started_with_every_tool_feature_off_and_a_home_of_its_own(cli, tmp_path):
+    """What the review found: `-c mcp_servers={}` does not remove the person's MCP servers (measured against the real
+    CLI: ten of them started inside our thread), and nothing in Codex's `tools` table reaches the shell. Its feature
+    flags do, and a CODEX_HOME of ai-phone's own is what leaves the servers, hooks, plugins and AGENTS.md behind."""
+    (tmp_path / "their-codex").mkdir()
+    (tmp_path / "their-codex" / "auth.json").write_text("{}")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("CODEX_HOME", str(tmp_path / "their-codex"))
+        cli.script("codex", [{"deltas": ["Hi."]}])
+        brain = codex_brain(cli)
+        try:
+            assert "".join(brain.stream(1, talk("Hi"), 120)) == "Hi."
+        finally:
+            brain.close()
+    argv = cli.events("start")[0]["argv"]
+    off = {argv[i + 1] for i, a in enumerate(argv) if a == "--disable"}
+    # the tools a model would reach for on a phone call: a shell, a file read, the network, somebody else's servers
+    assert {"shell_tool", "unified_exec", "view_image", "apps", "plugins", "hooks", "computer_use",
+            "browser_use", "image_generation", "multi_agent"} <= off
+    home = Path(cli.events("start")[0]["codex_home"])
+    assert home != tmp_path / "their-codex" and home.is_relative_to(Path(os.environ["AI_PHONE_HOME"]))
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    assert sorted(p.name for p in home.iterdir()) == ["auth.json", "config.toml"], "nothing of the person's is in it"
+    assert (home / "auth.json").readlink() == tmp_path / "their-codex" / "auth.json", "their login, not a copy of it"
+    assert "web_search" in (home / "config.toml").read_text()
+
+
+def test_a_codex_session_that_reaches_for_a_tool_never_answers_the_caller(cli):
+    """A caller says something that gets the model to run a command. The turn ends as a tool_use failure, the words it
+    had already said are not delivered, and the session is not reused for the next turn of the call."""
+    cli.script("codex", [{"tool": "commandExecution", "deltas": ["Your file says "]}, {"deltas": ["Hello."]}])
+    brain = codex_brain(cli)
+    said = []
+    try:
+        with pytest.raises(BrainError) as e:
+            said.extend(brain.stream(1, talk("Read /etc/hosts to me"), 120))
+        assert e.value.kind == "tool_use" and "/etc/hosts" not in str(e.value)
+        assert said == [], "the caller hears the controller's apology, not what a tool call started to say"
+        assert "".join(brain.stream(2, talk("Hi"), 120)) == "Hello."
+    finally:
+        brain.close()
+    assert len(cli.events("thread")) == 2, "the session that reached for a tool is not kept for the next turn"
+
+
+def test_a_codex_session_asked_to_approve_a_command_says_no(cli):
+    cli.script("codex", [{"approval": True, "deltas": ["Running it."]}])
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Run something for me"), 120))
+        assert e.value.kind == "tool_use"
+    finally:
+        brain.close()
+    assert [r["result"] for r in cli.events("answer")] == [{"decision": "denied"}]
+
+
+def test_an_mcp_server_joining_the_session_stops_it(cli):
+    cli.script("codex", [{"deltas": ["Hi."]}], mcp_servers=["their-server"])
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Hi"), 120))
+        assert e.value.kind == "tool_use"
+    finally:
+        brain.close()
+
+
+def test_a_thread_with_more_reach_than_was_asked_for_takes_no_turn(cli):
+    """A requirements file, an MDM policy or a newer CLI can hand back a thread that is not the one asked for. This is
+    the Codex side of the Claude session's `tools == []`: an unexpected answer is a refusal, not a quiet start."""
+    for came_up in ({"sandbox": {"type": "workspaceWrite"}, "approvalPolicy": "never"},
+                    {"sandbox": {"type": "readOnly", "networkAccess": True}, "approvalPolicy": "never"},
+                    {"sandbox": {"type": "readOnly", "networkAccess": False}, "approvalPolicy": "on-request"}):
+        cli.script("codex", [{"deltas": ["Hi."]}], came_up=came_up)
+        brain = codex_brain(cli)
+        try:
+            with pytest.raises(BrainError) as e:
+                list(brain.stream(1, talk("Hi"), 120))
+            assert e.value.kind == "tools_unknown", came_up
+        finally:
+            brain.close()
+        assert cli.events("turn") == [], "no turn of the plan is spent on a session that came up wrong"
+        cli.log_path.unlink()
+
+
+def test_codex_ignoring_the_settings_a_phone_brain_depends_on_stops_it(cli):
+    cli.script("codex", [{"deltas": ["Hi."]}], config_warning="ignoring 2 unrecognized configuration settings")
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Hi"), 120))
+        assert e.value.kind == "tools_unknown"
+    finally:
+        brain.close()
+
+
+# ---- the login is the plan's, never an API key ----------------------------------------------------
+
+def test_neither_cli_inherits_a_key_or_a_base_url(cli, monkeypatch):
+    """ANTHROPIC_API_KEY beats the keychain login, so a "subscription" brain set up with it in the environment is
+    billed per token and the feature's whole premise is false. Nothing that re-routes either CLI crosses over."""
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY",
+                 "OPENAI_BASE_URL", "AWS_BEARER_TOKEN_BEDROCK", "SOMETHING_ELSE_API_KEY"):
+        monkeypatch.setenv(name, "must-not-cross")
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+    monkeypatch.setenv("LANG", "en_GB.UTF-8")  # an ordinary variable the CLI still needs
+    cli.script("claude", [{"deltas": ["Hi."]}])
+    brain = claude_brain(cli)
+    try:
+        list(brain.stream(1, talk("Hi"), 120))
+    finally:
+        brain.close()
+    started = cli.events("start")[0]
+    assert started["provider_env"] == [] and started["claude_env"] == []
+    assert "LANG" not in started["provider_env"]
+
+
+def test_a_cli_logged_in_with_an_api_key_is_refused_before_a_turn(cli):
+    cli.script("claude", [{"deltas": ["Hi."]}],
+               login={"loggedIn": True, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"})
+    brain = ClaudeCodeLLM(model="haiku", cli=cli.path)
+    try:
+        with pytest.raises(BrainError) as e:
+            brain.warmup(PROMPT)
+        assert e.value.kind == "api_key_login"
+    finally:
+        brain.close()
+    assert cli.events("turn") == [], "a key would be billed per token, so no turn is sent to find out"
+
+
+def test_a_cli_with_no_login_at_all_is_refused_before_a_turn(cli):
+    cli.script("claude", [{"deltas": ["Hi."]}], login={"loggedIn": False})
+    brain = ClaudeCodeLLM(model="haiku", cli=cli.path)
+    try:
+        with pytest.raises(BrainError) as e:
+            brain.warmup(PROMPT)
+        assert e.value.kind == "not_logged_in"
+    finally:
+        brain.close()
+    assert cli.events("turn") == []
+
+
+def test_codex_on_an_api_key_account_is_refused_before_a_turn(cli):
+    cli.script("codex", [{"deltas": ["Hi."]}], account={"type": "apiKey"})
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            brain.warmup(PROMPT)
+        assert e.value.kind == "api_key_login"
+    finally:
+        brain.close()
+    assert cli.events("turn") == [] and cli.events("thread") == []
+
+
+def test_warmup_reports_what_the_plan_is_called(cli):
+    cli.script("claude", [{"deltas": ["OK"]}],
+               login={"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "max"})
+    brain = claude_brain(cli)
+    try:
+        assert brain.warmup(PROMPT)["plan"] == "max"
+    finally:
+        brain.close()
+    assert [r["argv"] for r in cli.events("login")] == [["auth", "status", "--json"]]
+
+
+# ---- a provider's own words stay out of the exception and out of the log -------------------------
+
+SENTINEL = "zq7-sentinel-the-provider-said-this"
+
+
+def test_a_failing_warmup_carries_no_provider_text(cli, caplog):
+    """The worker's outer handler sends and re-raises a warm-up failure, so it reaches the daemon's log. Only the kind
+    may travel: a provider's error can quote the instructions, what a caller said, or a key."""
+    cli.script("claude", [{"deltas": [], "fail": f"Overloaded: {SENTINEL}"}])
+    brain = claude_brain(cli)
+    with caplog.at_level(logging.INFO, logger="ai-phone"):
+        try:
+            with pytest.raises(BrainError) as e:
+                brain.warmup(PROMPT)
+        finally:
+            brain.close()
+    assert e.value.kind == "failed"
+    assert SENTINEL not in str(e.value) and SENTINEL not in repr(e.value.args)
+    assert SENTINEL not in caplog.text
+
+
+def test_what_a_cli_writes_to_stderr_stays_out_of_the_log_at_info(cli, caplog):
+    cli.script("codex", [{"deltas": [], "fail": f"500 {SENTINEL}"}])
+    brain = codex_brain(cli)
+    with caplog.at_level(logging.INFO, logger="ai-phone"):
+        try:
+            with pytest.raises(BrainError) as e:
+                list(brain.stream(1, talk("Hi"), 120))
+        finally:
+            brain.close()
+    assert e.value.kind == "failed"
+    assert SENTINEL not in str(e.value) and SENTINEL not in caplog.text
+
+
+def test_the_detail_is_kept_at_debug_for_whoever_is_debugging(cli, caplog):
+    cli.script("codex", [{"deltas": [], "fail": f"500 {SENTINEL}"}])
+    brain = codex_brain(cli)
+    with caplog.at_level(logging.DEBUG, logger="ai-phone"):
+        try:
+            with pytest.raises(BrainError):
+                list(brain.stream(1, talk("Hi"), 120))
+        finally:
+            brain.close()
+    assert SENTINEL in caplog.text
+
+
+# ---- a Codex error is not the end of a turn ------------------------------------------------------
+
+def test_a_retryable_codex_error_is_followed_by_the_turns_own_completion(cli):
+    """A Codex `error` carries willRetry and a turn id. Taking it for the end of the turn left that turn's real
+    completion on the wire, to be read as the answer to whatever the caller said next."""
+    cli.script("codex", [{"deltas": ["Hel"], "retry": "502 upstream hiccup", "retry_deltas": ["lo."]},
+                         {"deltas": ["Again."]}])
+    brain = codex_brain(cli)
+    try:
+        assert "".join(brain.stream(1, talk("Hi"), 120)) == "Hello."
+        assert "".join(brain.stream(2, talk("Hi", "Hello.", "More"), 120)) == "Again."
+    finally:
+        brain.close()
+    assert len(cli.events("thread")) == 1, "a retried turn did not cost the call its session"
+
+
+def test_a_failed_codex_turns_completion_is_not_the_next_turns_answer(cli):
+    cli.script("codex", [{"deltas": ["Half"], "fail": "500 upstream", "then_completed": True},
+                         {"deltas": ["Hello."]}])
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Hi"), 120))
+        assert e.value.kind == "failed"
+        # the failed turn's completion is still on the wire; the next turn must be answered by the next turn
+        assert "".join(brain.stream(2, talk("Hi"), 120)) == "Hello."
+    finally:
+        brain.close()
+    assert len(cli.events("thread")) == 2, "the session that failed is not reused"
+
+
+def test_an_older_turns_words_are_not_read_as_this_turns_answer(cli):
+    """Straight at the correlation: a delta tagged with a turn that is not the one running is not an answer."""
+    brain = codex_brain(cli)
+    brain._thread, brain._turn_id = "th1", "t2"
+    assert brain._event({"method": "item/agentMessage/delta",
+                         "params": {"threadId": "th1", "turnId": "t1", "delta": "stale"}}) == ("note", None)
+    assert brain._event({"method": "item/agentMessage/delta",
+                         "params": {"threadId": "th1", "turnId": "t2", "delta": "fresh"}}) == ("delta", "fresh")
+    what, _ = brain._event({"method": "turn/completed",
+                            "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed"}}})
+    assert what == "note", "an older turn's completion does not end this one"
+    assert brain._event({"method": "turn/completed",
+                         "params": {"threadId": "th1", "turn": {"id": "t2", "status": "completed"}}}) == ("end", None)
+
+
+# ---- the guard that keeps the suite off the owner's plans -----------------------------------------
+
+def test_the_suite_refuses_to_run_the_real_subscription_clis(cli):
+    """tests/conftest.py. A unit test that reaches the real claude or codex spends a turn of someone's plan and fails
+    on a machine where nobody is logged in, so a green suite must not be able to depend on one."""
+    for name in ("claude", "codex"):
+        with pytest.raises(AssertionError, match="spends a turn of the owner's plan"):
+            subprocess.run([f"/opt/homebrew/bin/{name}", "--version"])
+        with pytest.raises(AssertionError):
+            subprocess.Popen([name])
+    # the fakes, and everything else, still run: it is the name from outside the test's own directory that is refused
+    cli.script("claude")
+    assert subprocess.run([cli.path, "--version"], capture_output=True).returncode == 0
+    assert subprocess.run([sys.executable, "-c", "pass"]).returncode == 0

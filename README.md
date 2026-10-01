@@ -101,7 +101,14 @@ asks, and the daemon says at start where the words of a call go.
 
 A subscription brain uses no API key: ai-phone drives the CLI you are already logged into (`claude -p`, or
 `codex app-server`) in an empty private directory, with no tools and none of your own project settings, and
-streams its words to the caller. Install them with `npm install -g @anthropic-ai/claude-code` (then `claude`
+streams its words to the caller. It asks each CLI what its login is before it uses it, and refuses to run on
+an API key: a key is billed per request, and on the Claude side `ANTHROPIC_API_KEY` beats the login you have,
+so neither it nor anything else that would re-route a CLI (`OPENAI_*`, a `*_BASE_URL`) is passed on to one.
+What callers say is model input, so neither session gets tools: Claude Code is run with none and asked what it
+came up with, and Codex is given a `CODEX_HOME` of ai-phone's own, so none of your MCP servers, hooks, plugins
+or `AGENTS.md` is in a call, with every tool feature turned off and a read-only sandbox that approves nothing.
+A session that reaches for a tool anyway does not answer the caller: the turn ends and the session goes.
+Install them with `npm install -g @anthropic-ai/claude-code` (then `claude`
 and `/login`) or `npm install -g @openai/codex` (then `codex login`). A plan is a second or two slower to the
 first word than the model on this Mac, and it is not private; what it buys is a much stronger brain on the
 phone than 24 GB of memory can hold. The session belongs to one call: it is started while the greeting plays

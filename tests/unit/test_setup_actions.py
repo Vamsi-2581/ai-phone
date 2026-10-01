@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
 import stat
 import subprocess
@@ -903,21 +904,33 @@ def test_kokoro_player_needs_the_model_and_the_voice(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fake_cli(tmp_path, monkeypatch):
-    """The fake CLI the backend tests use, with a script of its own: setup never runs the real claude or codex."""
+    """The fake CLI the backend tests use, with a script of its own: setup never runs the real claude or codex.
+
+    `as_name` also installs it under the name a backend looks for (`claude`, `codex`) on a PATH with nothing else on
+    it, for the paths where the config names no CLI of its own and the lookup is what has to be covered.
+    """
     from tests.unit.test_cli_brain import FAKE_CLI
 
     exe = tmp_path / "fake-cli"
     exe.write_text(FAKE_CLI)
     exe.chmod(0o755)
 
-    def script(protocol, turns=None, **extra):
+    def script(protocol, turns=None, as_name=None, **extra):
         spec = tmp_path / "script.json"
         spec.write_text(json.dumps({"protocol": protocol, "log": str(tmp_path / "cli.jsonl"),
                                     "turns": turns or [{}], **extra}))
         monkeypatch.setenv("AI_PHONE_FAKE_CLI", str(spec))
+        if as_name:
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir(exist_ok=True)
+            (bin_dir / as_name).write_text(FAKE_CLI)
+            (bin_dir / as_name).chmod(0o755)
+            # the fake and the interpreter its shebang needs, and nothing else: the real CLI is not on this PATH
+            monkeypatch.setenv("PATH", os.pathsep.join([str(bin_dir), str(Path(sys.executable).parent)]))
         return str(exe)
 
-    script.log = lambda: [json.loads(l) for l in (tmp_path / "cli.jsonl").read_text().splitlines()]
+    script.log = lambda: ([json.loads(l) for l in (tmp_path / "cli.jsonl").read_text().splitlines()]
+                          if (tmp_path / "cli.jsonl").exists() else [])
     return script
 
 
@@ -934,9 +947,57 @@ def test_a_logged_in_cli_is_proved_with_one_turn_and_remembered(home, fake_cli):
 
 
 def test_the_probe_uses_the_plans_own_model_when_the_config_names_another_brain(home, fake_cli):
-    exe = fake_cli("claude", [{"deltas": ["OK"]}])
+    """The config is on the local brain, so its `cli` is not Claude Code's path and is rightly ignored: the backend
+    looks the command up on PATH instead. The fake is installed there under that name, because the point of this test
+    is the lookup, and a unit test that reaches the real claude spends a turn of the owner's plan on every suite run.
+    """
+    exe = fake_cli("claude", [{"deltas": ["OK"]}], as_name="claude")
     a = make(home, f"brain: {{kind: local, cli: {exe}}}\n")
     assert a.test_subscription("claude")["model"] == "haiku"   # the fastest, for a probe and for a call
+    assert [r["event"] for r in fake_cli.log()].count("turn") == 1, "the fake handled the probe, not the real claude"
+
+
+def test_the_login_is_established_without_spending_a_turn(home, fake_cli):
+    """What the wizard asks before it offers a model: whether there is a login, and whether it is a plan."""
+    exe = fake_cli("claude", [{"deltas": ["OK"]}], login={"loggedIn": True, "authMethod": "claude.ai",
+                                                          "subscriptionType": "max"})
+    a = make(home, f"brain: {{kind: claude, cli: {exe}}}\n")
+    assert a.login_status("claude") == {"plan": "max"}
+    assert [r["event"] for r in fake_cli.log()] == ["login"], "no session, no turn"
+    assert a.login_status("claude") == {"plan": "max"}  # remembered for the run
+    assert [r["event"] for r in fake_cli.log()] == ["login"]
+
+
+def test_a_login_that_is_an_api_key_says_so_before_any_turn(home, fake_cli):
+    """ANTHROPIC_API_KEY, or a key saved in the CLI's own settings, is billed per request and beats the plan login. A
+    brain sold as "no API key" must not quietly become one."""
+    exe = fake_cli("claude", [{"deltas": ["OK"]}],
+                   login={"loggedIn": True, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"})
+    a = make(home, f"brain: {{kind: claude, cli: {exe}}}\n")
+    with pytest.raises(ActionError, match=r"^claude is set up to use an API key, which is billed per request\."):
+        a.login_status("claude")
+    assert [r["event"] for r in fake_cli.log()] == ["login"]
+
+
+def test_a_failed_login_check_is_never_remembered(home, fake_cli):
+    exe = fake_cli("claude", login={"loggedIn": False})
+    a = make(home, f"brain: {{kind: claude, cli: {exe}}}\n")
+    with pytest.raises(ActionError, match="not logged in"):
+        a.login_status("claude")
+    fake_cli("claude", login={"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "max"})
+    assert a.login_status("claude") == {"plan": "max"}
+
+
+def test_the_probe_is_against_the_model_that_was_picked_and_is_remembered_as_such(home, fake_cli):
+    """The wizard probes after the menu, with the model the person chose; the Check page then asks for the model the
+    config names, which is that one, and finds it proved. One request of the plan for the whole run."""
+    exe = fake_cli("claude", [{"deltas": ["OK"]}, {"deltas": ["OK"]}])
+    a = make(home, f"brain: {{kind: claude, model: haiku, cli: {exe}}}\n")
+    assert a.test_subscription("claude", "opus")["model"] == "opus"
+    a.save_brain_subscription("claude", "opus")
+    assert a.test_subscription("claude")["model"] == "opus"          # the Check page, with no model of its own
+    assert [r["event"] for r in fake_cli.log()].count("turn") == 1
+    assert [r["model"] for r in fake_cli.log() if r["event"] == "turn"] == ["opus"]
 
 
 def test_a_cli_that_is_not_installed_says_how_to_install_it(home, fake_cli):
@@ -1020,11 +1081,15 @@ def test_a_failure_nobody_has_guidance_for_keeps_the_cli_s_own_words_off_the_pag
     said = "Overloaded: policy 1234 says this ORGANISATION may not do that"
     exe = fake_cli("claude", [{"deltas": [], "fail": said}])
     a = make(home, f"brain: {{kind: claude, cli: {exe}}}\n")
-    with caplog.at_level(logging.DEBUG, logger="ai-phone.setup"):
+    # both loggers: the backend puts the CLI's own words in the debug log of "ai-phone" as it classifies them, and
+    # the wizard adds its own line there too. Neither is above debug.
+    with caplog.at_level(logging.DEBUG, logger="ai-phone"):
         with pytest.raises(ActionError) as e:
             a.test_subscription("claude")
     assert str(e.value) == "claude could not answer (failed). Try again, or pick another brain."
     assert said not in str(e.value) and "policy 1234" in caplog.text  # the detail is kept, out of sight
+    above = [r for r in caplog.records if r.levelno > logging.DEBUG and said in r.getMessage()]
+    assert above == [], "the provider's own words belong at debug and nowhere else"
 
 
 def test_a_path_set_for_one_plans_cli_is_never_used_for_the_other(home, fake_cli):
