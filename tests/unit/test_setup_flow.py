@@ -7,10 +7,11 @@ from pathlib import Path
 import pytest
 
 import ai_phone
-from ai_phone.config import InboundConfig
+from ai_phone.config import SUBSCRIPTION_MODELS, InboundConfig
 from ai_phone.lines.forward import divert_codes
 from ai_phone.pipeline.prompts import DISCLOSURE
 from ai_phone.providers.base import Number, VerificationStep
+from ai_phone.services.backends.cli_brain import CLAUDE_MODELS, CliModel
 from ai_phone.setup import flow
 from ai_phone.setup.actions import ActionError, Current, LineResult, Machine
 from ai_phone.setup.flow import BRAIN, CALLERS, CHECK, DONE, LINE, VOICE, WELCOME
@@ -21,6 +22,9 @@ VOICES = ["af_bella", "af_heart", "am_adam", "bf_emma", "bm_george"]
 OWNED = [Number("+15550100007", None, None, False, "PN7"), Number("+15550100008", None, None, False, "PN8")]
 FOUND = [Number("+15550100001", 1.15, "USD", False, "n1"), Number("+15550100002", 1.15, "USD", True, "n2")]
 TWILIO = {"TWILIO_ACCOUNT_SID": "ACsid", "TWILIO_AUTH_TOKEN": "tokSECRET"}
+CODEX_MODELS = [CliModel("gpt-5.6-luna", "gpt-5.6-luna", "fastest to answer"),
+                CliModel("gpt-6-astra", "gpt-6-astra", "the one your plan starts with")]
+CLI_VERSION = {"claude": "2.1.286 (Claude Code)", "chatgpt": "codex-cli 0.157.1"}
 SIP_LINE = {"kind": "sip", "user": "agent", "aor": "sip:agent@192.0.2.10"}
 NUMBER_LINE = {"kind": "trunk", "number": "+15550100001", "provider": {"name": "twilio", "state": "ready"}}
 
@@ -121,8 +125,8 @@ class FakeActions:
         self.calls: list[tuple[str, tuple]] = []
         self.m = Machine(sip_library=sip_library, memory_gb=memory, models_missing=list(missing), config_exists=exists)
         self.cur = Current(exists=exists, lines=dict(lines or {}), brain_kind="local", tier="t4",
-                           base_url="http://127.0.0.1:1234/v1", model="local", brain_key_saved=False, voice="af_heart",
-                           speed=1.0, greeting=GREETING, instructions=INSTRUCTIONS, daily_limit=20)
+                           base_url="http://127.0.0.1:1234/v1", model="local", brain_key_saved=False, brain_cli=None,
+                           voice="af_heart", speed=1.0, greeting=GREETING, instructions=INSTRUCTIONS, daily_limit=20)
         self.results = {"saved_keys": None, "owned_numbers": OWNED, "search_numbers": FOUND, "lan_address": "192.0.2.10",
                         "voices": VOICES, "check_config": None, "download_size": 4_300_000_000, "test_endpoint": "OK"}
         self.results.update(results)
@@ -178,6 +182,19 @@ class FakeActions:
     def test_endpoint(self, url, model, key):
         return self._call("test_endpoint", url, model, key)
 
+    def cli_installed(self, kind):
+        found = self._call("cli_installed", kind)
+        return True if found is None else found
+
+    def test_subscription(self, kind):
+        probe = self._call("test_subscription", kind)
+        return probe or {"model": self.cur.model if self.cur.brain_kind == kind else SUBSCRIPTION_MODELS[kind],
+                         "cli_version": CLI_VERSION[kind], "warm_ms": 1200.0}
+
+    def brain_models(self, kind):
+        found = self._call("brain_models", kind)
+        return list(found if found is not None else (CLAUDE_MODELS if kind == "claude" else CODEX_MODELS))
+
     def owned_numbers(self, carrier, creds):
         return self._call("owned_numbers", carrier, dict(creds))
 
@@ -199,6 +216,10 @@ class FakeActions:
     def save_brain_local(self, tier):
         self._call("save_brain_local", tier)
         self.cur.brain_kind, self.cur.tier = "local", tier
+
+    def save_brain_subscription(self, kind, model):
+        self._call("save_brain_subscription", kind, model)
+        self.cur.brain_kind, self.cur.model = kind, model
 
     def save_brain_endpoint(self, url, model, key):
         self._call("save_brain_endpoint", url, model, key)
@@ -378,7 +399,7 @@ def test_endpoint_brain_keeps_the_saved_key_when_left_empty():
     actions = FakeActions(exists=True)
     actions.cur.brain_kind, actions.cur.model, actions.cur.brain_key_saved = "openai_compatible", "qwen", True
     assert drive(ui, actions).code == 1
-    assert ui.menus[1][2] == 1  # the current brain is the default
+    assert ui.menus[1][2] == 3  # the current brain is the default: the endpoint is the last of the four
     assert ui.fields[2].placeholder == "leave empty to keep the saved key (same server)"
     assert actions.args("test_endpoint") == [("https://api.example.com/v1", "qwen", None)]
     assert actions.args("save_brain_endpoint") == [("https://api.example.com/v1", "qwen", None)]
@@ -1588,3 +1609,172 @@ def test_done_text_with_one_kind_of_line():
     pending = {"twilio": dict(NUMBER_LINE, provider={"name": "twilio", "state": "pending"})}
     lines = flow.done_text(FakeActions(exists=True, lines=pending), flow.Session()).splitlines()
     assert lines[lines.index("Try it") + 1] == "  nothing to call yet: the number is still being set up"
+
+
+# ---- a Claude or ChatGPT subscription as the brain ----------------------------------------------
+
+def test_new_setup_with_a_claude_subscription():
+    ui = ScriptedUI([
+        WELCOME_NEW,
+        ("Where should your agent think?", "My Claude subscription"),
+        ("Which model?", "<default>"),
+        ("How should people reach your agent?", "A SIP address"),
+        ("Name your SIP address", ["agent", "192.0.2.10"]),
+        ("How should your agent sound?", "American · female"),
+        ("American · female", "<default>"),
+        ("Heart", "Use this voice"),
+        ("How fast should it talk?", [""]),
+        ("What should callers hear?", ["", "", ""]),
+        ("Everything works", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions()
+    outcome = drive(ui, actions)
+    assert [o.label for o in ui.menu("Where should your agent think")[1]] == \
+        ["On this Mac", "My Claude subscription", "My ChatGPT subscription", "My own endpoint"]
+    assert ui.menu("Where should your agent think")[1][1].hint == "uses the Claude Code login · no API key"
+    assert actions.args("cli_installed") == [("claude",)]
+    assert "Checking your Claude login…" in ui.labels
+    assert "Asking which models your Claude plan allows…" not in ui.labels  # Claude Code always takes these three
+    model = ui.menu("Which model?")
+    assert [o.label for o in model[1]] == ["Haiku", "Sonnet", "Opus"] and model[2] == 0
+    assert model[1][0].hint == "fastest to answer · the one for a phone call"
+    assert "The words of every call go to Claude through Claude Code" in ui.questions("Which model?")[0].detail
+    assert actions.changes() == ["save_brain_subscription", "add_sip_line", "save_voice", "save_callers"]
+    assert actions.args("save_brain_subscription") == [("claude", "haiku")]
+    assert actions.args("test_subscription") == [("claude",)] * 2  # the brain step, then the Check page
+    assert Check("Brain", "Claude (Haiku) · logged in", True) in ui.questions("Everything works")[0].checks
+    assert "Brain    your Claude subscription · Haiku" in outcome.summary
+    assert "nothing leaves this Mac" not in outcome.summary
+
+
+def test_a_chatgpt_plan_is_asked_which_models_it_allows():
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My ChatGPT subscription"),
+        ("Which model?", "<default>"),
+        ("A few things need attention", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions(exists=True)
+    outcome = drive(ui, actions)
+    assert actions.args("brain_models") == [("chatgpt",)]
+    assert "Asking which models your ChatGPT plan allows…" in ui.labels
+    model = ui.menu("Which model?")
+    assert [o.label for o in model[1]] == ["gpt-5.6-luna", "gpt-6-astra"] and model[2] == 0  # fastest measured first
+    assert actions.args("save_brain_subscription") == [("chatgpt", "gpt-5.6-luna")]
+    assert Check("Brain", "ChatGPT (gpt-5.6-luna) · logged in", True) in ui.questions("A few things need attention")[0].checks
+    assert "Brain    your ChatGPT subscription · gpt-5.6-luna" in outcome.summary
+
+
+def test_the_brain_the_config_already_names_is_the_default_everywhere():
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "<default>"),
+        ("Which model?", "<default>"),
+        ("A few things need attention", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions(exists=True)
+    actions.cur.brain_kind, actions.cur.model = "chatgpt", "gpt-6-astra"
+    drive(ui, actions)
+    assert ui.menus[1][2] == 2  # My ChatGPT subscription
+    assert ui.menu("Which model?")[2] == 1  # the model it is already using
+    assert actions.args("save_brain_subscription") == [("chatgpt", "gpt-6-astra")]
+
+
+def test_a_cli_that_is_not_installed_says_how_to_install_it():
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My ChatGPT subscription"),
+        ("Codex is not installed", "Check again"),
+        ("Which model?", "<default>"),
+        ("A few things need attention", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions(exists=True, cli_installed=Seq(False, True))
+    drive(ui, actions)
+    page = ui.questions("Codex is not installed")[0]
+    assert page.body == "npm install -g @openai/codex\ncodex login"
+    assert page.detail == "ai-phone reaches your ChatGPT plan through it. Install it, log in, then check again."
+    assert actions.args("test_subscription") == [("chatgpt",)] * 2 and not page.error
+
+
+def test_a_cli_that_is_not_logged_in_shows_what_to_run():
+    told = "claude is installed but not logged in. Log in with: claude, then type /login"
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My Claude subscription"),
+        ("cannot use your Claude plan yet", "Check again"),
+        ("Which model?", "<default>"),
+        ("A few things need attention", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions(exists=True, test_subscription=Seq(ActionError(told), None, None))
+    drive(ui, actions)
+    page = ui.questions("cannot use your Claude plan yet")[0]
+    assert page.error == told and page.body == "npm install -g @anthropic-ai/claude-code\nclaude, then type /login"
+    assert actions.args("save_brain_subscription") == [("claude", "haiku")]
+
+
+def test_back_from_the_login_page_goes_back_to_the_brain_menu():
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My Claude subscription"),
+        ("Claude Code is not installed", "<back>"),
+        ("Where should your agent think?", "On this Mac"),
+        ("Which model?", "<default>"),
+        ("A few things need attention", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions(exists=True, cli_installed=False)
+    drive(ui, actions)
+    assert actions.changes() == ["save_brain_local"]
+    assert len(ui.questions("Where should your agent think?")) == 2
+
+
+def test_a_subscription_brain_that_cannot_be_saved_is_asked_again():
+    broken = "config.lines.agent.aor: expected sip:user@host[:port]"
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My Claude subscription"),
+        ("Which model?", "<default>"),
+        ("Which model?", "Sonnet"),
+        ("A few things need attention", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, save_brain_subscription=Seq(ActionError(broken), None), check_config=broken)
+    assert drive(ui, actions).code == 1
+    assert ui.questions("Which model?")[1].error == broken and ui.menu("Which model?")[2] == 0
+    assert actions.args("save_brain_subscription") == [("claude", "haiku"), ("claude", "sonnet")]
+
+
+def test_a_login_that_stops_working_is_a_failed_check_row():
+    ui = ScriptedUI([
+        ("Give your AI", "Change what callers hear"),
+        ("What should callers hear?", ["", "", ""]),
+        ("A few things need attention", "Continue"),
+        FINISH,
+    ])
+    told = "claude is installed but not logged in. Log in with: claude, then type /login"
+    actions = FakeActions(exists=True, test_subscription=ActionError(told))
+    actions.cur.brain_kind, actions.cur.model = "claude", "sonnet"
+    outcome = drive(ui, actions)
+    assert Check("Brain", told, False) in ui.questions("A few things need attention")[0].checks
+    assert "Brain    your Claude subscription · Sonnet" in outcome.summary
+
+
+def test_a_subscription_brain_needs_no_model_download():
+    """models.missing() already leaves the brain's weights out when the brain is not on this Mac; the Check page then
+    has nothing to download and says so once the speech models are there."""
+    ui = ScriptedUI([
+        ("Give your AI", "Change the brain"),
+        ("Where should your agent think?", "My Claude subscription"),
+        ("Which model?", "Opus"),
+        ("A few things need attention", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions(exists=True)
+    drive(ui, actions)
+    rows = ui.questions("A few things need attention")[0].checks
+    assert rows[0] == Check("Models", "downloaded", True) and not actions.args("pull_models")
+    assert Check("Brain", "Claude (Opus) · logged in", True) in rows

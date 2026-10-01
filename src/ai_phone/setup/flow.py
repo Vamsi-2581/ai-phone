@@ -16,10 +16,25 @@ import ai_phone
 from ai_phone import models, paths, voices
 from ai_phone.config import E164_RE, HOST_RE, LINE_ID_RE, SIP_USER_RE
 from ai_phone.pipeline.prompts import DISCLOSURE
-from ai_phone.setup.actions import CARRIER_KEYS, LOOPBACK, ActionError, LineResult
+from ai_phone.services.backends.cli_brain import CLAUDE_MODELS
+from ai_phone.setup.actions import CARRIER_KEYS, INSTALL, LOGIN, LOOPBACK, ActionError, LineResult
 from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
 
 WELCOME, BRAIN, LINE, VOICE, CALLERS, CHECK, DONE = range(7)
+BRAIN_KINDS = ("local", "claude", "chatgpt", "openai_compatible")  # in the order the Brain menu offers them
+
+
+@dataclass(frozen=True)
+class Plan:
+    """A subscription brain in the words the pages use."""
+    name: str          # the plan: "Claude", "ChatGPT"
+    cli: str           # the CLI it is reached through: "Claude Code", "Codex"
+    label: str         # the Brain menu's option
+    hint: str
+
+
+PLANS = {"claude": Plan("Claude", "Claude Code", "My Claude subscription", "uses the Claude Code login · no API key"),
+         "chatgpt": Plan("ChatGPT", "Codex", "My ChatGPT subscription", "uses the Codex login · no API key")}
 SAMPLE = "Hi, this is your agent. This is how I sound on the phone."
 CARRIERS = (("twilio", "Twilio"), ("telnyx", "Telnyx"))
 VOICE_GROUPS = (("af", "American · female"), ("am", "American · male"), ("bf", "British · female"), ("bm", "British · male"))
@@ -210,6 +225,16 @@ def home_dir() -> str:
     return tilde(paths.home())
 
 
+def model_name(kind: str, model: str) -> str:
+    """What to call a subscription brain's model on a page: Claude's aliases have names, a ChatGPT model is its id."""
+    return next((m.name for m in CLAUDE_MODELS if m.id == model), model) if kind == "claude" else model
+
+
+def install_lines(kind: str) -> str:
+    """The two lines that put the CLI there and log it in, shown as a block the person can copy."""
+    return f"{INSTALL[kind]}\n{LOGIN[kind]}"
+
+
 def tier_name(tier: str) -> str:
     """What to call the local brain: its catalog name, or the repo id when the config names one by hand."""
     entry = models.CATALOG.get(tier)
@@ -242,7 +267,7 @@ def welcome(ui, actions) -> list[int]:
         return [BRAIN, LINE, VOICE, CALLERS, CHECK, DONE]
     plans = [[LINE], [BRAIN], [VOICE], [CALLERS], [BRAIN, LINE, VOICE, CALLERS]]
     i = ui.choose(page, [Option("Add a line", "a phone number, a SIP address or your own trunk"),
-                         Option("Change the brain", "on this Mac, or your own endpoint"),
+                         Option("Change the brain", "on this Mac, a plan you pay for, or your own endpoint"),
                          Option("Change the voice", "voice and speed"),
                          Option("Change what callers hear", "greeting, instructions, daily limit"),
                          Option("Run all steps"),
@@ -256,12 +281,18 @@ def welcome(ui, actions) -> list[int]:
 
 def brain(ui, actions, session: Session) -> None:
     cur = actions.current()
+    kinds = list(BRAIN_KINDS)
     where = ui.choose(Page(BRAIN, "Where should your agent think?",
                            "The model that writes what your agent says. Speech and voice always run on this Mac."),
                       [Option("On this Mac", "private · nothing leaves this Mac"),
+                       Option(PLANS["claude"].label, PLANS["claude"].hint),
+                       Option(PLANS["chatgpt"].label, PLANS["chatgpt"].hint),
                        Option("My own endpoint", "any OpenAI-compatible URL: LM Studio, llama.cpp, a hosted API")],
-                      default=0 if cur.brain_kind == "local" else 1)
-    if where == 1:
+                      default=kinds.index(cur.brain_kind) if cur.brain_kind in kinds else 0)
+    kind = kinds[where]
+    if kind in PLANS:
+        return brain_subscription(ui, actions, session, cur, kind)
+    if kind == "openai_compatible":
         return brain_endpoint(ui, actions, session, cur)
     mem = actions.machine().memory_gb
     catalog = list(models.CATALOG.values())
@@ -288,6 +319,48 @@ def brain(ui, actions, session: Session) -> None:
             return
         except ActionError as e:
             error = str(e)
+
+
+def brain_subscription(ui, actions, session: Session, cur, kind: str) -> None:
+    """A plan the person already pays for: ai-phone drives the CLI they are logged into, so there is no key to type.
+    What has to be true is that the CLI is installed and logged in, and the pages say how when it is not."""
+    plan = PLANS[kind]
+    while True:
+        if not actions.cli_installed(kind):
+            try_again(ui, Page(BRAIN, f"{plan.cli} is not installed",
+                               f"ai-phone reaches your {plan.name} plan through it. Install it, log in, then check again.",
+                               body=install_lines(kind)))
+            continue
+        waiting = Page(BRAIN, f"Your {plan.name} subscription")
+        try:
+            probe = busy(ui, session, waiting, f"Checking your {plan.name} login…", lambda: actions.test_subscription(kind))
+            # Claude Code's models are three names it always takes; a ChatGPT plan is asked which ones it allows
+            choices = (busy(ui, session, waiting, f"Asking which models your {plan.name} plan allows…",
+                            lambda: actions.brain_models(kind)) if kind == "chatgpt" else actions.brain_models(kind))
+        except ActionError as e:
+            try_again(ui, Page(BRAIN, f"ai-phone cannot use your {plan.name} plan yet",
+                               f"It talks to {plan.name} through {plan.cli}, with the login you already have.",
+                               body=install_lines(kind), error=str(e)))
+            continue
+        break
+    detail = (f"Logged in. The words of every call go to {plan.name} through {plan.cli}; a faster model starts "
+              "talking sooner.")
+    default = next((i for i, m in enumerate(choices) if m.id == cur.model), 0) if cur.brain_kind == kind else 0
+    error = ""
+    while True:
+        i = ui.choose(Page(BRAIN, "Which model?", detail, error=error),
+                      [Option(m.name, m.note) for m in choices], default=default)
+        try:
+            actions.save_brain_subscription(kind, choices[i].id)
+            session.note("the brain")
+            return
+        except ActionError as e:
+            error, default = str(e), i
+
+
+def try_again(ui, page: Page) -> None:
+    """A page with nothing to do but check again. Back (the front-end's own option) starts the step over."""
+    ui.choose(page, [Option("Check again")])
 
 
 def brain_endpoint(ui, actions, session: Session, cur) -> None:
@@ -668,6 +741,8 @@ def check(ui, actions, session: Session) -> None:
         error = actions.check_config()
         rows.append(Check("Config", "loads", True) if error is None else Check("Config", error, False))
         cur = actions.current()
+        if cur.brain_kind in PLANS:
+            rows.append(check_brain(ui, actions, session, checking(rows), cur))
         if error is None:
             rows.extend(check_lines(ui, actions, session, checking(rows), cur))
         if actions.voices():  # the speech model is here
@@ -686,6 +761,17 @@ def check(ui, actions, session: Session) -> None:
 def checking(rows: list[Check]) -> Page:
     """The page shown while a check runs: the rows found so far."""
     return Page(CHECK, "Checking that it all works", checks=list(rows))
+
+
+def check_brain(ui, actions, session: Session, page: Page, cur) -> Check:
+    """The plan answers, with the login the person already has. One tiny turn, and only if this run has not used one."""
+    plan = PLANS[cur.brain_kind]
+    try:
+        probe = busy(ui, session, page, f"Checking your {plan.name} login…",
+                     lambda: actions.test_subscription(cur.brain_kind))
+    except ActionError as e:
+        return Check("Brain", str(e), False)
+    return Check("Brain", f"{plan.name} ({model_name(cur.brain_kind, probe['model'])}) · logged in", True)
 
 
 def check_models(ui, actions, session: Session, page: Page) -> Check:
@@ -742,7 +828,12 @@ def done_text(actions, session: Session) -> str:
         out += [f"{'Lines' if k == 0 else '':9}{i.ljust(a)}   {where.ljust(b)}   {kind}" for k, (i, where, kind) in enumerate(rows)]
     else:
         out.append("Lines    none yet · run setup again to add one")
-    brain_row = f"on this Mac · {tier_name(cur.tier)}" if cur.brain_kind == "local" else f"{cur.base_url} · {cur.model}"
+    if cur.brain_kind == "local":
+        brain_row = f"on this Mac · {tier_name(cur.tier)}"
+    elif cur.brain_kind in PLANS:
+        brain_row = f"your {PLANS[cur.brain_kind].name} subscription · {model_name(cur.brain_kind, cur.model)}"
+    else:
+        brain_row = f"{cur.base_url} · {cur.model}"
     out += [f"Brain    {brain_row}",
             f"Voice    {voices.title(cur.voice)} · {voices.describe(cur.voice)} · {speed_text(cur.speed)}×",
             "", "Start ai-phone", "  uv run ai-phone run", "", "Try it"]

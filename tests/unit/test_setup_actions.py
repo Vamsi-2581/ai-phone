@@ -77,7 +77,7 @@ def test_machine_and_current_for_a_new_config(home):
                                   models_missing=[models.STT, models.TTS, models.LLM["t4"]])
     inbound = InboundConfig()
     assert a.current() == Current(exists=False, lines={}, brain_kind="local", tier="t4", base_url="http://127.0.0.1:1234/v1",
-                                  model="local", brain_key_saved=False, voice="af_heart", speed=1.0,
+                                  model="local", brain_key_saved=False, brain_cli=None, voice="af_heart", speed=1.0,
                                   greeting=inbound.greeting, instructions=inbound.instructions, daily_limit=20)
     for so in act.VENDOR.iterdir():
         so.unlink()
@@ -96,7 +96,7 @@ def test_current_reads_the_config(home):
     assert cur == Current(exists=True, lines={"agent": {"kind": "sip", "user": "agent", "aor": "sip:agent@192.0.2.10",
                                                         "accept_invites_from": "lan"}},
                           brain_kind="openai_compatible", tier="t9", base_url="https://api.example.com/v1", model="qwen",
-                          brain_key_saved=True, voice="bm_george", speed=0.9, greeting="Hello there.",
+                          brain_key_saved=True, brain_cli=None, voice="bm_george", speed=0.9, greeting="Hello there.",
                           instructions="Take a message.", daily_limit=5)
     assert a.machine().models_missing == [models.STT, models.TTS]  # an endpoint brain needs no local language model
     assert a.machine().config_exists
@@ -894,3 +894,116 @@ def test_kokoro_player_needs_the_model_and_the_voice(tmp_path, monkeypatch):
     monkeypatch.setattr(voices, "voices_dir", lambda: None)
     with pytest.raises(ActionError, match="^could not play the sample: the voice bf_emma is not installed$"):
         player.play("bf_emma", 1.0, "Hi.")
+
+
+# ---- a Claude or ChatGPT plan as the brain -------------------------------------------------------
+
+@pytest.fixture
+def fake_cli(tmp_path, monkeypatch):
+    """The fake CLI the backend tests use, with a script of its own: setup never runs the real claude or codex."""
+    from tests.unit.test_cli_brain import FAKE_CLI
+
+    exe = tmp_path / "fake-cli"
+    exe.write_text(FAKE_CLI)
+    exe.chmod(0o755)
+
+    def script(protocol, turns=None, **extra):
+        spec = tmp_path / "script.json"
+        spec.write_text(json.dumps({"protocol": protocol, "log": str(tmp_path / "cli.jsonl"),
+                                    "turns": turns or [{}], **extra}))
+        monkeypatch.setenv("AI_PHONE_FAKE_CLI", str(spec))
+        return str(exe)
+
+    script.log = lambda: [json.loads(l) for l in (tmp_path / "cli.jsonl").read_text().splitlines()]
+    return script
+
+
+def test_a_logged_in_cli_is_proved_with_one_turn_and_remembered(home, fake_cli):
+    exe = fake_cli("claude", [{"deltas": ["OK"]}], version="2.1.286 (Claude Code)")
+    a = make(home, f"brain: {{kind: claude, model: sonnet, cli: {exe}}}\n")
+    assert a.cli_installed("claude") is True
+    probe = a.test_subscription("claude")
+    assert probe == {"model": "sonnet", "cli_version": "2.1.286 (Claude Code)", "warm_ms": probe["warm_ms"]}
+    assert probe["warm_ms"] > 0
+    assert a.test_subscription("claude") == probe              # the Check page asks again
+    assert [r["event"] for r in fake_cli.log()].count("turn") == 1  # one turn of the plan for the whole run
+    assert [r["text"] for r in fake_cli.log() if r["event"] == "turn"] == ["Say OK."]
+
+
+def test_the_probe_uses_the_plans_own_model_when_the_config_names_another_brain(home, fake_cli):
+    exe = fake_cli("claude", [{"deltas": ["OK"]}])
+    a = make(home, f"brain: {{kind: local, cli: {exe}}}\n")
+    assert a.test_subscription("claude")["model"] == "haiku"   # the fastest, for a probe and for a call
+
+
+def test_a_cli_that_is_not_installed_says_how_to_install_it(home, fake_cli):
+    fake_cli("claude")
+    a = make(home, f"brain: {{kind: chatgpt, cli: {home / 'nowhere' / 'codex'}}}\n")
+    assert a.cli_installed("chatgpt") is False
+    with pytest.raises(ActionError, match="codex is not installed. Install it with: npm install -g @openai/codex"):
+        a.test_subscription("chatgpt")
+
+
+def test_a_cli_that_is_not_logged_in_says_how_to_log_in(home, fake_cli):
+    exe = fake_cli("claude", [{"deltas": [], "fail": "Not logged in"}])
+    a = make(home, f"brain: {{kind: claude, cli: {exe}}}\n")
+    with pytest.raises(ActionError, match=r"claude is installed but not logged in. Log in with: claude, then type /login"):
+        a.test_subscription("claude")
+    exe = fake_cli("codex", [{"deltas": [], "fail": "401 Unauthorized"}])
+    a = make(home, f"brain: {{kind: chatgpt, cli: {exe}}}\n")
+    with pytest.raises(ActionError, match="codex is installed but not logged in. Log in with: codex login"):
+        a.test_subscription("chatgpt")
+
+
+def test_a_failed_login_is_never_remembered(home, fake_cli):
+    """"Check again" has to mean it: a plan that has just been logged into must be allowed to answer."""
+    exe = fake_cli("claude", [{"deltas": [], "fail": "Not logged in"}, {"deltas": ["OK"]}])
+    a = make(home, f"brain: {{kind: claude, cli: {exe}}}\n")
+    with pytest.raises(ActionError):
+        a.test_subscription("claude")
+    assert a.test_subscription("claude")["model"] == "haiku"
+
+
+def test_claude_offers_its_three_models_without_asking_anything(home, fake_cli):
+    exe = fake_cli("claude")
+    a = make(home, f"brain: {{kind: claude, cli: {exe}}}\n")
+    found = a.brain_models("claude")
+    assert [m.id for m in found] == ["haiku", "sonnet", "opus"]
+    assert [m.name for m in found] == ["Haiku", "Sonnet", "Opus"] and all(m.note for m in found)
+    assert not (home / "cli.jsonl").exists(), "the CLI was started to list three names it always takes"
+
+
+def test_chatgpt_models_are_the_plans_own_with_the_fastest_first(home, fake_cli):
+    models_ = [{"id": "gpt-6-astra", "displayName": "GPT-6-Astra", "description": "the default", "isDefault": True},
+               {"id": "gpt-5.6-luna", "displayName": "GPT-5.6-Luna", "description": "fast"},
+               {"id": "secret", "displayName": "Hidden", "description": "", "hidden": True}]
+    exe = fake_cli("codex", models=models_)
+    a = make(home, f"brain: {{kind: chatgpt, cli: {exe}}}\n")
+    found = a.brain_models("chatgpt")
+    assert [m.id for m in found] == ["gpt-5.6-luna", "gpt-6-astra"]   # the measured default first; the hidden one is out
+    assert found[0].name == "GPT-5.6-Luna" and found[1].note == "the default"
+    assert [r["event"] for r in fake_cli.log()].count("turn") == 0    # asking costs no turn of the plan
+
+
+def test_a_plan_that_lists_no_models_is_said_so(home, fake_cli):
+    exe = fake_cli("codex", models=[])
+    a = make(home, f"brain: {{kind: chatgpt, cli: {exe}}}\n")
+    with pytest.raises(ActionError, match="Codex listed no models for this account"):
+        a.brain_models("chatgpt")
+
+
+def test_save_brain_subscription_writes_the_kind_and_the_model(home):
+    a = make(home, "brain: {kind: openai_compatible, base_url: 'https://api.example.com/v1', model: qwen, "
+                   "api_key_env: BRAIN_TOKEN_KEY, cli: /opt/homebrew/bin/claude}\n")
+    a.save_brain_subscription("claude", "sonnet")
+    assert raw(home)["brain"] == {"kind": "claude", "model": "sonnet", "cli": "/opt/homebrew/bin/claude"}
+    assert load_config(home / "config.yaml").brain.kind == "claude"
+    cur = a.current()
+    assert cur.brain_kind == "claude" and cur.model == "sonnet" and cur.brain_cli == "/opt/homebrew/bin/claude"
+    a.save_brain_subscription("chatgpt", "gpt-5.6-luna")
+    assert raw(home)["brain"]["kind"] == "chatgpt" and raw(home)["brain"]["model"] == "gpt-5.6-luna"
+
+
+def test_a_subscription_brain_needs_no_model_of_its_own(home):
+    a = make(home, "brain: {kind: chatgpt, model: gpt-5.6-luna}\n")
+    assert a.machine().models_missing == [models.STT, models.TTS]  # speech and voice only: the brain is not here

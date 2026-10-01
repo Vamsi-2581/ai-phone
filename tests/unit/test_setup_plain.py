@@ -329,3 +329,42 @@ def test_ctrl_c_during_a_download_in_plain_mode_exits_at_once(typed, capsys, mon
     assert exits == [1]
     assert capsys.readouterr().out.endswith("Downloading…\n\nSetup cancelled. The download stops now and picks up where it "
                                             "left off next time. Saved in this run: what callers hear.\n")
+
+
+def test_a_subscription_brain_in_plain_mode(typed, capsys, monkeypatch, tmp_path):
+    """The numbered prompts inherit the whole branch: the menu, the login check and the model."""
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    actions = FakeActions()
+    monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
+    typed.answers += [
+        "",    # Welcome: Continue
+        "2",   # Brain: My Claude subscription
+        "",    # model: Haiku
+        "2", "", "",          # a SIP address, with its defaults
+        "", "", "", "",       # voice group, voice, use it, speed
+        "", "", "",           # greeting, instructions, daily limit
+        "",    # Check: Continue
+        "",    # Done: Finish
+    ]
+    assert run_setup(plain=True) == 0
+    assert actions.changes() == ["save_brain_subscription", "add_sip_line", "save_voice", "save_callers"]
+    assert actions.args("save_brain_subscription") == [("claude", "haiku")]
+    out = capsys.readouterr().out
+    assert "2) My Claude subscription" in out and "uses the Claude Code login · no API key" in out
+    assert "Checking your Claude login…" in out
+    assert "1) Haiku" in out and "fastest to answer · the one for a phone call" in out
+    assert "✓ Brain" in out and "Claude (Haiku) · logged in" in out
+    assert "Brain    your Claude subscription · Haiku" in out
+    assert not typed.answers
+
+
+def test_a_cli_to_install_in_plain_mode(typed, capsys, monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    actions = FakeActions(cli_installed=False)
+    monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
+    typed.answers += ["", "3", "b", "q"]  # Continue, My ChatGPT subscription, Back from the install page, quit
+    assert run_setup(plain=True) == 1
+    out = capsys.readouterr().out
+    assert "Codex is not installed" in out and "npm install -g @openai/codex" in out and "codex login" in out
+    assert "  1) Check again" in out and "  b) Back" in out
+    assert actions.changes() == [] and not typed.answers

@@ -10,6 +10,7 @@ import contextlib
 import copy
 import functools
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -30,12 +31,14 @@ import yaml
 import ai_phone
 from ai_phone import models, paths, voices
 from ai_phone.cli_lines import journal_setups, manual_line, next_line_id, provision_flow, write_line
-from ai_phone.config import Config, ConfigError, line_password_env, load_config
+from ai_phone.config import SUBSCRIPTION_MODELS, Config, ConfigError, line_password_env, load_config
 from ai_phone.control.client import probe
 from ai_phone.lines.config_writer import read_raw, write_raw
 from ai_phone.lines.forward import divert_codes
 from ai_phone.lines.journal import Journal, line_lock
 from ai_phone.secrets import SecretsError, load_secrets, redact, remove_secret, write_secret
+from ai_phone.services.backends.cli_brain import CLAUDE_MODELS, ClaudeCodeLLM, CliModel, CodexLLM, codex_models
+from ai_phone.services.errors import BrainError
 from ai_phone.telephony.state import StateError, StateFile
 
 CARRIER_KEYS = {"twilio": ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"), "telnyx": ("TELNYX_API_KEY",), "fake": ("FAKE_API_KEY",)}
@@ -46,6 +49,10 @@ CHECK_SEC, POLL_SEC, STOP_SEC = 20, 0.5, 10  # how long a trial start may take t
 EXIT_STOP_SEC = 2  # how long a trial start may take to stop when setup itself is exiting
 SAMPLE_RATE = 24000  # Kokoro's own rate
 LOOPBACK = ("127.0.0.1", "localhost", "::1")  # the config's rule: plain http only to this machine
+BRAINS = {"claude": ClaudeCodeLLM, "chatgpt": CodexLLM}  # the subscription brains, by the config's kind
+INSTALL = {"claude": "npm install -g @anthropic-ai/claude-code", "chatgpt": "npm install -g @openai/codex"}
+LOGIN = {"claude": "claude, then type /login", "chatgpt": "codex login"}
+PROBE_MS = 30000  # how long the login probe may take: a CLI that has to start, then the provider's own first word
 
 
 @dataclass
@@ -61,11 +68,12 @@ class Current:
     """What the config says now (defaults for a new config)."""
     exists: bool
     lines: dict[str, dict]      # raw line entries by id
-    brain_kind: str             # "local" | "openai_compatible"
+    brain_kind: str             # "local" | "openai_compatible" | "claude" | "chatgpt"
     tier: str                   # resolved: a key from models.CATALOG, or a Hub repo id named by hand
     base_url: str
     model: str
     brain_key_saved: bool       # the brain's api_key_env has a value in secrets.env
+    brain_cli: str | None       # brain.cli: where a subscription brain's CLI is, when the config says
     voice: str
     speed: float
     greeting: str
@@ -106,6 +114,7 @@ class Actions:
         self.player = player or KokoroPlayer()
         self.provider_loader = provider_loader
         self.http = http  # tests pass a client with a mock transport
+        self._probed: dict[tuple[str, str], dict] = {}  # a login already proved in this run, by (kind, model)
 
     # ---- what is there ---------------------------------------------------------------------------
 
@@ -130,6 +139,7 @@ class Actions:
         key_env = cfg.brain.api_key_env
         return Current(exists=exists, lines=lines, brain_kind=cfg.brain.kind, tier=models.resolve_tier(cfg.models.tier),
                        base_url=cfg.brain.base_url, model=cfg.brain.model, brain_key_saved=bool(key_env and _saved().get(key_env)),
+                       brain_cli=cfg.brain.cli,
                        voice=cfg.tts.voice, speed=cfg.tts.speed, greeting=cfg.inbound.greeting,
                        instructions=cfg.inbound.instructions, daily_limit=limit)
 
@@ -207,6 +217,74 @@ class Actions:
             return r.json()["choices"][0]["message"].get("content") or ""
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             raise ActionError(f"{host} answered, but not like an OpenAI chat API (is the URL right? it usually ends in /v1)") from None
+
+    # ---- a Claude or ChatGPT plan as the brain ----------------------------------------------------
+
+    def cli_installed(self, kind: str) -> bool:
+        """Is the CLI this plan is reached through on PATH (or where the config says it is)?"""
+        return shutil.which(self.current().brain_cli or BRAINS[kind].cli_name) is not None
+
+    def _brain(self, kind: str, model: str):
+        return BRAINS[kind](model=model, cli=self.current().brain_cli, first_token_timeout_ms=PROBE_MS,
+                            stream_idle_timeout_ms=PROBE_MS)
+
+    def _brain_model(self, kind: str) -> str:
+        """Which model to probe with: the one the config already names for this plan, or the plan's own default."""
+        cur = self.current()
+        return cur.model if cur.brain_kind == kind else SUBSCRIPTION_MODELS[kind]
+
+    def _brain_trouble(self, kind: str, e: BrainError) -> ActionError:
+        """What the person can do about it, in their own words. Never the CLI's own output."""
+        cli = BRAINS[kind].cli_name
+        if e.kind == "cli_missing":
+            return ActionError(f"{cli} is not installed. Install it with: {INSTALL[kind]}")
+        if e.kind == "not_logged_in":
+            return ActionError(f"{cli} is installed but not logged in. Log in with: {LOGIN[kind]}")
+        if e.kind in ("first_token_timeout", "idle_timeout"):
+            return ActionError(f"{cli} did not answer within {PROBE_MS // 1000} seconds. Try again, or pick another brain.")
+        if e.kind == "model_not_allowed":
+            return ActionError(f"Your plan does not allow {self._brain_model(kind)}. Choose another model.")
+        return ActionError(f"{cli} could not answer: {e}")
+
+    def test_subscription(self, kind: str) -> dict:
+        """One tiny turn through the person's own CLI: it proves the CLI runs and that they are logged in.
+
+        A proved login is remembered for the rest of the run, so a setup run spends one turn of their plan and not
+        one per page. A failure is never remembered: the point of "Check again" is to try once more.
+        """
+        model = self._brain_model(kind)
+        if (kind, model) in self._probed:
+            return self._probed[(kind, model)]
+        brain = self._brain(kind, model)
+        try:
+            timings = brain.warmup()
+        except BrainError as e:
+            raise self._brain_trouble(kind, e) from None
+        finally:
+            brain.close()
+        self._probed[(kind, model)] = {"model": model, "cli_version": timings.get("cli_version", ""),
+                                       "warm_ms": timings.get("warm_ms", 0.0)}
+        return self._probed[(kind, model)]
+
+    def brain_models(self, kind: str) -> list[CliModel]:
+        """What setup offers as the model: Claude Code's aliases, or the models this ChatGPT plan lists (no turn is
+        spent on the asking), fastest-measured first."""
+        if kind == "claude":
+            return list(CLAUDE_MODELS)
+        try:
+            found = codex_models(cli=self.current().brain_cli)
+        except BrainError as e:
+            raise self._brain_trouble(kind, e) from None
+        if not found:
+            raise ActionError("Codex listed no models for this account. Check your plan, then try again.")
+        fastest = SUBSCRIPTION_MODELS[kind]
+        return sorted(found, key=lambda m: m.id != fastest)
+
+    def save_brain_subscription(self, kind: str, model: str) -> None:
+        def change(raw: dict) -> None:
+            where = {k: v for k, v in _section(raw, "brain").items() if k == "cli"}  # a hand-set path to the CLI stays
+            raw["brain"] = {"kind": kind, "model": model, **where}
+        self._edit(change)
 
     def save_brain_endpoint(self, url: str, model: str, key: str | None) -> None:
         env = BRAIN_KEY_ENV if key else self._brain_key_env(url)
