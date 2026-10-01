@@ -181,7 +181,13 @@ else:
             note(event="turn", text=(prm.get("input") or [{}])[0].get("text"), effort=prm.get("effort"))
             d, n = directive(), n + 1
             turn_id = f"t{n}"
-            out({"jsonrpc": "2.0", "id": mid, "result": {"turn": {"id": turn_id, "items": [], "status": "inProgress"}}})
+            reply = {"jsonrpc": "2.0", "id": mid, "result": {"turn": {"id": turn_id, "items": [], "status": "inProgress"}}}
+            if not d.get("reply_last"):
+                out(reply)          # normally the reply comes first; `reply_last` puts it after the turn's own events
+            if d.get("widened"):
+                out({"jsonrpc": "2.0", "method": "thread/settings/updated",
+                     "params": {"threadId": "th1", "threadSettings": {"sandboxPolicy": d["widened"],
+                                                                      "approvalPolicy": d.get("widened_approval", "never")}}})
             cut = []
 
             def interrupted():
@@ -248,12 +254,17 @@ else:
                 status = "interrupted" if cut else "completed"
                 out({"jsonrpc": "2.0", "method": "turn/completed",
                      "params": {"threadId": "th1", "turn": {"id": turn_id, "items": [], "status": status}}})
+                if d.get("reply_last"):
+                    out(reply)
                 if d.get("extra_completion"):
                     # a turn whose completion arrives twice, so the second one is on the wire when the next turn starts
                     out({"jsonrpc": "2.0", "method": "turn/completed",
                          "params": {"threadId": "th1", "turn": {"id": turn_id, "items": [], "status": status}}})
 '''
 
+# A long value of exactly the shape a charset filter preserves, and the reason `detail` is shown from an allowlist
+# instead: every character of this survives stripping everything but [A-Za-z0-9_.-]. Not a credential of any kind.
+TOKEN_SHAPED = "aaaa-bbbb01-CcDdEe_123.xyz"
 PROMPT = "You are a phone assistant."
 OTHER = "You are a phone assistant. This call: take a message."
 MODELS = [{"id": "gpt-5.6-luna", "displayName": "GPT-5.6-Luna", "description": "fast", "hidden": False, "isDefault": False},
@@ -1244,7 +1255,7 @@ def test_a_login_that_is_billed_per_request_is_refused_and_named(cli, how):
     assert cli.events("turn") == []
 
 
-@pytest.mark.parametrize("how", ["third_party", "oauth_token", "something_a_later_version_added"])
+@pytest.mark.parametrize("how", ["third_party", "oauth_token"])
 def test_a_login_ai_phone_does_not_know_is_refused_and_named(cli, how):
     """An allowlist, not a denylist. `claude auth status --json` reports one of none, third_party, claude.ai,
     api_key_helper, oauth_token or api_key, and only claude.ai is the subscription this feature promises; a value a
@@ -1258,6 +1269,21 @@ def test_a_login_ai_phone_does_not_know_is_refused_and_named(cli, how):
     finally:
         brain.close()
     assert cli.events("turn") == [], "no turn is spent finding out"
+
+
+def test_a_login_method_outside_the_six_is_refused_without_repeating_it(cli):
+    """The detail reaches a wizard page, so it is shown from the enumeration this module holds, not by filtering the
+    characters of whatever arrived: `[A-Za-z0-9_.-]` leaves a token like a key entirely intact."""
+    cli.script("claude", [{"deltas": ["Hi."]}],
+               login={"loggedIn": True, "authMethod": TOKEN_SHAPED})
+    brain = claude_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            brain.warmup(PROMPT)
+        assert (e.value.kind, e.value.detail) == ("login_unknown", "unrecognised")
+        assert TOKEN_SHAPED not in str(e.value)
+    finally:
+        brain.close()
 
 
 @pytest.mark.parametrize("how", ["none", "", None])
@@ -1307,11 +1333,102 @@ def test_a_tool_flag_codex_no_longer_has_is_named_at_warmup(cli, monkeypatch):
 def test_a_codex_that_will_not_start_because_of_a_flag_says_which_one(cli):
     """The other half: a CLI already running the renamed flag exits before it says anything on stdout. The one line it
     does write is the whole diagnosis, so it becomes the kind rather than staying in the debug log."""
-    cli.script("codex", [{"deltas": ["OK"]}], die_with="Error: Unknown feature flag: a_flag_codex_dropped")
+    # the real shape: Codex drops a flag ai-phone names, so the name in its message is one of ai-phone's own
+    cli.script("codex", [{"deltas": ["OK"]}], die_with="Error: Unknown feature flag: shell_tool")
     brain = codex_brain(cli)
     try:
         with pytest.raises(BrainError) as e:
             list(brain.stream(1, talk("Hi"), 120))
-        assert (e.value.kind, e.value.detail) == ("tools_renamed", "a_flag_codex_dropped")
+        assert (e.value.kind, e.value.detail) == ("tools_renamed", "shell_tool")
     finally:
         brain.close()
+    # and a name that is not one of ours is not repeated onto a page either
+    cli.log_path.unlink()
+    cli.script("codex", [{"deltas": ["OK"]}], die_with=f"Error: Unknown feature flag: {TOKEN_SHAPED}")
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Hi"), 120))
+        assert (e.value.kind, e.value.detail) == ("tools_renamed", "unrecognised")
+    finally:
+        brain.close()
+
+
+def test_a_completion_that_arrives_before_its_own_reply_still_ends_the_turn(cli):
+    """Why `_ours` is permissive while the turn's id is unknown, and why that default is kept: a `turn/completed` can
+    reach us before the `turn/start` reply that names the turn, and dropping it would hang the turn to its timeout and
+    leave the caller with silence. This is the case any tightening of that line has to keep passing."""
+    cli.script("codex", [{"deltas": ["Hello."], "reply_last": True}])
+    brain = codex_brain(cli)
+    try:
+        assert "".join(brain.stream(1, talk("Hi"), 120)) == "Hello."
+    finally:
+        brain.close()
+    assert len(cli.events("thread")) == 1
+
+
+def test_a_turn_abandoned_before_its_reply_cannot_silence_the_next_one(cli):
+    """The hole the permissive default leaves, closed from the other side. A turn whose id was never read records
+    nothing, so its late completion used to pass as the live turn's. The request id is known at send time, so its reply
+    -- which the ordered stream still puts before its own notifications -- is what names it afterwards."""
+    brain = codex_brain(cli)
+    brain._thread, brain._turn_req, brain._turn_id = "th1", 7, None
+    brain._request = lambda method, params: 8   # the real _send, with only the write to a process stubbed out
+    brain._send("what did it say?")
+    assert brain._orphans == {7} and brain._turn_id is None, "the request id is what it had to go on"
+    # the abandoned turn's reply finally arrives and names it
+    assert brain._event({"id": 7, "result": {"turn": {"id": "t1"}}}) == ("note", None)
+    assert "t1" in brain._past
+    # so its completion is no longer read as the live turn's
+    assert brain._event({"method": "turn/completed",
+                         "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed"}}}) == ("note", None)
+    # and the live turn, once its own reply arrives, still ends on its own completion
+    assert brain._event({"id": 8, "result": {"turn": {"id": "t2"}}}) == ("note", None)
+    assert brain._event({"method": "turn/completed",
+                         "params": {"threadId": "th1", "turn": {"id": "t2", "status": "completed"}}}) == ("end", None)
+
+
+@pytest.mark.parametrize("widened,approval", [
+    ({"type": "workspaceWrite"}, "never"),
+    ({"type": "dangerFullAccess"}, "never"),
+    ({"type": "readOnly", "networkAccess": True}, "never"),
+    ({"type": "readOnly", "networkAccess": False}, "on-request"),
+])
+def test_a_sandbox_widened_after_the_thread_started_stops_the_turn(cli, widened, approval):
+    """`_confined()` reads thread/start, which is not the only moment a sandbox is set: `thread/settings/updated` can
+    report one widened under a running session, and that is the same thing as a tool appearing."""
+    cli.script("codex", [{"widened": widened, "widened_approval": approval, "deltas": ["Hello."]}])
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Hi"), 120))
+        assert e.value.kind == "tools_unknown"
+    finally:
+        brain.close()
+
+
+def test_settings_that_change_without_widening_anything_are_nothing(cli):
+    cli.script("codex", [{"widened": {"type": "readOnly", "networkAccess": False}, "deltas": ["Hello."]}])
+    brain = codex_brain(cli)
+    try:
+        assert "".join(brain.stream(1, talk("Hi"), 120)) == "Hello."
+    finally:
+        brain.close()
+
+
+def test_what_a_cli_prints_for_its_version_is_a_version_or_nothing(cli, caplog):
+    """The version rides the worker's `ready` event into the daemon's log at INFO, read from whatever the CLI put on
+    stdout or stderr. That is finding 4's channel, so it is classified like the rest."""
+    sentinel = f"Error: key {TOKEN_SHAPED} rejected"   # short enough that the 60-char debug line keeps all of it
+    cli.script("claude", version=sentinel)
+    brain = claude_brain(cli)
+    with caplog.at_level(logging.INFO, logger="ai-phone"):
+        assert brain.cli_version() == "unknown"
+    assert sentinel not in caplog.text and TOKEN_SHAPED not in caplog.text
+    with caplog.at_level(logging.DEBUG, logger="ai-phone"):
+        brain.cli_version()
+    assert TOKEN_SHAPED in caplog.text, "still there for whoever is debugging, one level down"
+    for real in ("2.1.286 (Claude Code)", "codex-cli 0.157.1"):
+        cli.script("claude", version=real)
+        assert brain.cli_version() == real
+    brain.close()

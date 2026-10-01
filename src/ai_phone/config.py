@@ -136,14 +136,16 @@ class CallsConfig:
 # a ChatGPT plan lists (measured; see README "Any brain").
 SUBSCRIPTION_MODELS = {"claude": "haiku", "chatgpt": "gpt-5.6-luna"}
 SUBSCRIPTION_KINDS = tuple(SUBSCRIPTION_MODELS)
-# every brain a config may name. Anything that reads brain.kind out of a config too broken to load (models pull's
-# recovery) takes the kinds from here, so a new one is never silently read as the default.
-BRAIN_KINDS = ("local", "openai_compatible", *SUBSCRIPTION_KINDS)
+# Every brain a config may name, in one place: the annotation below and `BRAIN_KINDS` are the same object read two ways,
+# so the tuple cannot drift from the type the loader validates against. Anything that reads brain.kind out of a config
+# too broken to load (models pull's recovery) takes the kinds from here, and a fifth one is never read as the default.
+BrainKind = Literal["local", "openai_compatible", "claude", "chatgpt"]
+BRAIN_KINDS = typing.get_args(BrainKind)
 
 
 @dataclass
 class BrainConfig:
-    kind: Literal["local", "openai_compatible", "claude", "chatgpt"] = "local"
+    kind: BrainKind = "local"
     base_url: str = "http://127.0.0.1:1234/v1"   # openai_compatible only; ignored by the other kinds
     model: str = "local"
     api_key_env: str | None = None               # openai_compatible only; a subscription brain needs no key

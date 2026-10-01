@@ -66,6 +66,10 @@ STDERR_CHARS = 400             # how much of one of the CLI's own stderr lines r
 # person is being told ai-phone uses. An allowlist, so a value added in a later version is refused rather than accepted.
 CLAUDE_SUBSCRIPTION_LOGINS = frozenset({"claude.ai"})
 CLAUDE_BILLED_LOGINS = frozenset({"api_key", "api_key_helper"})
+CLAUDE_LOGINS = CLAUDE_SUBSCRIPTION_LOGINS | CLAUDE_BILLED_LOGINS | {"none", "third_party", "oauth_token"}
+# `account/read`'s own enum, from the app-server schema: an account is one of these three and nothing else.
+CODEX_ACCOUNTS = frozenset({"chatgpt", "apiKey", "amazonBedrock"})
+UNNAMED = "unrecognised"   # what a value that is not one of the above is called on a page: never the value itself
 
 # Anything that would move a CLI off the login the person has: a key or token it would bill instead of the plan, and a
 # base URL or token file that would send the call somewhere else. `ANTHROPIC_API_KEY` is the one that matters most --
@@ -188,7 +192,7 @@ def _pump_stderr(stream, name: str, fatal: list) -> None:
             log.debug("%s: %s", name, line[:STDERR_CHARS])
             m = re.search(r"Unknown feature flag:\s*([A-Za-z0-9_.-]{1,60})", line)
             if m:
-                fatal.append(BrainError("tools_renamed", m.group(1)))
+                fatal.append(BrainError("tools_renamed", _one_of(m.group(1), frozenset(CODEX_TOOLS_OFF))))
     except (OSError, ValueError):
         pass
 
@@ -209,6 +213,36 @@ def _classify(cli: str, said: str) -> BrainError:
     if any(w in low for w in ("rate limit", "429", "usage limit", "quota")):
         return BrainError("rate_limited", f"{cli} says the plan's limit is reached")
     return BrainError("failed", f"{cli} ended the turn with an error")
+
+
+def _version(cli: str, said: str) -> str:
+    """A CLI's version, or "unknown" -- and nothing else.
+
+    This string rides the worker's `ready` event into the daemon's log at INFO, which is the one line a person is
+    guaranteed to read, and it is read from whatever the CLI printed on stdout *or stderr*. That is the same channel
+    finding 4 was about, so it is classified like the rest: a version is a short dull string with a number in it, and
+    anything that is not one leaves its text in the debug log and reports nothing.
+    """
+    line = " ".join(said.split())[:60]
+    if line and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._()+/-]*", line) and any(c.isdigit() for c in line):
+        return line
+    if line:
+        log.debug("%s: what it printed for --version does not read as one: %s", cli, line)
+    return "unknown"
+
+
+def _one_of(value, known: frozenset) -> str:
+    """A value that may be shown to the person, which is to say: one of the values it is allowed to be.
+
+    `detail` reaches a wizard page, and nothing reaches a screen on the strength of a charset filter -- stripping
+    everything but `[A-Za-z0-9_.-]` leaves a token like an API key entirely intact. These fields are single enums whose
+    members this module already holds, so the check is membership, and anything else is unnamed.
+    """
+    said = str(value or "")
+    if said not in known:
+        log.debug("a value outside the %d this field may hold: %r", len(known), said[:80])
+        return UNNAMED
+    return said
 
 
 def _routes_elsewhere(name: str) -> bool:
@@ -498,7 +532,7 @@ class CliBrain:
     def cli_version(self) -> str:
         r = self._run(["--version"])
         said = ((r.stdout if r else "") or (r.stderr if r else "") or "").strip()
-        return said.splitlines()[0][:60] if said else "unknown"
+        return _version(self.cli_name, said.splitlines()[0] if said else "")
 
     def _run(self, args: list[str]) -> subprocess.CompletedProcess | None:
         """One short, non-streaming run of the CLI (its version, its login status). None means it would not run."""
@@ -590,7 +624,7 @@ class ClaudeCodeLLM(CliBrain):
             said = {}
         if not isinstance(said, dict) or not said.get("loggedIn"):
             raise BrainError("not_logged_in", "claude is not logged in")
-        how = re.sub(r"[^A-Za-z0-9_.-]", "", str(said.get("authMethod") or "none"))[:40]
+        how = _one_of(said.get("authMethod") or "none", CLAUDE_LOGINS)
         if how == "none":  # logged in by one reckoning and not by the other: the CLI's own word for no login wins
             raise BrainError("not_logged_in", "claude is not logged in")
         if how in CLAUDE_BILLED_LOGINS:
@@ -655,6 +689,7 @@ class CodexLLM(CliBrain):
         self._turn_req: int | None = None
         self._turn_id: str | None = None
         self._past: set[str] = set()   # turns this session has finished with; their late events are not the next turn's
+        self._orphans: set[int] = set()  # turn/start requests we moved on from before their reply named the turn
 
     def _args(self, system_prompt: str) -> list[str]:
         off = [a for feature in CODEX_TOOLS_OFF for a in ("--disable", feature)]
@@ -726,7 +761,7 @@ class CodexLLM(CliBrain):
         if not kind:
             raise BrainError("not_logged_in", "codex is not logged in")
         if kind != "chatgpt":
-            raise BrainError("api_key_login", re.sub(r"[^A-Za-z0-9_.-]", "", kind)[:40])
+            raise BrainError("api_key_login", _one_of(kind, CODEX_ACCOUNTS))
         self._plan = str(account.get("planType") or "")[:40]
         return {"plan": self._plan}
 
@@ -743,7 +778,7 @@ class CodexLLM(CliBrain):
         result = r.get("result") or {}
         self._thread = (result.get("thread") or {}).get("id")
         self._turn_req = self._turn_id = None
-        self._past = set()
+        self._past, self._orphans = set(), set()
         if not self._thread:
             raise BrainError("failed", "codex started no thread")
         self._confined(result)
@@ -752,11 +787,17 @@ class CodexLLM(CliBrain):
         """What the thread says it came up as. A requirements file, an MDM policy or a version that reads one of these
         settings differently can hand back a thread with more reach than was asked for; that thread does not take a
         turn. This is the Claude side's `tools == []` for a protocol that reports no tool list of its own."""
-        sandbox = result.get("sandbox") or {}
-        approval, kind = result.get("approvalPolicy"), sandbox.get("type")
-        if kind != "readOnly" or sandbox.get("networkAccess") or approval != "never":
-            log.debug("codex brain: the thread came up sandbox=%r approval=%r", sandbox, approval)
-            raise BrainError("tools_unknown", "codex started a session with more reach than a phone brain gets")
+        err = self._widened(result.get("sandbox") or {}, result.get("approvalPolicy"))
+        if err is not None:
+            raise err
+
+    def _widened(self, sandbox: dict, approval) -> BrainError | None:
+        """Is this more reach than a phone brain gets? Read at thread start and again whenever the thread says its
+        settings changed, because `thread/start` is not the only moment a sandbox can be set."""
+        if sandbox.get("type") != "readOnly" or sandbox.get("networkAccess") or approval != "never":
+            log.debug("codex brain: the session reports sandbox=%r approval=%r", sandbox, approval)
+            return BrainError("tools_unknown", "codex gave the session more reach than a phone brain gets")
+        return None
 
     def _handshake(self) -> None:
         self._await(self._request("initialize", {"clientInfo": {"name": "ai-phone", "version": _client_version()}}))
@@ -798,6 +839,13 @@ class CodexLLM(CliBrain):
     def _send(self, text: str) -> None:
         if self._turn_id:
             self._past.add(self._turn_id)
+        elif self._turn_req is not None:
+            # A turn we are leaving whose id we never read. The request id is known the moment it is sent, and the
+            # stream is ordered, so its reply still has to arrive before any notification of its own: when it does,
+            # `_event` learns the id and `_past` can recognise the late events. This is what closes the hole the
+            # permissive default in `_ours` leaves, without touching that default -- which is there to honour a
+            # completion that arrives before its own reply, and whose removal is how a silent turn gets shipped.
+            self._orphans.add(self._turn_req)
         self._turn_id = None
         self._turn_req = self._request("turn/start", {"threadId": self._thread, "input": [{"type": "text", "text": text}]})
 
@@ -808,6 +856,13 @@ class CodexLLM(CliBrain):
             log.info("codex brain: an MCP server joined the session; a phone brain gets no tools")
             self._spent = True
             return "error", BrainError("tool_use", "an MCP server joined the session; a phone brain gets no tools")
+        if method == "thread/settings/updated":
+            # a sandbox or an approval policy changed under the session; `_confined()` only sees thread/start
+            settings = prm.get("threadSettings") or {}
+            err = self._widened(settings.get("sandboxPolicy") or {}, settings.get("approvalPolicy"))
+            if err is not None:
+                self._spent = True
+                return "error", err
         if method == "configWarning":
             log.debug("codex brain: codex ignored settings: %s", str(prm.get("summary"))[:STDERR_CHARS])
             self._spent = True
@@ -854,6 +909,11 @@ class CodexLLM(CliBrain):
             if obj.get("error"):
                 return "error", self._failure(obj["error"])
             self._turn_id = ((obj.get("result") or {}).get("turn") or {}).get("id")
+        elif obj.get("id") in self._orphans:
+            self._orphans.discard(obj["id"])
+            late = ((obj.get("result") or {}).get("turn") or {}).get("id")
+            if late:
+                self._past.add(late)  # now its own completion can be told apart from this turn's
         return "note", None
 
     def _ours(self, prm: dict, turn_id: str | None = None) -> bool:

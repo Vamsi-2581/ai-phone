@@ -358,3 +358,15 @@ def test_validation_only_reads_the_config(tmp_path: Path):
     assert cfg.brain.model == "local", "validate_config rewrote the config it was asked to check"
     fill_defaults(cfg)
     assert cfg.brain.model == "haiku"
+
+
+def test_the_brain_kinds_cannot_drift_from_the_type_the_loader_checks():
+    """`BRAIN_KINDS` is what `models pull` falls back on when a config will not load, and the Literal is what the loader
+    validates against. A hand-kept copy of a type drifts, so they are one object read two ways."""
+    import typing
+
+    from ai_phone.config import BRAIN_KINDS, SUBSCRIPTION_KINDS, BrainConfig
+
+    assert typing.get_args(typing.get_type_hints(BrainConfig)["kind"]) == BRAIN_KINDS
+    assert set(SUBSCRIPTION_KINDS) <= set(BRAIN_KINDS)
+    assert BrainConfig().kind in BRAIN_KINDS
