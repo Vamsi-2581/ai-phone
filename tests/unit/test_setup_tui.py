@@ -3,6 +3,7 @@ import asyncio
 import dataclasses
 import threading
 import time
+import types
 
 import pytest
 from rich.color import ColorType
@@ -502,36 +503,92 @@ def clipped(text: str) -> list[str]:
     return bad
 
 
+FORM_PAGE = Page(2, "Your Twilio credentials", "Saved to ~/.ai-phone/secrets.env, readable only by you.")
+# one page of each kind the wizard shows, with the text that says it is up: Welcome has no eyebrow and a wordmark,
+# a question has a menu, a form has input boxes
+PAGE_KINDS = {"welcome": (WELCOME, [Option("Continue"), Option("Cancel")], None, "[2] Cancel"),
+              "question": (LINE, OPTIONS, None, "[2] A SIP address"),
+              "form": (FORM_PAGE, None, KEY_FIELDS, "Auth Token")}
+
+
+async def render(size, page, options=None, fields=None, marker=""):
+    """Drive one page onto a terminal of `size` and return what it shows, with how it chose to lay itself out."""
+    if options is not None:
+        app = SetupApp(lambda ui: Outcome(ui.choose(page, options, back=page.step != 0)))
+        keys = look.MENU_KEYS if page.step else look.MENU_KEYS.replace("esc back   ", "")  # no Back on Welcome
+    else:
+        app = SetupApp(lambda ui: Outcome(0) if ui.ask(page, fields) else Outcome(1))
+        keys = look.FORM_KEYS
+    async with app.run_test(size=size) as pilot:
+        await wait_for(pilot, app, showing(app, marker))
+        shown = types.SimpleNamespace(
+            rows=[row.rstrip() for row in screen_text(app).splitlines()], keys=keys, width=size[0],
+            scrolled=app.screen.show_vertical_scrollbar or app.screen.max_scroll_y > 0,
+            dense=app.screen.has_class("dense"))
+        if fields is None:
+            await pilot.press("enter")
+        else:
+            await pilot.press("a", "enter", "b", "enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    return shown
+
+
+def eyebrow_row(shown) -> int:
+    return next(i for i, row in enumerate(shown.rows) if "S T E P" in row)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("width", [70, 104])
 async def test_a_narrow_terminal_clips_no_form_row(width):
     """A 70-column terminal is the narrowest the wizard is meant to look right in: the input boxes keep both
-    borders, every row fits, and the key hints are whole. 104 columns is the control."""
-    form = Page(2, "Your Twilio credentials", "Saved to ~/.ai-phone/secrets.env, readable only by you.")
-    app = SetupApp(lambda ui: Outcome(0) if ui.ask(form, KEY_FIELDS) else Outcome(1))
-    async with app.run_test(size=(width, 30)) as pilot:
-        await wait_for(pilot, app, showing(app, "Auth Token"))
-        rows = [row.rstrip() for row in screen_text(app).splitlines()]
-        assert clipped("\n".join(rows)) == []
-        assert max(len(row) for row in rows) <= width
-        assert any(look.FORM_KEYS in row for row in rows)
-        tops = [row for row in rows if row.strip().startswith("╭")]
-        assert len(tops) == 2 and len({len(row.strip()) for row in tops}) == 1  # both fields, the same width
-        await pilot.press("a", "enter", "b", "enter")
-        await wait_for(pilot, app, lambda: app.outcome is not None)
+    borders and come out the same width as each other. 104 columns is the control."""
+    shown = await render((width, 30), FORM_PAGE, fields=KEY_FIELDS, marker="Auth Token")
+    assert clipped("\n".join(shown.rows)) == []
+    assert max(len(row) for row in shown.rows) <= width
+    tops = [row for row in shown.rows if row.strip().startswith("╭")]
+    assert len(tops) == 2 and len({len(row.strip()) for row in tops}) == 1
 
 
 @pytest.mark.asyncio
-async def test_a_narrow_terminal_keeps_the_menu_and_its_hints_whole():
-    """A question at 70x30 fits as it is: every option, and the whole key hint, not a cut-off one."""
+@pytest.mark.parametrize("width", [70, 104])
+@pytest.mark.parametrize("kind", list(PAGE_KINDS))
+async def test_a_30_row_terminal_fits_the_page_and_keeps_its_key_hints(kind, width):
+    """The approved look's spacing wants 40 rows; in a shorter terminal it would push the key hints below the
+    bottom of the screen, so the wizard tightens the spacing by height as well as by body length."""
+    page, options, fields, marker = PAGE_KINDS[kind]
+    shown = await render((width, 30), page, options, fields, marker)
+    assert shown.dense and not shown.scrolled  # the whole page is on screen, not one scroll below it
+    assert any(shown.keys in row for row in shown.rows)  # and so is the whole key hint
+    assert clipped("\n".join(shown.rows)) == []
+    assert max(len(row) for row in shown.rows) <= width
+    if kind != "welcome":  # Welcome has a wordmark where the others have an eyebrow
+        assert eyebrow_row(shown) == 5  # one blank row above it, not five
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", list(PAGE_KINDS))
+async def test_40_rows_still_gets_the_spacing_the_look_was_approved_with(kind):
+    """The tightening is for short terminals only: at 40 rows nothing about the approved look moves."""
+    page, options, fields, marker = PAGE_KINDS[kind]
+    shown = await render((104, 40), page, options, fields, marker)
+    assert not shown.dense and not shown.scrolled
+    assert any(shown.keys in row for row in shown.rows)
+    if kind != "welcome":
+        assert eyebrow_row(shown) == 9  # five blank rows above it
+
+
+@pytest.mark.asyncio
+async def test_resizing_into_a_short_terminal_tightens_the_spacing_and_back():
     app = SetupApp(lambda ui: Outcome(ui.choose(LINE, OPTIONS)))
-    async with app.run_test(size=(70, 30)) as pilot:
+    async with app.run_test(size=(104, 40)) as pilot:
         await wait_for(pilot, app, showing(app, "[2] A SIP address"))
+        assert not app.screen.has_class("dense")
+        await pilot.resize_terminal(104, 30)
+        await wait_for(pilot, app, lambda: app.screen.has_class("dense"))
         rows = [row.rstrip() for row in screen_text(app).splitlines()]
-        assert max(len(row) for row in rows) <= 70
-        assert any(look.MENU_KEYS in row for row in rows)
-        for label in ("[1] A phone number", "[2] A SIP address", "[3] Back"):
-            assert any(label in row for row in rows)
+        assert not app.screen.show_vertical_scrollbar and any(look.MENU_KEYS in row for row in rows)
+        await pilot.resize_terminal(104, 40)
+        await wait_for(pilot, app, lambda: not app.screen.has_class("dense"))
         await pilot.press("enter")
         await wait_for(pilot, app, lambda: app.outcome is not None)
 

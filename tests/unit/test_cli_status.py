@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from ai_phone.cli import main
 from ai_phone.cli_status import line_state, render_last_call, render_status
 
@@ -66,13 +68,13 @@ def test_last_call_groups_by_the_unique_call_id_when_records_carry_one(tmp_path:
             {"call_id": "2", "call": "d4e5f6", "turn": 0, "first_audible_ms": 700.0}]   # PJSIP reused call ID 2
     turns.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     out = render_last_call(turns)
-    assert out.startswith("call d4e5f6: 1 turns") and "p50 700 ms" in out and "brain errors: 0" in out
+    assert out.startswith("call d4e5f6: 1 turn,") and "p50 700 ms" in out and "brain errors: 0" in out
 
 
-def write_turns(path: Path, **counters) -> Path:
-    """One call of two turns, with whatever audio counters the test is about."""
+def write_turns(path: Path, turns: int = 2, **counters) -> Path:
+    """One call of `turns` turns, with whatever audio counters the test is about."""
     rows = [dict({"call_id": "8", "turn": i, "first_audible_ms": 900.0, "rx_overruns": 0, "tx_underruns": 0,
-                  "direction": "in", "brain_error": None}, **(counters if i == 0 else {})) for i in range(2)]
+                  "direction": "in", "brain_error": None}, **(counters if i == 0 else {})) for i in range(turns)]
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     return path
 
@@ -96,6 +98,23 @@ def test_last_call_warns_about_both_directions_in_the_order_of_the_counters(tmp_
     out = render_last_call(write_turns(tmp_path / "turns.jsonl", rx_overruns=5, tx_underruns=7)).splitlines()
     assert [row.split()[1] for row in out[1:]] == ["5", "7"]
     assert "inbound" in out[1] and "outbound" in out[2]
+
+
+@pytest.mark.parametrize("n, inbound, outbound", [
+    (1, "1 inbound audio frame was dropped", "1 outbound frame was late"),
+    (2, "2 inbound audio frames were dropped", "2 outbound frames were late"),
+])
+def test_one_lost_frame_does_not_read_as_if_there_were_many(tmp_path: Path, n, inbound, outbound):
+    rx = render_last_call(write_turns(tmp_path / "rx.jsonl", rx_overruns=n)).splitlines()
+    tx = render_last_call(write_turns(tmp_path / "tx.jsonl", tx_underruns=n)).splitlines()
+    assert rx[1] == f"warning: {inbound}; this Mac was too busy during the call."
+    assert tx[1] == f"warning: {outbound}; this Mac was too busy during the call."
+
+
+@pytest.mark.parametrize("turns, counted", [(1, "1 turn"), (2, "2 turns")])
+def test_one_turn_does_not_read_as_if_there_were_many(tmp_path: Path, turns, counted):
+    out = render_last_call(write_turns(tmp_path / "turns.jsonl", turns=turns))
+    assert out.startswith(f"call 8: {counted}, first audible p50 900 ms,")
 
 
 def test_last_call_says_nothing_about_audio_when_no_frame_was_lost(tmp_path: Path):

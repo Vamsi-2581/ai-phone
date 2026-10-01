@@ -29,13 +29,15 @@ DOWNLOAD_LEFT = "Setup cancelled. The download stops now and picks up where it l
 SCREEN_CLOSED = "Setup stopped: the screen closed unexpectedly."
 STOPPING = "Stopping after this step…"
 DENSE_BODY_LINES = 12  # a longer body (the Done page) gets tighter spacing so the page fits 40 rows
+DENSE_HEIGHT = 34  # and so does any page in a shorter terminal, so its key hints stay on screen at 30 rows
 
 
 class PageScreen(Screen):
     """One Page: a menu (options), a form (fields), or a spinner/progress bar while the flow works."""
 
     def __init__(self, page: Page, reply=None, options=(), default=0, back=False, fields=(), busy="", progress=False):
-        super().__init__(classes="dense" if len(page.body.splitlines()) > DENSE_BODY_LINES else None)
+        self.long_body = len(page.body.splitlines()) > DENSE_BODY_LINES
+        super().__init__(classes="dense" if self.long_body else None)  # on_resize adds the short-terminal case
         self.page, self.reply = page, reply
         self.options, self.default, self.back = list(options), default, back
         # a menu whose default is its Back row is a confirmation (a purchase): only Enter answers it
@@ -92,6 +94,9 @@ class PageScreen(Screen):
 
     def on_resize(self, event: events.Resize) -> None:
         width = event.size.width
+        # the generous spacing of the approved look needs 40 rows; below that it would push the key hints off the
+        # bottom, so a short terminal gets the same tighter spacing a long summary gets
+        self.set_class(self.long_body or event.size.height < DENSE_HEIGHT, "dense")
         self.query_one("#crumbs", Static).update(look.crumbs(self.page.step, width))
         if self.page.step == 0:
             self.query_one("#logo", Static).update(self._logo(width))

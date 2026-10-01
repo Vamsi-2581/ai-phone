@@ -182,6 +182,7 @@ Screen {{ background: {BG}; align: center top; }}
 #checks {{ width: auto; margin: 2 0 1 0; }}
 #body {{ width: auto; max-width: 100%; margin: 1 0 0 0; }}
 .dense #body {{ margin: 0; }}
+.dense #logo {{ margin: 1 0 0 0; }}
 Center {{ height: auto; }}
 #menu {{ width: auto; margin: 2 0 0 0; }}
 #hint {{ width: auto; margin: 2 0 0 0; }}

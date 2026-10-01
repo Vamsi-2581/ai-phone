@@ -39,6 +39,16 @@ def render_status(state: dict, alive: bool) -> str:
     return "\n".join(rows)
 
 
+def _count(n: int, noun: str) -> str:
+    """'1 turn' / '2 turns'."""
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def _frames(n: int, what: str) -> str:
+    """'1 inbound audio frame was' / '644 inbound audio frames were'."""
+    return f"{_count(n, f'{what} frame')} {'was' if n == 1 else 'were'}"
+
+
 def render_last_call(turns_path: Path) -> str:
     if not turns_path.exists():
         return "no turns recorded yet"
@@ -60,15 +70,15 @@ def render_last_call(turns_path: Path) -> str:
     p50 = f"{statistics.median(lat):.0f} ms" if lat else "n/a"
     rx = sum(r.get("rx_overruns") or 0 for r in call)
     tx = sum(r.get("tx_underruns") or 0 for r in call)
-    out = [f"call {last_id}: {len(call)} turns, first audible p50 {p50}, "
+    out = [f"call {last_id}: {_count(len(call), 'turn')}, first audible p50 {p50}, "
            f"rx overruns: {rx}, tx underruns: {tx}, "
            f"brain errors: {sum(1 for r in call if r.get('brain_error'))}, direction: {call[0].get('direction', 'in')}"]
     # a counter in the hundreds means the caller heard a reply with holes in it, or words of theirs were never
     # transcribed; as a bare number among five others nobody reads it as the fault it is
     if rx:
-        out.append(f"warning: {rx} inbound audio frames were dropped; this Mac was too busy during the call.")
+        out.append(f"warning: {_frames(rx, 'inbound audio')} dropped; this Mac was too busy during the call.")
     if tx:
-        out.append(f"warning: {tx} outbound frames were late; this Mac was too busy during the call.")
+        out.append(f"warning: {_frames(tx, 'outbound')} late; this Mac was too busy during the call.")
     return "\n".join(out)
 
 
