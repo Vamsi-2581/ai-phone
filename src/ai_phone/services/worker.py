@@ -86,6 +86,17 @@ def _trim_memory(first: bool = False) -> None:
     mx.clear_cache()
 
 
+def _release(kind: str, backend) -> None:
+    """End whatever the backend holds open (a CLI session). Everything else has nothing to release."""
+    close = getattr(backend, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception as e:  # a backend that will not let go must not take the worker down with it
+        print(f"[{kind}-worker] close failed: {e!r}", file=sys.stderr, flush=True)
+
+
 def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_name, warm_args: dict, factory_args: dict | None = None,
                keep_warm_sec: float = 0.0) -> None:
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -116,12 +127,7 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 msg = ipc.recv(conn)
             op = msg.get("op")
             if op == "shutdown":
-                close = getattr(backend, "close", None)  # a brain that holds a CLI session ends it here
-                if close is not None:
-                    try:
-                        close()
-                    except Exception as e:
-                        print(f"[{kind}-worker] close failed: {e!r}", file=sys.stderr, flush=True)
+                _release(kind, backend)
                 break
             if op == "cancel":
                 cancelled.add(msg["gen"])
@@ -149,7 +155,15 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                     try:
                         prepare(msg["system_prompt"])
                     except BrainError as e:
+                        # the controller has no turn to attach this to yet, so say it here too: a login that has gone
+                        # or a CLI that has been uninstalled is worth one line in the log at the moment it is found
+                        print(f"[{kind}-worker] llm.prepare failed: {e.kind}", file=sys.stderr, flush=True)
                         ipc.send(conn, {"ev": "brain_error", "gen": gen, "kind": e.kind})
+                continue
+            if op == "llm.release":
+                # the call is over: a brain that holds a session (a subscription CLI) ends it now, so no process of
+                # ours sits idle between calls. The next call's llm.prepare starts a fresh one.
+                _release(kind, backend)
                 continue
             if gen in cancelled:
                 continue

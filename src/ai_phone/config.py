@@ -479,8 +479,6 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
         if br.api_key_env is not None:
             _require(bool(ENV_RE.fullmatch(br.api_key_env)), "config.brain.api_key_env: must match " + ENV_RE.pattern)
     if br.kind in SUBSCRIPTION_KINDS:
-        if br.model == BrainConfig().model:  # "local" names a model on this Mac: for a plan, take the kind's own default
-            br.model = SUBSCRIPTION_MODELS[br.kind]
         _require(bool(MODEL_RE.fullmatch(br.model)), f"config.brain.model: {br.model!r} is not a model name")
         if br.cli is not None:
             _require(bool(CLI_RE.fullmatch(br.cli)), "config.brain.cli: expected a command name or a path to one")
@@ -497,6 +495,14 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
     return warnings
 
 
+def fill_defaults(cfg: Config) -> None:
+    """Defaults that depend on another field, filled in as the config loads (validation only reads; it never writes).
+    A subscription brain's `model` means something different per kind, so the placeholder becomes that kind's own."""
+    b = cfg.brain
+    if b.kind in SUBSCRIPTION_KINDS and b.model == BrainConfig().model:
+        b.model = SUBSCRIPTION_MODELS[b.kind]
+
+
 def load_config(path: Path, env: Mapping[str, str] | None = None) -> Config:
     """`env` is where line passwords are looked up for the warnings (the daemon passes os.environ merged with secrets.env)."""
     p = Path(path).expanduser()
@@ -510,5 +516,6 @@ def load_config(path: Path, env: Mapping[str, str] | None = None) -> Config:
         raise ConfigError("config: expected a mapping at the top level")
     raw, warnings = _migrate_legacy(raw)
     cfg = _build(Config, raw, "config")
+    fill_defaults(cfg)
     cfg.warnings = warnings + validate_config(cfg, env)
     return cfg

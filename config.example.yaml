@@ -72,6 +72,8 @@ tts:
 
 conversation:
   endpoint_silence_ms: 300
-  reply_timeout_sec: 12      # no audible reply this long after the caller stops: apologise and listen again (a stalled model)
+  reply_timeout_sec: 12      # no audible reply this long after the caller stops: apologise and listen again (a stalled
+                             # model). A subscription brain also takes a third of this as the longest it will wait for
+                             # a turn the caller talked over to finish (Claude Code cannot be interrupted)
 log:
   dir: "~/Library/Logs/ai-phone"

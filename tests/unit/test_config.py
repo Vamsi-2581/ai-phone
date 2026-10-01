@@ -347,3 +347,14 @@ def test_a_brain_kind_nobody_has_heard_of_is_a_config_error(tmp_path: Path):
 def test_a_subscription_brain_model_must_look_like_one(tmp_path: Path):
     with pytest.raises(ConfigError, match="config.brain.model"):
         _load(tmp_path, 'brain: {kind: claude, model: "-- --dangerously"}\n')
+
+
+def test_validation_only_reads_the_config(tmp_path: Path):
+    """Defaulting belongs to loading: a Config built by hand (a test, a check in the wizard) comes back untouched."""
+    from ai_phone.config import BrainConfig, Config, fill_defaults
+
+    cfg = Config(brain=BrainConfig(kind="claude"))
+    validate_config(cfg, env={})
+    assert cfg.brain.model == "local", "validate_config rewrote the config it was asked to check"
+    fill_defaults(cfg)
+    assert cfg.brain.model == "haiku"

@@ -21,6 +21,7 @@ import logging
 import os
 import queue
 import shutil
+import signal
 import stat
 import subprocess
 import threading
@@ -30,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ai_phone import paths
+from ai_phone.lines.journal import private_mkdir
 from ai_phone.services.errors import BrainError
 
 if TYPE_CHECKING:  # only for the annotations: the setup wizard imports this module and needs no array library
@@ -41,7 +43,9 @@ PROBE = "Say OK."              # the one tiny turn warm-up spends to prove the l
 PROBE_PROMPT = "You are a phone assistant. Answer in one short sentence."
 CODEX_EFFORT = "low"           # measured: the first word takes about four seconds at any reasoning effort, so take
                                # the one every current model accepts rather than the person's own configured default
-DRAIN_SEC = 10.0               # how long a turn we stopped reading may take to finish before the session is dropped
+DRAIN_MS = 2000                # how long a turn we stopped reading may take to finish before the session is dropped;
+                               # the daemon sets this from the caller's own patience (conversation.reply_timeout_sec)
+STDOUT_BUDGET = 1 << 20        # bytes of output one call may print (plus the reply cap) before we take it for a runaway
 HANDSHAKE_SEC = 10.0           # how long starting a session may take, when that is longer than the token deadline
 CLOSE_SEC = 2.0                # how long the CLI may take to exit after its stdin closes
 VERSION_SEC = 15.0             # how long `<cli> --version` may take
@@ -91,10 +95,16 @@ def _same(sent: Message, shown: Message) -> bool:
     return sent.get("role") == "assistant" or sent.get("content") == shown.get("content")
 
 
-def _pump(stream, q: queue.Queue) -> None:
-    """Every line the CLI prints, onto the queue, until it stops."""
+def _pump(stream, q: queue.Queue, budget: int) -> None:
+    """Every line the CLI prints, onto the queue, until it stops or prints more than one call's worth. `max_tokens`
+    cannot be imposed on a CLI, so a runaway reply is possible; the producer stops long before the queue could eat
+    the worker's memory (the endpoint brain's producer has the same guard)."""
     try:
         for line in stream:
+            budget -= len(line)
+            if budget < 0:
+                q.put(("error", BrainError("too_long", "the CLI printed more than one call's worth of output")))
+                break
             q.put(("line", line))
     except (OSError, ValueError):
         pass
@@ -111,6 +121,17 @@ def _pump_stderr(stream, name: str) -> None:
         pass
 
 
+def _kill_group(p: subprocess.Popen) -> None:
+    """Kill the CLI and whatever it started (a Node runtime starts children of its own), not only the process we hold."""
+    try:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except (OSError, PermissionError):
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
 class CliBrain:
     """The part both CLIs share: the process, the deadlines, and what makes a session reusable.
 
@@ -121,11 +142,12 @@ class CliBrain:
     cli_name = ""      # the executable to look for on PATH
 
     def __init__(self, model: str, cli: str | None = None, first_token_timeout_ms: int = 12000,
-                 stream_idle_timeout_ms: int = 4000, max_response_chars: int = 2000):
+                 stream_idle_timeout_ms: int = 4000, max_response_chars: int = 2000, drain_timeout_ms: int = DRAIN_MS):
         self.model = model
         self.cli = cli or self.cli_name
         self.first_token_s = first_token_timeout_ms / 1000
         self.idle_s = stream_idle_timeout_ms / 1000
+        self.drain_s = drain_timeout_ms / 1000
         self.max_chars = max_response_chars
         self.last_timings: dict = {}
         self._cancelled: set[int] = set()
@@ -152,8 +174,12 @@ class CliBrain:
         return {"warm_ms": (time.monotonic_ns() - t) / 1e6, "model": self.model, "cli_version": version}
 
     def prepare(self, system_prompt: str) -> None:
-        """Have a session ready for a call with these instructions, without spending a turn. A call always gets a
-        session of its own: the same instructions on a new call still start again, so nothing carries over."""
+        """Have a session ready for a call with these instructions, without spending a turn.
+
+        A session that has heard nothing yet is pristine, so one already waiting with these instructions is kept (a
+        restart would cost the startup this call is trying to avoid). Any session that has taken a turn is closed, so
+        nothing of the last call can carry into this one.
+        """
         if self._alive() and self._system == system_prompt and not self._seen and not self._in_flight:
             return
         self.close()
@@ -223,7 +249,7 @@ class CliBrain:
         try:
             p.wait(timeout=CLOSE_SEC)
         except subprocess.TimeoutExpired:
-            p.kill()
+            _kill_group(p)
             try:
                 p.wait(timeout=CLOSE_SEC)
             except subprocess.TimeoutExpired:
@@ -258,18 +284,26 @@ class CliBrain:
 
     def _settle(self) -> bool:
         """Let a turn we stopped reading finish before the next one starts, so two are never in flight (Claude Code
-        cannot be interrupted at all). False means it never finished and this session is no good."""
+        cannot be interrupted at all). False means this session is no good and a new one should be started.
+
+        The wait is bounded by `drain_timeout_ms`, a slice of the caller's own patience: whatever is spent here comes
+        out of the time this turn has to answer before the controller apologises, so a turn that will not finish in
+        that slice loses its session (about a second to start a new one) instead of the caller losing the call.
+        """
         if not self._in_flight:
             return True
-        end = time.monotonic() + DRAIN_SEC
+        end = time.monotonic() + self.drain_s
         try:
-            while True:
+            while self.drain_s > 0:
                 what, _ = self._event(self._take(end - time.monotonic(), "idle_timeout"))
                 if what in ("end", "error"):
                     self._in_flight = False
                     return True
         except BrainError:
-            return False
+            pass
+        log.info("%s brain: a cancelled turn did not finish within %.0f ms; starting a new session",
+                 self.cli_name, self.drain_s * 1000)
+        return False
 
     def _start(self, system_prompt: str | None) -> None:
         self._spawn(system_prompt)
@@ -284,12 +318,15 @@ class CliBrain:
     def _spawn(self, system_prompt: str | None) -> None:
         exe = self._executable()
         try:
+            # its own session: close() then kills the CLI and anything it started, so nothing of ours is left running
             p = subprocess.Popen([exe, *self._args(system_prompt or "")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True, bufsize=1, env=self._env(), cwd=str(self._workdir()))
+                                 stderr=subprocess.PIPE, text=True, bufsize=1, env=self._env(), cwd=str(self._workdir()),
+                                 start_new_session=True)
         except OSError as e:
             raise BrainError("cli_missing", f"{self.cli} would not start: {type(e).__name__}") from None
         self._proc, self._q, self._system, self._seen, self._in_flight = p, queue.Queue(), system_prompt, [], False
-        threading.Thread(target=_pump, args=(p.stdout, self._q), name=f"{self.cli_name}-brain", daemon=True).start()
+        threading.Thread(target=_pump, args=(p.stdout, self._q, STDOUT_BUDGET + 100 * self.max_chars),
+                         name=f"{self.cli_name}-brain", daemon=True).start()
         threading.Thread(target=_pump_stderr, args=(p.stderr, self.cli_name), name=f"{self.cli_name}-brain-err",
                          daemon=True).start()
 
@@ -301,9 +338,10 @@ class CliBrain:
 
     def _workdir(self) -> Path:
         """An empty private directory of our own: nothing of the person's (a CLAUDE.md, an AGENTS.md, project
-        settings) is read from the place a session runs in."""
+        settings) is read from the place a session runs in. This may be the first thing to create the ai-phone home
+        (a plan is probed before any config is written), so the home itself is made 0700 too, not the umask's 0755."""
         d = paths.home() / "brain"
-        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        private_mkdir(d)
         if stat.S_IMODE(d.stat().st_mode) != 0o700:
             d.chmod(0o700)
         return d
@@ -345,6 +383,9 @@ class CliBrain:
             kind, payload = q.get(timeout=max(0.0, timeout_s))
         except queue.Empty:
             raise BrainError(on_timeout) from None
+        if kind == "error":  # the pump stopped it: this session has printed enough
+            self.close()
+            raise payload
         if kind == "eof":
             self.close()
             raise BrainError("failed", f"{self.cli} stopped")

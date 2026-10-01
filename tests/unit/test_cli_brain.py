@@ -56,6 +56,13 @@ def flag(name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
 
 
+def init():
+    """Claude Code's own `system`/`init` line. The real CLI prints nothing until the first turn arrives and then one
+    of these per turn (measured); `init_at_start` in the script asks for the other ordering, where the line is already
+    queued by the time the first turn is sent."""
+    out({"type": "system", "subtype": "init", "model": flag("--model"), "tools": SPEC.get("tools", [])})
+
+
 def deltas(d, emit, interrupted=lambda: False):
     """The turn's text, chunk by chunk, with the script's pauses. Returns what was said."""
     time.sleep(d.get("before_ms", 0) / 1000)
@@ -80,13 +87,16 @@ note(event="start", argv=sys.argv[1:], cwd=os.getcwd(), entries=sorted(os.listdi
      claude_env=sorted(k for k in os.environ if k.startswith("CLAUDE")))
 
 if SPEC["protocol"] == "claude":
+    if SPEC.get("init_at_start"):
+        init()
     for line in sys.stdin:
         if not line.strip():
             continue
         note(event="turn", text=json.loads(line).get("message", {}).get("content"),
              system=flag("--system-prompt"), model=flag("--model"))
         d = directive()
-        out({"type": "system", "subtype": "init", "model": flag("--model"), "tools": SPEC.get("tools", [])})
+        if not SPEC.get("init_at_start"):
+            init()
         said = deltas(d, lambda c: out({"type": "stream_event", "event": {"type": "content_block_delta",
                                                                          "delta": {"type": "text_delta", "text": c}}}))
         out({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": said}]}})
@@ -380,7 +390,7 @@ def test_a_reply_longer_than_the_cap_ends_the_turn(cli):
 
 def test_no_first_delta_within_the_deadline_is_a_timeout(cli):
     cli.script("claude", [{"before_ms": 2000, "deltas": ["Late."]}, {"deltas": ["Soon."]}])
-    brain = claude_brain(cli, first_token_timeout_ms=300)
+    brain = claude_brain(cli, first_token_timeout_ms=300, drain_timeout_ms=8000)
     try:
         with pytest.raises(BrainError) as e:
             list(brain.stream(1, talk("Hi"), 120))
@@ -390,6 +400,40 @@ def test_no_first_delta_within_the_deadline_is_a_timeout(cli):
     finally:
         brain.close()
     assert len(cli.events("start")) == 1
+
+
+def test_a_turn_that_will_not_finish_in_the_drain_budget_loses_its_session(cli):
+    """Claude Code cannot be interrupted, so a cancelled turn runs on. Waiting it out comes out of the time this turn
+    has before the caller is apologised to, so a turn that is too slow to finish loses the session instead."""
+    cli.script("claude", [{"deltas": ["One", " two", " three"], "gap_ms": 400}, {"deltas": ["Fresh."]}])
+    brain = claude_brain(cli, drain_timeout_ms=100)
+    try:
+        for piece in brain.stream(1, talk("First"), 120):
+            brain.cancel(1)
+        assert "".join(brain.stream(2, talk("First", "One", "Second"), 120)) == "Fresh."
+    finally:
+        brain.close()
+    assert len(cli.events("start")) == 2, "the session that was still talking was kept"
+
+
+def test_the_drain_budget_is_the_daemon_s_to_set(cli):
+    assert claude_brain(cli, drain_timeout_ms=3500).drain_s == 3.5
+    assert CodexLLM(model="m").drain_s == 2.0  # the backend's own default, for anything that does not pass one
+
+
+def test_a_cli_that_floods_its_stdout_is_stopped(cli):
+    """`max_tokens` cannot be imposed on a CLI, so the producer stops a runaway long before the queue eats the
+    worker's memory."""
+    cli.script("claude", [{"deltas": ["x" * 2_000_000]}, {"deltas": ["Fresh."]}])
+    brain = claude_brain(cli, max_response_chars=100)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Go on"), 120))
+        assert e.value.kind == "too_long"
+        assert "".join(brain.stream(2, talk("Again"), 120)) == "Fresh."  # a new session; that one is gone
+    finally:
+        brain.close()
+    assert len(cli.events("start")) == 2
 
 
 def test_a_stream_that_stops_mid_reply_is_an_idle_timeout(cli):
@@ -436,6 +480,27 @@ def test_a_session_whose_process_died_fails_the_turn_and_the_next_one_restarts_i
     assert len(cli.events("start")) == 2
 
 
+def test_an_init_line_queued_before_the_turn_is_read_in_its_turn(cli):
+    """prepare() starts the CLI, so anything it prints is waiting on the queue when the first turn is sent. Whether
+    the init line comes then or with the turn, the reply is the same and tools are still refused."""
+    cli.script("claude", [{"deltas": ["Hello."]}], init_at_start=True)
+    brain = claude_brain(cli)
+    try:
+        brain.prepare(PROMPT)
+        cli.wait("start", 1)
+        assert "".join(brain.stream(1, talk("Hi"), 120)) == "Hello."
+    finally:
+        brain.close()
+    cli.script("claude", [{"deltas": ["Hello."]}], init_at_start=True, tools=["Bash"])
+    brain = claude_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Hi"), 120))
+        assert e.value.kind == "failed" and "tools" in str(e.value)
+    finally:
+        brain.close()
+
+
 def test_a_cli_that_came_up_with_tools_of_its_own_is_refused(cli):
     cli.script("claude", [{"deltas": ["Hello."]}], tools=["Bash", "Read"])
     brain = claude_brain(cli)
@@ -458,6 +523,9 @@ def test_the_session_runs_in_a_private_empty_directory(cli, tmp_path):
     assert where == (tmp_path / "home" / "brain").resolve()
     assert cli.events("start")[0]["entries"] == [], "a CLAUDE.md or AGENTS.md in there would be read"
     assert stat.S_IMODE(where.stat().st_mode) == 0o700
+    # this is often the first thing to create the ai-phone home (a plan is probed before any config is written), so
+    # the home must not be left at the umask's 0755 beside the config and the secrets file
+    assert stat.S_IMODE(where.parent.stat().st_mode) == 0o700
 
 
 def test_warmup_proves_the_login_and_reports_the_model_and_version(cli):
@@ -679,6 +747,7 @@ def test_closing_the_brain_ends_the_cli(cli):
     brain = claude_brain(cli)
     brain.prepare(PROMPT)
     proc = brain._proc
+    assert os.getpgid(proc.pid) != os.getpgid(0), "a session of its own, so closing it takes its children too"
     brain.close()
     assert proc.poll() is not None, "the CLI is still running"
     assert brain._proc is None and brain.close() is None  # closing twice is how the worker shuts down

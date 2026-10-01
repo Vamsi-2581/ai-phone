@@ -835,8 +835,17 @@ words. The worker's new `llm.prepare` op (sent by the daemon as soon as a call's
 greeting plays, and ignored by backends without `prepare`) starts the session so the first reply does not pay the
 startup. `warmup` spends one tiny turn ("Say OK.") to prove the login and throws that session away; failures are the
 same `BrainError` kinds as the endpoint brain plus `cli_missing`, `not_logged_in` and `model_not_allowed`.
-`max_tokens` cannot be imposed on a CLI, so a reply past `max_response_chars` ends the turn. Nothing of the
-conversation is logged: timings and the model only, with the CLI's own stderr at debug, truncated. Measured on this
+`max_tokens` cannot be imposed on a CLI, so a reply past `max_response_chars` ends the turn, and the reader stops a
+session that prints more than one call's worth of output (`BrainError("too_long")`). Nothing of the conversation is
+logged: timings and the model only, with the CLI's own stderr at debug, truncated. The session belongs to one call:
+the daemon sends `llm.release` as the call ends (the mirror of `llm.prepare`; every other brain ignores both), so no
+CLI process idles between calls, and `close()` kills the whole process group, since a Node runtime starts children of
+its own. Claude Code cannot be interrupted, so a turn the caller talked over has to finish before the next one is
+sent; that wait is bounded by a third of `conversation.reply_timeout_sec` (the daemon passes it as
+`drain_timeout_ms`), because whatever is spent on the old turn comes out of the time the new one has before the
+controller apologises — past it the session is dropped and a fresh one started. The working directory is created with
+`private_mkdir`, since probing a plan in the wizard can be the first thing to make `~/.ai-phone` and it must not be
+left at the umask's 0755. Measured on this
 Mac (first word, a call's first turn): Claude Code 2.1.286 + Haiku 2.4–5.5 s, then about 1 s; codex-cli 0.157.1 +
 gpt-5.6-luna 3.9–4.4 s, then 1.1–1.9 s — so the daemon raises `first_token_timeout_ms` to 12000 for these kinds while
 the config still holds the 4000 a model on this Mac gets.

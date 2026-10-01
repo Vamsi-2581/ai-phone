@@ -41,10 +41,13 @@ FACTORIES = {
                      "chatgpt": "ai_phone.services.backends.cli_brain:make_codex"},
              "tts": "ai_phone.services.backends.mlx_kokoro:KokoroTTS"},
     "fake": {"stt": "ai_phone.services.backends.fake:FakeSTT",
+             # openai_compatible is here for completeness only: llm_worker takes that kind before it reads this map,
+             # because an endpoint is a server the person chose and --fake must not stand in for it
              "llm": {"local": FAKE_LLM, "openai_compatible": FAKE_LLM, "claude": FAKE_LLM, "chatgpt": FAKE_LLM},
              "tts": "ai_phone.services.backends.fake:FakeTTS"},
 }
 SUBSCRIPTION_FIRST_TOKEN_MS = 12000  # a plan's first word takes seconds: its own CLI starts, then the provider answers
+DRAIN_SHARE = 3  # a turn the caller talked over may take this fraction of their patience to finish, and no more
 LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
 BRAIN_WARNINGS = {
     "claude": ("Brain: your Claude subscription. What callers say, the instructions and the conversation are sent to "
@@ -59,6 +62,13 @@ def subscription_first_token_ms(b: BrainConfig) -> int:
     set themselves is the one that counts."""
     default = BrainConfig().first_token_timeout_ms
     return SUBSCRIPTION_FIRST_TOKEN_MS if b.first_token_timeout_ms == default else b.first_token_timeout_ms
+
+
+def drain_timeout_ms(cfg: Config) -> int:
+    """How long a cancelled turn may take to finish before its session is dropped. Claude Code cannot be interrupted,
+    and whatever is spent waiting for the old turn comes out of the time the new one has before the controller
+    apologises, so the wait gets a third of that budget; past it, a new session (about a second) is the better trade."""
+    return cfg.conversation.reply_timeout_sec * 1000 // DRAIN_SHARE
 
 
 def brain_warning(cfg: Config) -> str | None:
@@ -98,7 +108,8 @@ def llm_worker(cfg: Config, tier: str, fake: bool, system_prompt: str, secrets: 
                 "factory_args": {"model": b.model, "cli": b.cli,
                                  "first_token_timeout_ms": subscription_first_token_ms(b),
                                  "stream_idle_timeout_ms": b.stream_idle_timeout_ms,
-                                 "max_response_chars": b.max_response_chars}}
+                                 "max_response_chars": b.max_response_chars,
+                                 "drain_timeout_ms": drain_timeout_ms(cfg)}}
     return {"factory": FACTORIES["real"]["llm"]["local"], "warm_args": {**warm, **wire},
             "factory_args": {"model_id": models.repo_for(tier)}, "keep_warm_sec": cfg.models.keep_warm_sec}
 
@@ -717,6 +728,9 @@ class Daemon:
             finally:  # the teardown runs even if the controller failed: the record ends and the claim is released
                 for c in (stt, llm, tts):
                     c.cancel(c.current_gen)
+                # the call is over: a brain that holds a CLI session lets it go, so no process of ours idles between
+                # calls (every other brain ignores this, as it ignores llm.prepare)
+                llm.send({"op": "llm.release", "gen": llm.current_gen})
                 if tc.timer is not None and tc.timer.t0 is not None:
                     r = tc.incomplete_record(str(call_id), n[0])  # keeps what the agent had said, and the counters
                     r.update(incomplete=True, state_at_end=tc.state, line_id=line_id, call=rec.id, mode=rec.mode)

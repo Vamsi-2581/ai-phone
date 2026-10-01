@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from ai_phone.config import BrainConfig, Config, ModelsConfig
-from ai_phone.daemon import Daemon, brain_warning, llm_worker, subscription_first_token_ms
+from ai_phone.config import BrainConfig, Config, ConversationConfig, ModelsConfig
+from ai_phone.daemon import Daemon, brain_warning, drain_timeout_ms, llm_worker, subscription_first_token_ms
 
 PROMPT = "You are an AI assistant speaking on a live phone call."
 WIRE = {"wire_memory": True}
@@ -27,9 +27,17 @@ def test_a_claude_subscription_runs_claude_code():
     s = spec("claude", model="haiku", cli="/opt/homebrew/bin/claude")
     assert s["factory"] == "ai_phone.services.backends.cli_brain:make_claude"
     assert s["factory_args"] == {"model": "haiku", "cli": "/opt/homebrew/bin/claude", "first_token_timeout_ms": 12000,
-                                 "stream_idle_timeout_ms": 4000, "max_response_chars": 2000}
+                                 "stream_idle_timeout_ms": 4000, "max_response_chars": 2000, "drain_timeout_ms": 4000}
     assert s["warm_args"] == {"system_prompt": PROMPT}  # no wire_memory: there are no weights on this Mac
     assert s["keep_warm_sec"] == 0.0                   # and nothing to keep warm
+
+
+def test_a_cancelled_turn_may_take_a_third_of_the_callers_patience_to_finish():
+    """Claude Code cannot be interrupted, so the next turn waits for the one the caller talked over. What is spent
+    waiting comes out of the time this turn has before the controller apologises."""
+    assert drain_timeout_ms(Config()) == 4000  # reply_timeout_sec 12
+    assert drain_timeout_ms(Config(conversation=ConversationConfig(reply_timeout_sec=6))) == 2000
+    assert spec("claude")["factory_args"]["drain_timeout_ms"] == 4000
 
 
 def test_a_chatgpt_subscription_runs_codex():

@@ -104,7 +104,9 @@ A subscription brain uses no API key: ai-phone drives the CLI you are already lo
 streams its words to the caller. Install them with `npm install -g @anthropic-ai/claude-code` (then `claude`
 and `/login`) or `npm install -g @openai/codex` (then `codex login`). A plan is a second or two slower to the
 first word than the model on this Mac, and it is not private; what it buys is a much stronger brain on the
-phone than 24 GB of memory can hold.
+phone than 24 GB of memory can hold. The session belongs to one call: it is started while the greeting plays
+and let go when the call ends. Proving the login costs one tiny turn of your plan every time ai-phone starts
+(and again if the brain worker has to be restarted mid-run), on top of the calls themselves.
 
 ## Use it from your AI (Milestone 3)
 

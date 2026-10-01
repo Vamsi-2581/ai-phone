@@ -9,6 +9,7 @@ import atexit
 import contextlib
 import copy
 import functools
+import logging
 import os
 import shutil
 import signal
@@ -41,6 +42,7 @@ from ai_phone.services.backends.cli_brain import CLAUDE_MODELS, ClaudeCodeLLM, C
 from ai_phone.services.errors import BrainError
 from ai_phone.telephony.state import StateError, StateFile
 
+log = logging.getLogger("ai-phone.setup")
 CARRIER_KEYS = {"twilio": ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"), "telnyx": ("TELNYX_API_KEY",), "fake": ("FAKE_API_KEY",)}
 BRAIN_KEY_ENV = "AI_PHONE_BRAIN_API_KEY"  # a secret name by the daemon's rules (it contains KEY), so workers never inherit it
 VENDOR = Path(ai_phone.__file__).parent / "vendor"  # where install.sh puts the PJSIP binding
@@ -99,6 +101,15 @@ def sip_library_built() -> bool:
 def _section(raw: dict, name: str) -> dict:
     value = raw.get(name)
     return dict(value) if isinstance(value, dict) else {}
+
+
+BRAIN_KIND_KEYS = ("kind", "base_url", "model", "api_key_env")  # what choosing a brain sets; the rest is the person's
+
+
+def _kept_brain(raw: dict) -> dict:
+    """The brain settings that are the person's own — the timeouts, a hand-set path to a CLI — kept through a change of
+    brain, because `config.example.yaml` promises that a number they set themselves is the one used."""
+    return {k: v for k, v in _section(raw, "brain").items() if k not in BRAIN_KIND_KEYS}
 
 
 def _saved() -> dict[str, str]:
@@ -173,7 +184,7 @@ class Actions:
 
     def save_brain_local(self, tier: str) -> None:
         def change(raw: dict) -> None:
-            raw["brain"] = {"kind": "local"}
+            raw["brain"] = {"kind": "local", **_kept_brain(raw)}
             raw["models"] = {**_section(raw, "models"), "tier": tier}
         self._edit(change)
 
@@ -244,7 +255,10 @@ class Actions:
             return ActionError(f"{cli} did not answer within {PROBE_MS // 1000} seconds. Try again, or pick another brain.")
         if e.kind == "model_not_allowed":
             return ActionError(f"Your plan does not allow {self._brain_model(kind)}. Choose another model.")
-        return ActionError(f"{cli} could not answer: {e}")
+        # anything else (a rate limit, an org policy, a provider incident) comes with the CLI's own text, which is
+        # unbounded third-party prose: the kind is enough for the person, the detail belongs in the log
+        log.debug("%s brain probe failed: %s", cli, e)
+        return ActionError(f"{cli} could not answer ({e.kind}). Try again, or pick another brain.")
 
     def test_subscription(self, kind: str) -> dict:
         """One tiny turn through the person's own CLI: it proves the CLI runs and that they are logged in.
@@ -282,8 +296,7 @@ class Actions:
 
     def save_brain_subscription(self, kind: str, model: str) -> None:
         def change(raw: dict) -> None:
-            where = {k: v for k, v in _section(raw, "brain").items() if k == "cli"}  # a hand-set path to the CLI stays
-            raw["brain"] = {"kind": kind, "model": model, **where}
+            raw["brain"] = {"kind": kind, "model": model, **_kept_brain(raw)}
         self._edit(change)
 
     def save_brain_endpoint(self, url: str, model: str, key: str | None) -> None:
@@ -291,8 +304,7 @@ class Actions:
         previous = _saved().get(BRAIN_KEY_ENV)
 
         def change(raw: dict) -> None:
-            brain = {k: v for k, v in _section(raw, "brain").items() if k not in ("kind", "base_url", "model", "api_key_env")}
-            brain = {"kind": "openai_compatible", "base_url": url, "model": model, **brain}
+            brain = {"kind": "openai_compatible", "base_url": url, "model": model, **_kept_brain(raw)}
             if env:
                 brain["api_key_env"] = env
             raw["brain"] = brain

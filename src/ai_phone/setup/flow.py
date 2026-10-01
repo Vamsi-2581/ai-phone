@@ -333,7 +333,7 @@ def brain_subscription(ui, actions, session: Session, cur, kind: str) -> None:
             continue
         waiting = Page(BRAIN, f"Your {plan.name} subscription")
         try:
-            probe = busy(ui, session, waiting, f"Checking your {plan.name} login…", lambda: actions.test_subscription(kind))
+            busy(ui, session, waiting, f"Checking your {plan.name} login…", lambda: actions.test_subscription(kind))
             # Claude Code's models are three names it always takes; a ChatGPT plan is asked which ones it allows
             choices = (busy(ui, session, waiting, f"Asking which models your {plan.name} plan allows…",
                             lambda: actions.brain_models(kind)) if kind == "chatgpt" else actions.brain_models(kind))

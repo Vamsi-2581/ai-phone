@@ -185,12 +185,16 @@ class PrepareProbeLLM(FakeLLM):
 
     def __init__(self, fail: str | None = None):
         super().__init__()
-        self.fail, self.prepared = fail, None
+        self.fail, self.prepared, self.closed = fail, None, 0
 
     def prepare(self, system_prompt):
         if self.fail:
             raise BrainError(self.fail)
         self.prepared = system_prompt
+
+    def close(self):
+        self.closed += 1
+        self.prepared = None
 
     def stream(self, gen_id, messages, max_tokens):
         yield f"prepared with {self.prepared!r}"
@@ -282,3 +286,29 @@ async def test_a_subscription_brain_through_the_real_worker(tmp_path, monkeypatc
     assert [r["event"] for r in log] == ["start", "turn", "start", "turn"]  # the probe's session, then the call's
     assert [r["text"] for r in log if r["event"] == "turn"] == ["Say OK.", "Hi"]
     assert log[-1]["system"] == "This call: take a message."  # prepare's session is the one the turn used
+
+
+@pytest.mark.asyncio
+async def test_llm_release_ends_the_session_the_call_was_using():
+    """The call is over: a brain that holds a CLI session lets it go, so no process of ours idles between calls."""
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", PROBE, loop, None, None, {"system_prompt": "warm"})
+    await c.start()
+    c.send({"op": "llm.prepare", "gen": c.current_gen, "system_prompt": "This call: take a message."})
+    assert await _generate(c) == "prepared with 'This call: take a message.'"
+    c.cancel(c.current_gen)  # exactly what the daemon does as a call ends, before it releases
+    c.send({"op": "llm.release", "gen": c.current_gen})
+    assert await _generate(c) == "prepared with None"  # released, and the worker still serves the next call
+    c.send({"op": "llm.prepare", "gen": c.current_gen, "system_prompt": "Next call."})
+    assert await _generate(c) == "prepared with 'Next call.'"
+    await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_llm_release_is_nothing_to_a_brain_with_no_session():
+    loop = asyncio.get_running_loop()
+    c = WorkerClient("llm", "ai_phone.services.backends.fake:FakeLLM", loop, None, None, {})
+    await c.start()
+    c.send({"op": "llm.release", "gen": c.current_gen})
+    assert await _generate(c) == "Hello, this is a fake reply."
+    await c.stop()

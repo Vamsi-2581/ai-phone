@@ -3,6 +3,7 @@ daemon process and a mock HTTP transport. Nothing here touches the network, play
 from __future__ import annotations
 
 import json
+import logging
 import signal
 import stat
 import subprocess
@@ -120,7 +121,9 @@ def test_save_brain_local_writes_its_section_and_keeps_the_others(home):
     a = make(home, "inbound: {greeting: Hi}\nmodels: {keep_warm_sec: 10}\n"
                    "brain: {kind: openai_compatible, base_url: 'https://api.example.com/v1', model: q, connect_timeout_ms: 900}\n")
     a.save_brain_local("t9")
-    assert raw(home) == {"inbound": {"greeting": "Hi"}, "models": {"keep_warm_sec": 10, "tier": "t9"}, "brain": {"kind": "local"}}
+    # the endpoint's own keys go; a timeout the person set by hand is theirs and stays, whichever brain they pick
+    assert raw(home) == {"inbound": {"greeting": "Hi"}, "models": {"keep_warm_sec": 10, "tier": "t9"},
+                         "brain": {"kind": "local", "connect_timeout_ms": 900}}
     assert stat.S_IMODE((home / "config.yaml").stat().st_mode) == 0o600
     assert load_config(home / "config.yaml").models.tier == "t9"
 
@@ -994,9 +997,11 @@ def test_a_plan_that_lists_no_models_is_said_so(home, fake_cli):
 
 def test_save_brain_subscription_writes_the_kind_and_the_model(home):
     a = make(home, "brain: {kind: openai_compatible, base_url: 'https://api.example.com/v1', model: qwen, "
-                   "api_key_env: BRAIN_TOKEN_KEY, cli: /opt/homebrew/bin/claude}\n")
+                   "api_key_env: BRAIN_TOKEN_KEY, cli: /opt/homebrew/bin/claude, first_token_timeout_ms: 20000}\n")
     a.save_brain_subscription("claude", "sonnet")
-    assert raw(home)["brain"] == {"kind": "claude", "model": "sonnet", "cli": "/opt/homebrew/bin/claude"}
+    # the endpoint's url and key variable go with it; the path to the CLI and a deadline the person chose stay
+    assert raw(home)["brain"] == {"kind": "claude", "model": "sonnet", "cli": "/opt/homebrew/bin/claude",
+                                  "first_token_timeout_ms": 20000}
     assert load_config(home / "config.yaml").brain.kind == "claude"
     cur = a.current()
     assert cur.brain_kind == "claude" and cur.model == "sonnet" and cur.brain_cli == "/opt/homebrew/bin/claude"
@@ -1007,3 +1012,16 @@ def test_save_brain_subscription_writes_the_kind_and_the_model(home):
 def test_a_subscription_brain_needs_no_model_of_its_own(home):
     a = make(home, "brain: {kind: chatgpt, model: gpt-5.6-luna}\n")
     assert a.machine().models_missing == [models.STT, models.TTS]  # speech and voice only: the brain is not here
+
+
+def test_a_failure_nobody_has_guidance_for_keeps_the_cli_s_own_words_off_the_page(home, fake_cli, caplog):
+    """Whatever a provider says — a rate limit, an org policy, an incident — is unbounded third-party prose; the
+    person gets a sentence and the kind, and the detail goes to the log."""
+    said = "Overloaded: policy 1234 says this ORGANISATION may not do that"
+    exe = fake_cli("claude", [{"deltas": [], "fail": said}])
+    a = make(home, f"brain: {{kind: claude, cli: {exe}}}\n")
+    with caplog.at_level(logging.DEBUG, logger="ai-phone.setup"):
+        with pytest.raises(ActionError) as e:
+            a.test_subscription("claude")
+    assert str(e.value) == "claude could not answer (failed). Try again, or pick another brain."
+    assert said not in str(e.value) and "policy 1234" in caplog.text  # the detail is kept, out of sight
