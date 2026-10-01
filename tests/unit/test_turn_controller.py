@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from ai_phone.config import ConversationConfig
+from ai_phone.pipeline.timing import TurnTimer
 from ai_phone.pipeline.turn import TurnController
 from ai_phone.pipeline.vad import Endpointer, EnergyVad
 from ai_phone.services.client import WorkerClient
@@ -344,3 +345,63 @@ def test_real_media_port_clears_the_flag_only_after_flushing():
     from ai_phone.telephony import media_port
     src = inspect.getsource(media_port.RingMediaPort.onFrameRequested)
     assert src.index("self.tx.flush()") < src.index("self._flush_requested = False")
+
+
+@pytest.mark.asyncio
+async def test_a_turn_cut_short_by_the_end_of_the_call_keeps_what_was_said():
+    """The daemon writes the turn that was still running when the call ended; it must carry the agent's words and the
+    ring counters, like every other end-of-turn path."""
+    loop = asyncio.get_running_loop()
+    tc, port, turns, rings, clients = await make_stack(loop, greeting=[b"\x10\x00" * 320] * 10)
+    rx, tx = rings[0], rings[1]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await _drain_tx(tx, port, 0.5)                 # the greeting plays
+        for f in speech_frames(0.6):                   # the caller speaks, then stops
+            rx.push(f)
+            await asyncio.sleep(0.02)
+        for _ in range(25):
+            rx.push(SILENCE)
+            await asyncio.sleep(0.02)
+        for _ in range(100):                           # stop as soon as the agent is talking
+            if tc.state == "SPEAKING" and tc._reply_parts:
+                break
+            await asyncio.sleep(0.02)
+        assert tc.state == "SPEAKING" and tc.timer is not None, "the agent never started speaking"
+        record = tc.incomplete_record("7", 0)
+        assert record["reply_text"] and record["reply_text"] in "Hello, this is a fake reply."
+        assert record["rx_overruns"] == rx.overruns and record["tx_underruns"] == tx.underruns
+        assert record["call_id"] == "7" and record["turn"] == 0
+    finally:
+        await teardown(stop, runner, rings, clients)
+
+
+@pytest.mark.asyncio
+async def test_t4_comes_from_the_frames_not_from_the_event_that_announces_them():
+    """The TTS worker pushes its frames before it sends `chunk`, so the port can stamp t5 before that event is
+    drained. t4 is taken from the frames, which keeps t5 >= t4 (and egress_ms positive) whoever wins the race."""
+    loop = asyncio.get_running_loop()
+    tc, port, turns, rings, clients = await make_stack(loop)
+    tts_out = rings[3]
+    try:
+        gen = tc.tts.current_gen
+        tc.timer = TurnTimer(gen=gen, t0=time.monotonic_ns(), t3=time.monotonic_ns())
+        tc.state = "SPEAKING"
+        tts_out.push(tag_frame(gen, b"\x10\x00" * 320))
+        tc._pump_tts_out()
+        assert tc.timer.t4 is not None and tc.timer.t4 >= tc.timer.t3
+        frames = tc.timer.t4
+        tc._on_event({"ev": "chunk", "kind": "tts", "gen": gen, "seq": 0, "nframes": 1})
+        assert tc.timer.t4 == frames, "the announcement moved t4 later than the frames it announced"
+        t5 = time.monotonic_ns()
+        port.armed, port.first_nonsilent_ns = 1, t5
+        tc._pump_tts_out()
+        assert tc.timer.t5 == t5 and tc.timer.t5 >= tc.timer.t4
+        assert tc.timer.to_record("7", 0)["egress_ms"] >= 0
+    finally:
+        tc.timer = None  # the controller was never run here, so there is no runner to stop
+        await asyncio.gather(*(c.stop() for c in clients))
+        for r in rings:
+            r.close()
+            r.unlink()

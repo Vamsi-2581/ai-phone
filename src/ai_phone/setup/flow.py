@@ -819,9 +819,15 @@ AI_COMMANDS = (('uv run ai-phone call +15550100000 --prompt "…" --json', "ai-p
                ("uv run ai-phone hangup", "end the call"))
 
 
+def saved_files() -> str:
+    """What is actually in there: secrets.env is named only when there is one (nothing was typed in that needs it)."""
+    return ("config.yaml and secrets.env (keys and passwords, private to you)"
+            if paths.secrets_path().exists() else "config.yaml")
+
+
 def done_text(actions, session: Session) -> str:
     cur = actions.current()
-    out = [f"Saved in {home_dir()}/   config.yaml and secrets.env (keys and passwords, private to you)", ""]
+    out = [f"Saved in {home_dir()}/   {saved_files()}", ""]
     rows = [(line_id, ln.get("number") or ln.get("aor") or "", line_kind(ln) + calls_out(ln)) for line_id, ln in cur.lines.items()]
     if rows:
         a, b = (max(len(r[i]) for r in rows) for i in (0, 1))
@@ -865,9 +871,10 @@ def provider_of(ln: dict) -> dict:
 
 
 def calls_out(ln: dict) -> str:
-    """A verified caller id the agent uses instead of the line's own number."""
+    """A verified caller id the agent uses instead of the line's own number. A sip line's caller id is its own
+    address, which is no news to anyone."""
     caller = ln.get("caller_id")
-    return f" · calls out as {caller}" if caller and caller != ln.get("number") else ""
+    return f" · calls out as {caller}" if caller and caller not in (ln.get("number"), ln.get("aor")) else ""
 
 
 def line_kind(ln: dict) -> str:

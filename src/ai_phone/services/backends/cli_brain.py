@@ -119,7 +119,6 @@ class CliBrain:
     """
 
     cli_name = ""      # the executable to look for on PATH
-    provider = ""      # who the words reach, for the daemon's start-up warning
 
     def __init__(self, model: str, cli: str | None = None, first_token_timeout_ms: int = 12000,
                  stream_idle_timeout_ms: int = 4000, max_response_chars: int = 2000):
@@ -166,7 +165,7 @@ class CliBrain:
         stream_idle_timeout_ms."""
         system, prior, newest = _split(messages)
         proc = None
-        t0, t_first, n, said, done = time.monotonic_ns(), None, 0, [], False
+        t0, t_first, n, chars, said, done = time.monotonic_ns(), None, 0, 0, [], False
         try:
             if gen_id in self._cancelled:
                 return  # cancelled before it began: never spend a turn of the person's plan on it
@@ -188,11 +187,11 @@ class CliBrain:
                     continue
                 if t_first is None:
                     t_first = time.monotonic_ns()
-                n += 1
+                n, chars = n + 1, chars + len(value)
                 said.append(value)
                 deadline = time.monotonic() + self.idle_s
                 yield value
-                if sum(len(s) for s in said) >= self.max_chars:
+                if chars >= self.max_chars:
                     log.info("%s brain: the reply passed %d characters; ending the turn", self.cli_name, self.max_chars)
                     return
         finally:
@@ -219,7 +218,7 @@ class CliBrain:
         try:
             if p.stdin is not None:
                 p.stdin.close()
-        except OSError:
+        except (OSError, ValueError):
             pass
         try:
             p.wait(timeout=CLOSE_SEC)
@@ -233,7 +232,7 @@ class CliBrain:
             try:
                 if pipe is not None:
                     pipe.close()
-            except OSError:
+            except (OSError, ValueError):
                 pass
 
     # ---- sessions --------------------------------------------------------------------------------
@@ -381,7 +380,6 @@ class ClaudeCodeLLM(CliBrain):
     """
 
     cli_name = "claude"
-    provider = "Anthropic"
 
     def _args(self, system_prompt: str) -> list[str]:
         return ["-p", "--verbose", "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config",
@@ -426,7 +424,6 @@ class CodexLLM(CliBrain):
     """
 
     cli_name = "codex"
-    provider = "OpenAI"
 
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)

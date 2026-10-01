@@ -646,6 +646,11 @@ class TurnController:
             g, payload = untag_frame(f)
             if g != cur:
                 continue  # audio from a cancelled generation is dropped here, whatever its timing
+            if self.timer is not None and self.timer.t4 is None:
+                # the frames are available the moment they are here. The worker pushes them before it sends `chunk`,
+                # so the port can stamp t5 before that event is drained; taking t4 from the event made egress_ms
+                # negative (and t5 < t4) whenever the pump won that race.
+                self.timer.t4 = time.monotonic_ns()
             if self.state in OPENING:
                 self._held.append(payload)  # the model's opening waits for the disclosure to finish
             else:
@@ -654,6 +659,14 @@ class TurnController:
         if (self.timer is not None and self.timer.t5 is None and self.timer.t3 is not None
                 and self.port.first_nonsilent_ns and self.port.first_nonsilent_ns >= self.timer.t3):
             self.timer.t5 = self.port.first_nonsilent_ns
+
+    def incomplete_record(self, call_id: str, turn: int) -> dict:
+        """The turn that was still running when the call ended, recorded the way every finished one is: what the agent
+        had already said, and the ring counters. A call that ends mid-sentence must not lose the reply."""
+        t = self.timer
+        t.reply_text = _without_marker("".join(self._reply_parts)).strip()
+        t.rx_overruns, t.tx_underruns = self.rx.overruns, self.tx.underruns
+        return t.to_record(call_id, turn)
 
     def _finish_turn(self) -> None:
         t = self.timer

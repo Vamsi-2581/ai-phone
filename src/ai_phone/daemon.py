@@ -718,7 +718,7 @@ class Daemon:
                 for c in (stt, llm, tts):
                     c.cancel(c.current_gen)
                 if tc.timer is not None and tc.timer.t0 is not None:
-                    r = tc.timer.to_record(str(call_id), n[0])
+                    r = tc.incomplete_record(str(call_id), n[0])  # keeps what the agent had said, and the counters
                     r.update(incomplete=True, state_at_end=tc.state, line_id=line_id, call=rec.id, mode=rec.mode)
                     turn_log.write(r)
                 ended_by = self._ended_by(tc.end_reason, remote_ended)

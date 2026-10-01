@@ -395,6 +395,25 @@ class FakeTC:
         await stop.wait()
 
 
+class SpeakingTC(FakeTC):
+    """A controller that is still speaking when the call ends: the turn has started and has no record yet."""
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.recorded: list[tuple] = []
+
+    async def run(self, stop):
+        self.timer, self.state = FakeTimer(), "SPEAKING"
+        self.timer.t0 = 1
+        self.end_reason = "agent"
+        self.hangup_requested.set()
+        await stop.wait()
+
+    def incomplete_record(self, call_id, n):
+        self.recorded.append((call_id, n))
+        return {"call_id": call_id, "turn": n, "reply_text": "Half a sen", "rx_overruns": 0, "tx_underruns": 2}
+
+
 class Worker:
     current_gen = 1
 
@@ -824,3 +843,23 @@ def test_the_llm_worker_runs_the_model_the_tier_names(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         asyncio.run(Daemon(Config(), "gemma12b", tmp_path, lan=True, fake=True).run())
     assert ("llm", "ai_phone.services.backends.fake:FakeLLM", None) in made  # the fake brain ignores the tier
+
+
+@pytest.mark.asyncio
+async def test_a_turn_still_speaking_when_the_call_ends_is_written_with_what_was_said(tmp_path, monkeypatch):
+    """The teardown record goes through the controller, so it carries the agent's words and the ring counters; it
+    used to be taken straight off the timer, and a call that ended mid-sentence lost the reply."""
+    from ai_phone import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "TurnController", SpeakingTC)
+    d, tel = daemon(tmp_path, monkeypatch), CallTel()
+    rec = d.calls.new("agent", "out", "agents", "sip:x@127.0.0.1", "Book a table for two.")
+    rec.pj_call_id = 7
+    c = run_ctx(tel)
+    await asyncio.wait_for(d._run_call(rec, c), 2)
+    tc = SpeakingTC.last
+    assert tc.recorded == [("7", 0)], "the record did not go through the controller"
+    row = c["turn_log"].rows[-1]
+    assert row["reply_text"] == "Half a sen" and row["tx_underruns"] == 2
+    assert row["incomplete"] is True and row["state_at_end"] == "SPEAKING"
+    assert row["call"] == rec.id and row["line_id"] == "agents" and row["mode"] == "agent"

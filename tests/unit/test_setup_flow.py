@@ -1558,8 +1558,11 @@ def test_check_shows_a_skipped_row_without_the_sip_library():
         Check("Lines", "skipped · SIP library not built · run ./scripts/install.sh", None)
 
 
-def test_done_text_fits_the_page(monkeypatch):
+def test_done_text_fits_the_page(monkeypatch, tmp_path):
     monkeypatch.delenv("AI_PHONE_HOME", raising=False)
+    secrets = tmp_path / "secrets.env"   # this run saved a key, so the page names the file it is in
+    secrets.write_text("")
+    monkeypatch.setattr(flow.paths, "secrets_path", lambda: secrets)
     lines = {"agent": SIP_LINE, "twilio": NUMBER_LINE, "office": {"kind": "trunk", "number": "+15550100002"},
              "telnyx": {"kind": "trunk", "number": "+15550100003", "provider": {"name": "telnyx", "state": "pending"}},
              "desk": {"kind": "sip", "user": "desk", "aor": "sip:desk@192.0.2.10"},
@@ -1594,6 +1597,26 @@ def test_done_text_fits_the_page(monkeypatch):
         "  uv run ai-phone hangup                                  end the call",
     ]
     assert max(len(ln) for ln in text.splitlines() if not ln.startswith("Give your AI the phone")) <= 88
+
+
+def test_the_done_page_names_secrets_env_only_when_there_is_one(monkeypatch, tmp_path):
+    monkeypatch.setattr(flow.paths, "secrets_path", lambda: tmp_path / "secrets.env")
+    first = flow.done_text(FakeActions(exists=True), flow.Session()).splitlines()[0]
+    assert first.endswith("config.yaml") and "secrets.env" not in first
+    (tmp_path / "secrets.env").write_text("TWILIO_AUTH_TOKEN=x\n")
+    first = flow.done_text(FakeActions(exists=True), flow.Session()).splitlines()[0]
+    assert first.endswith("config.yaml and secrets.env (keys and passwords, private to you)")
+
+
+def test_a_sip_address_does_not_say_it_calls_out_as_itself(monkeypatch, tmp_path):
+    monkeypatch.setattr(flow.paths, "secrets_path", lambda: tmp_path / "secrets.env")
+    aor = "sip:agent@192.0.2.10"
+    lines = {"agent": {**SIP_LINE, "caller_id": aor},
+             "twilio": {**NUMBER_LINE, "caller_id": "+15550100009"}}
+    rows = [ln for ln in flow.done_text(FakeActions(exists=True, lines=lines), flow.Session()).splitlines()
+            if "SIP address" in ln or "Twilio number" in ln]
+    assert rows[0].endswith("SIP address"), rows[0]
+    assert rows[1].endswith("Twilio number · calls out as +15550100009")  # a verified number is worth saying
 
 
 def test_done_text_with_one_kind_of_line():
