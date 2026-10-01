@@ -999,12 +999,12 @@ def test_save_brain_subscription_writes_the_kind_and_the_model(home):
     a = make(home, "brain: {kind: openai_compatible, base_url: 'https://api.example.com/v1', model: qwen, "
                    "api_key_env: BRAIN_TOKEN_KEY, cli: /opt/homebrew/bin/claude, first_token_timeout_ms: 20000}\n")
     a.save_brain_subscription("claude", "sonnet")
-    # the endpoint's url and key variable go with it; the path to the CLI and a deadline the person chose stay
-    assert raw(home)["brain"] == {"kind": "claude", "model": "sonnet", "cli": "/opt/homebrew/bin/claude",
-                                  "first_token_timeout_ms": 20000}
+    # the endpoint's url and key variable go with it, and so does a cli path set while it was the brain (it belongs to
+    # the kind it was set for); a deadline the person chose is theirs whichever brain they pick
+    assert raw(home)["brain"] == {"kind": "claude", "model": "sonnet", "first_token_timeout_ms": 20000}
     assert load_config(home / "config.yaml").brain.kind == "claude"
     cur = a.current()
-    assert cur.brain_kind == "claude" and cur.model == "sonnet" and cur.brain_cli == "/opt/homebrew/bin/claude"
+    assert cur.brain_kind == "claude" and cur.model == "sonnet" and cur.brain_cli is None
     a.save_brain_subscription("chatgpt", "gpt-5.6-luna")
     assert raw(home)["brain"]["kind"] == "chatgpt" and raw(home)["brain"]["model"] == "gpt-5.6-luna"
 
@@ -1025,3 +1025,22 @@ def test_a_failure_nobody_has_guidance_for_keeps_the_cli_s_own_words_off_the_pag
             a.test_subscription("claude")
     assert str(e.value) == "claude could not answer (failed). Try again, or pick another brain."
     assert said not in str(e.value) and "policy 1234" in caplog.text  # the detail is kept, out of sight
+
+
+def test_a_path_set_for_one_plans_cli_is_never_used_for_the_other(home, fake_cli):
+    """`brain.cli` belongs to the kind it was set for: the Claude Code binary driven as `codex app-server` would fail
+    with nothing the person could act on."""
+    exe = fake_cli("claude")
+    a = make(home, f"brain: {{kind: claude, cli: {exe}}}\n")
+    assert a._cli_path("claude") == exe and a.cli_installed("claude") is True
+    assert a._cli_path("chatgpt") is None, "the Claude Code path would have been run as Codex"
+
+
+def test_choosing_the_other_plan_drops_the_path_to_the_first_ones_cli(home):
+    a = make(home, "brain: {kind: claude, cli: /opt/homebrew/bin/claude, first_token_timeout_ms: 20000}\n")
+    a.save_brain_subscription("claude", "sonnet")
+    assert raw(home)["brain"]["cli"] == "/opt/homebrew/bin/claude"  # same plan: the path is still theirs
+    a.save_brain_subscription("chatgpt", "gpt-5.6-luna")
+    assert "cli" not in raw(home)["brain"], "a path to Claude Code was left behind to run Codex"
+    assert raw(home)["brain"] == {"kind": "chatgpt", "model": "gpt-5.6-luna", "first_token_timeout_ms": 20000}
+    assert a._cli_path("chatgpt") is None

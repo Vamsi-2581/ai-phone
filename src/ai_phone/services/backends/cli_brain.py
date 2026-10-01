@@ -235,25 +235,32 @@ class CliBrain:
     def cancel(self, gen_id: int) -> None:
         self._cancelled.add(gen_id)
 
-    def close(self) -> None:
-        """End the session. The CLI exits when its stdin closes; one that does not is killed."""
+    def close(self, hard: bool = False) -> None:
+        """End the session. The CLI exits when its stdin closes; one that does not is killed.
+
+        `hard` skips the asking: a CLI that is still generating will not exit on EOF, and a session we have already
+        given up on must not cost the caller the wait as well as the drain.
+        """
         p, self._proc, self._q, self._system = self._proc, None, None, None
         self._seen, self._in_flight = [], False
         if p is None:
             return
-        try:
-            if p.stdin is not None:
-                p.stdin.close()
-        except (OSError, ValueError):
-            pass
-        try:
-            p.wait(timeout=CLOSE_SEC)
-        except subprocess.TimeoutExpired:
+        if hard:
             _kill_group(p)
+        else:
+            try:
+                if p.stdin is not None:
+                    p.stdin.close()
+            except (OSError, ValueError):
+                pass
             try:
                 p.wait(timeout=CLOSE_SEC)
             except subprocess.TimeoutExpired:
-                pass
+                _kill_group(p)
+        try:
+            p.wait(timeout=CLOSE_SEC)  # a killed process is reaped at once; this is only so none is left a zombie
+        except subprocess.TimeoutExpired:
+            pass
         for pipe in (p.stdout, p.stderr):  # the pump threads see the end of their stream and stop
             try:
                 if pipe is not None:
@@ -263,14 +270,20 @@ class CliBrain:
 
     # ---- sessions --------------------------------------------------------------------------------
     def _begin(self, system: str, prior: list[Message], newest: Message) -> None:
-        if self._alive() and system == self._system and self._continues(prior) and self._settle():
+        theirs = self._alive() and system == self._system and self._continues(prior)
+        if theirs and self._settle():
             self._send(str(newest.get("content") or ""))
             self._seen.append(dict(newest))
             return
-        self.close()
+        # A session we gave up on mid-turn is killed outright: its drain budget is already spent, and the polite
+        # close (stdin, then wait) would come straight out of the time this turn has to answer.
+        self.close(hard=self._in_flight)
         self._start(system)
         self._send(str(newest.get("content") or ""))
-        self._seen = [dict(newest)]
+        # The new session has heard only this message. Anchoring to what the controller shows keeps the rest of the
+        # call in one session: without it every later turn's history is longer than what we sent, so every later turn
+        # would start again and the agent would forget each sentence as it answered the next.
+        self._seen = [*(dict(m) for m in prior), dict(newest)]
 
     def _continues(self, prior: list[Message]) -> bool:
         """Is this the next turn of the conversation this session has had? The controller keeps only the last few
@@ -288,7 +301,8 @@ class CliBrain:
 
         The wait is bounded by `drain_timeout_ms`, a slice of the caller's own patience: whatever is spent here comes
         out of the time this turn has to answer before the controller apologises, so a turn that will not finish in
-        that slice loses its session (about a second to start a new one) instead of the caller losing the call.
+        that slice loses its session (about a second to start a new one) instead of the caller losing the call. That
+        is the whole cost: a session dropped here is killed outright, not asked to leave (see `close`).
         """
         if not self._in_flight:
             return True

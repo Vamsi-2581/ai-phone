@@ -106,10 +106,16 @@ def _section(raw: dict, name: str) -> dict:
 BRAIN_KIND_KEYS = ("kind", "base_url", "model", "api_key_env")  # what choosing a brain sets; the rest is the person's
 
 
-def _kept_brain(raw: dict) -> dict:
+def _kept_brain(raw: dict, kind: str) -> dict:
     """The brain settings that are the person's own — the timeouts, a hand-set path to a CLI — kept through a change of
-    brain, because `config.example.yaml` promises that a number they set themselves is the one used."""
-    return {k: v for k, v in _section(raw, "brain").items() if k not in BRAIN_KIND_KEYS}
+    brain, because `config.example.yaml` promises that a number they set themselves is the one used.
+
+    `cli` belongs to the kind it was set for: a path to Claude Code left behind would be run as Codex, so it goes
+    when the kind changes.
+    """
+    brain = _section(raw, "brain")
+    drop = set(BRAIN_KIND_KEYS) if brain.get("kind") == kind else {*BRAIN_KIND_KEYS, "cli"}
+    return {k: v for k, v in brain.items() if k not in drop}
 
 
 def _saved() -> dict[str, str]:
@@ -184,7 +190,7 @@ class Actions:
 
     def save_brain_local(self, tier: str) -> None:
         def change(raw: dict) -> None:
-            raw["brain"] = {"kind": "local", **_kept_brain(raw)}
+            raw["brain"] = {"kind": "local", **_kept_brain(raw, "local")}
             raw["models"] = {**_section(raw, "models"), "tier": tier}
         self._edit(change)
 
@@ -233,10 +239,16 @@ class Actions:
 
     def cli_installed(self, kind: str) -> bool:
         """Is the CLI this plan is reached through on PATH (or where the config says it is)?"""
-        return shutil.which(self.current().brain_cli or BRAINS[kind].cli_name) is not None
+        return shutil.which(self._cli_path(kind) or BRAINS[kind].cli_name) is not None
+
+    def _cli_path(self, kind: str) -> str | None:
+        """Where the config says this plan's CLI is — only while the config is that plan. A path set for Claude Code
+        is no use for running Codex, and it outlives a change of kind in a hand-written config."""
+        cur = self.current()
+        return cur.brain_cli if cur.brain_kind == kind else None
 
     def _brain(self, kind: str, model: str):
-        return BRAINS[kind](model=model, cli=self.current().brain_cli, first_token_timeout_ms=PROBE_MS,
+        return BRAINS[kind](model=model, cli=self._cli_path(kind), first_token_timeout_ms=PROBE_MS,
                             stream_idle_timeout_ms=PROBE_MS)
 
     def _brain_model(self, kind: str) -> str:
@@ -286,7 +298,7 @@ class Actions:
         if kind == "claude":
             return list(CLAUDE_MODELS)
         try:
-            found = codex_models(cli=self.current().brain_cli)
+            found = codex_models(cli=self._cli_path(kind))
         except BrainError as e:
             raise self._brain_trouble(kind, e) from None
         if not found:
@@ -296,7 +308,7 @@ class Actions:
 
     def save_brain_subscription(self, kind: str, model: str) -> None:
         def change(raw: dict) -> None:
-            raw["brain"] = {"kind": kind, "model": model, **_kept_brain(raw)}
+            raw["brain"] = {"kind": kind, "model": model, **_kept_brain(raw, kind)}
         self._edit(change)
 
     def save_brain_endpoint(self, url: str, model: str, key: str | None) -> None:
@@ -304,7 +316,8 @@ class Actions:
         previous = _saved().get(BRAIN_KEY_ENV)
 
         def change(raw: dict) -> None:
-            brain = {"kind": "openai_compatible", "base_url": url, "model": model, **_kept_brain(raw)}
+            brain = {"kind": "openai_compatible", "base_url": url, "model": model,
+                     **_kept_brain(raw, "openai_compatible")}
             if env:
                 brain["api_key_env"] = env
             raw["brain"] = brain

@@ -416,6 +416,41 @@ def test_a_turn_that_will_not_finish_in_the_drain_budget_loses_its_session(cli):
     assert len(cli.events("start")) == 2, "the session that was still talking was kept"
 
 
+def test_the_rest_of_the_call_stays_in_the_session_the_restart_made(cli):
+    """A barge-in on a slow model costs the session. It must not cost one per turn after that: the new session is
+    anchored to what the controller shows, so the turns that follow are continuations of it."""
+    cli.script("claude", [{"deltas": ["One", " more", " word."], "gap_ms": 400}, {"deltas": ["Two."]},
+                          {"deltas": ["Three."]}])
+    brain = claude_brain(cli, drain_timeout_ms=100)
+    try:
+        for _ in brain.stream(1, talk("First"), 120):
+            brain.cancel(1)
+        assert "".join(brain.stream(2, talk("First", "One", "Second"), 120)) == "Two."
+        # the third turn's history is longer than the two messages the new session was given; it is still its turn
+        assert "".join(brain.stream(3, talk("First", "One", "Second", "Two.", "Third"), 120)) == "Three."
+    finally:
+        brain.close()
+    assert len(cli.events("start")) == 2, "a session per turn for the rest of the call"
+    assert [r["text"] for r in cli.events("turn")] == ["First", "Second", "Third"]
+
+
+def test_a_session_given_up_on_is_killed_rather_than_asked_to_leave(cli):
+    """The drain budget is the whole cost: a CLI that is still generating will not exit when its stdin closes, and
+    waiting CLOSE_SEC for it would come out of the time this turn has to answer."""
+    cli.script("claude", [{"deltas": ["One"] + [" on"] * 30, "gap_ms": 300}, {"deltas": ["Two."]}])
+    brain = claude_brain(cli, drain_timeout_ms=200)
+    try:
+        for _ in brain.stream(1, talk("First"), 120):
+            brain.cancel(1)
+        start = time.monotonic()
+        assert "".join(brain.stream(2, talk("First", "One", "Second"), 120)) == "Two."
+        took = time.monotonic() - start
+    finally:
+        brain.close()
+    # the budget (0.2 s) plus a fake CLI's start; a polite close would have added CLOSE_SEC (2 s) on its own
+    assert took < 1.5, f"the turn took {took:.1f} s: the lost session was waited on"
+
+
 def test_the_drain_budget_is_the_daemon_s_to_set(cli):
     assert claude_brain(cli, drain_timeout_ms=3500).drain_s == 3.5
     assert CodexLLM(model="m").drain_s == 2.0  # the backend's own default, for anything that does not pass one
