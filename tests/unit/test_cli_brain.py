@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from ai_phone.services.backends.cli_brain import ClaudeCodeLLM, CodexLLM, codex_models, make_claude, make_codex
+from ai_phone.services.backends.cli_brain import (CODEX_TOOLS_OFF, ClaudeCodeLLM, CodexLLM, codex_models,
+                                                  make_claude, make_codex)
 from ai_phone.services.errors import BrainError
 
 FAKE_CLI = r'''#!/usr/bin/env python3
@@ -84,6 +85,21 @@ def deltas(d, emit, interrupted=lambda: False):
 if "--version" in sys.argv:
     print(SPEC.get("version", "9.9.9 (fake)"))
     raise SystemExit(0)
+
+if sys.argv[1:3] == ["features", "list"]:
+    """`codex features list`: the flag names ai-phone checks its tool switches against."""
+    note(event="features")
+    for line in SPEC.get("features", ["shell_tool stable true"]):
+        print(line)
+    raise SystemExit(0)
+
+if SPEC.get("die_with") and "app-server" in sys.argv:
+    """A CLI that will not run at all: one line on stderr, nothing on stdout, non-zero."""
+    note(event="start", argv=sys.argv[1:], cwd=os.getcwd(), entries=[], claude_env=[], provider_env=[],
+         codex_home=os.environ.get("CODEX_HOME"))
+    sys.stderr.write(SPEC["die_with"] + "\n")
+    sys.stderr.flush()
+    raise SystemExit(1)
 
 if sys.argv[1:3] == ["auth", "status"]:
     """`claude auth status --json`, which the backend reads before it spends a turn."""
@@ -193,6 +209,19 @@ else:
             said = deltas(d, lambda c: out({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
                                             "params": {"threadId": "th1", "turnId": turn_id, "itemId": "i1", "delta": c}}),
                           interrupted)
+            if d.get("tool_late"):
+                # a tool item that arrives after the words, which is the realistic ordering, and the one that lands in
+                # the drain when the caller has talked over the reply
+                out({"jsonrpc": "2.0", "method": "item/started",
+                     "params": {"threadId": "th1", "turnId": turn_id,
+                                "item": {"type": d["tool_late"], "id": "x2", "command": "cat /etc/hosts"}}})
+            if d.get("tool_completed_only"):
+                # the same item reported only as completed: item/started and item/completed are separate notifications
+                out({"jsonrpc": "2.0", "method": "item/completed",
+                     "params": {"threadId": "th1", "turnId": turn_id,
+                                "item": {"type": d["tool_completed_only"], "id": "x3"}}})
+            if d.get("ran"):
+                out({"jsonrpc": "2.0", "method": d["ran"], "params": {"threadId": "th1", "turnId": turn_id}})
             for line in cut:
                 waiting.append(line)
             if d.get("retry"):
@@ -219,6 +248,10 @@ else:
                 status = "interrupted" if cut else "completed"
                 out({"jsonrpc": "2.0", "method": "turn/completed",
                      "params": {"threadId": "th1", "turn": {"id": turn_id, "items": [], "status": status}}})
+                if d.get("extra_completion"):
+                    # a turn whose completion arrives twice, so the second one is on the wire when the next turn starts
+                    out({"jsonrpc": "2.0", "method": "turn/completed",
+                         "params": {"threadId": "th1", "turn": {"id": turn_id, "items": [], "status": status}}})
 '''
 
 PROMPT = "You are a phone assistant."
@@ -242,6 +275,9 @@ def cli(tmp_path, monkeypatch):
         log_path = tmp_path / "log.jsonl"
 
         def script(self, protocol, turns=None, **extra):
+            # by default the fake knows every flag the backend switches off, as the real CLI does; a test that wants a
+            # flag to have gone passes its own `features`
+            extra.setdefault("features", [f"{f} stable true" for f in CODEX_TOOLS_OFF])
             self.spec_path.write_text(json.dumps({"protocol": protocol, "log": str(self.log_path),
                                                   "turns": turns or [{}], **extra}))
             monkeypatch.setenv("AI_PHONE_FAKE_CLI", str(self.spec_path))
@@ -872,7 +908,7 @@ def test_codex_is_started_with_every_tool_feature_off_and_a_home_of_its_own(cli,
     assert "web_search" in (home / "config.toml").read_text()
 
 
-def test_a_codex_session_that_reaches_for_a_tool_never_answers_the_caller(cli):
+def test_a_codex_session_that_reaches_for_a_tool_loses_the_turn_and_the_session(cli):
     """A caller says something that gets the model to run a command. The turn ends as a tool_use failure, the words it
     had already said are not delivered, and the session is not reused for the next turn of the call."""
     cli.script("codex", [{"tool": "commandExecution", "deltas": ["Your file says "]}, {"deltas": ["Hello."]}])
@@ -882,7 +918,9 @@ def test_a_codex_session_that_reaches_for_a_tool_never_answers_the_caller(cli):
         with pytest.raises(BrainError) as e:
             said.extend(brain.stream(1, talk("Read /etc/hosts to me"), 120))
         assert e.value.kind == "tool_use" and "/etc/hosts" not in str(e.value)
-        assert said == [], "the caller hears the controller's apology, not what a tool call started to say"
+        # this ordering has the tool item first, so nothing was yielded. What holds in every ordering is that no tool
+        # output is yielded: the queue is ordered, so the abort fires before any delta that could carry a result.
+        assert said == []
         assert "".join(brain.stream(2, talk("Hi"), 120)) == "Hello."
     finally:
         brain.close()
@@ -1116,3 +1154,164 @@ def test_the_suite_refuses_to_run_the_real_subscription_clis(cli):
     cli.script("claude")
     assert subprocess.run([cli.path, "--version"], capture_output=True).returncode == 0
     assert subprocess.run([sys.executable, "-c", "pass"]).returncode == 0
+
+
+def test_a_tool_during_the_drain_does_not_keep_the_session(cli):
+    """A barge-in leaves a turn in flight, and the next turn drains it before sending. The tool watch lives in that
+    drain, so a turn that reaches for a tool while nobody is reading it must still lose its session: `_spent` has to be
+    read after the drain, not before it."""
+    cli.script("codex", [{"deltas": ["One", " more", " word."], "gap_ms": 150, "tool_late": "commandExecution"},
+                         {"deltas": ["Two."]}])
+    brain = codex_brain(cli)
+    try:
+        said = []
+        for piece in brain.stream(1, talk("First"), 120):
+            said.append(piece)
+            brain.cancel(1)  # the caller talks over the reply; we stop reading and leave the turn in flight
+        assert said == ["One"]
+        assert "".join(brain.stream(2, talk("First", "One", "Second"), 120)) == "Two."
+    finally:
+        brain.close()
+    assert len(cli.events("thread")) == 2, "the next turn ran on the session that had reached for a tool"
+
+
+def test_a_finished_turns_late_completion_does_not_silence_the_next_turn(cli):
+    """A turn's id is not known until `turn/start` is answered, so anything still on the wire for the turn before it
+    would be read as this turn's. A stale completion read that way ends the turn at once: the caller gets silence."""
+    cli.script("codex", [{"deltas": ["One."], "extra_completion": True}, {"deltas": ["Two."]}])
+    brain = codex_brain(cli)
+    try:
+        assert "".join(brain.stream(1, talk("First"), 120)) == "One."
+        assert "".join(brain.stream(2, talk("First", "One.", "Second"), 120)) == "Two."
+    finally:
+        brain.close()
+    assert len(cli.events("thread")) == 1, "nothing was wrong with the session"
+
+
+def test_a_tool_item_seen_only_as_completed_still_stops_the_turn(cli):
+    """`item/started` and `item/completed` are separate notifications carrying the same item. Watching only the first
+    left a tool that reports only its completion free to finish the turn and answer the caller."""
+    cli.script("codex", [{"tool_completed_only": "commandExecution", "deltas": ["The file says "]}])
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Read it to me"), 120))
+        assert e.value.kind == "tool_use"
+    finally:
+        brain.close()
+
+
+def test_an_item_whose_type_cannot_be_read_is_not_taken_for_a_safe_one(cli):
+    """The allowlist has to fail closed on an item it cannot classify, the way every other check here does."""
+    brain = codex_brain(cli)
+    brain._thread, brain._turn_id = "th1", "t1"
+    for item in ({}, {"id": "x"}, {"type": ""}, {"type": "somethingCodexAddedLater"}):
+        what, value = brain._event({"method": "item/started", "params": {"threadId": "th1", "turnId": "t1", "item": item}})
+        assert (what, value.kind) == ("error", "tool_use"), item
+    # and the four benign ones still pass
+    for kind in ("userMessage", "agentMessage", "reasoning", "contextCompaction"):
+        assert brain._event({"method": "item/started",
+                             "params": {"threadId": "th1", "turnId": "t1", "item": {"type": kind}}}) == ("note", None)
+
+
+@pytest.mark.parametrize("ran", ["hook/started", "command/exec/outputDelta", "item/commandExecution/outputDelta",
+                                 "item/mcpToolCall/progress", "process/exited", "item/plan/delta"])
+def test_a_notification_that_means_something_ran_stops_the_turn(cli, ran):
+    """Execution signals that live outside the item lifecycle. Nothing should produce them once the tools are off, so
+    one arriving means a layer failed and the turn is over."""
+    cli.script("codex", [{"ran": ran, "deltas": ["Done."]}])
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Hi"), 120))
+        assert e.value.kind == "tool_use"
+    finally:
+        brain.close()
+
+
+# ---- the login must be one ai-phone can actually run on -------------------------------------------
+
+@pytest.mark.parametrize("how", ["api_key", "api_key_helper"])
+def test_a_login_that_is_billed_per_request_is_refused_and_named(cli, how):
+    cli.script("claude", [{"deltas": ["Hi."]}], login={"loggedIn": True, "authMethod": how})
+    brain = claude_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            brain.warmup(PROMPT)
+        assert (e.value.kind, e.value.detail) == ("api_key_login", how)
+    finally:
+        brain.close()
+    assert cli.events("turn") == []
+
+
+@pytest.mark.parametrize("how", ["third_party", "oauth_token", "something_a_later_version_added"])
+def test_a_login_ai_phone_does_not_know_is_refused_and_named(cli, how):
+    """An allowlist, not a denylist. `claude auth status --json` reports one of none, third_party, claude.ai,
+    api_key_helper, oauth_token or api_key, and only claude.ai is the subscription this feature promises; a value a
+    later version adds has to be refused rather than run on."""
+    cli.script("claude", [{"deltas": ["Hi."]}], login={"loggedIn": True, "authMethod": how})
+    brain = claude_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            brain.warmup(PROMPT)
+        assert (e.value.kind, e.value.detail) == ("login_unknown", how)
+    finally:
+        brain.close()
+    assert cli.events("turn") == [], "no turn is spent finding out"
+
+
+@pytest.mark.parametrize("how", ["none", "", None])
+def test_a_cli_that_says_its_login_is_none_reads_as_not_logged_in(cli, how):
+    """`loggedIn` true with no method is a contradiction; the CLI's own word for having no login is the one to believe,
+    and it has a message of its own that tells the person what to run."""
+    cli.script("claude", [{"deltas": ["Hi."]}], login={"loggedIn": True, "authMethod": how})
+    brain = claude_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            brain.warmup(PROMPT)
+        assert e.value.kind == "not_logged_in"
+    finally:
+        brain.close()
+    assert cli.events("turn") == []
+
+
+def test_a_claude_ai_login_is_the_one_that_runs(cli):
+    cli.script("claude", [{"deltas": ["OK"]}], login={"loggedIn": True, "authMethod": "claude.ai",
+                                                      "subscriptionType": "max"})
+    brain = claude_brain(cli)
+    try:
+        assert brain.warmup(PROMPT)["plan"] == "max"
+    finally:
+        brain.close()
+
+
+# ---- a feature flag that Codex has renamed ------------------------------------------------------
+
+def test_a_tool_flag_codex_no_longer_has_is_named_at_warmup(cli, monkeypatch):
+    """The flags are how the tools are switched off, and `codex features list` is where they are named. A renamed one
+    would otherwise make the app-server exit with one line on stderr, which only a debug log would show."""
+    from ai_phone.services.backends import cli_brain as mod
+
+    monkeypatch.setattr(mod, "CODEX_TOOLS_OFF", ("shell_tool", "a_flag_codex_dropped"))
+    cli.script("codex", [{"deltas": ["OK"]}], features=["shell_tool stable true", "apps stable true"])
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            brain.warmup(PROMPT)
+        assert (e.value.kind, e.value.detail) == ("tools_renamed", "a_flag_codex_dropped")
+    finally:
+        brain.close()
+    assert cli.events("turn") == [] and cli.events("thread") == []
+
+
+def test_a_codex_that_will_not_start_because_of_a_flag_says_which_one(cli):
+    """The other half: a CLI already running the renamed flag exits before it says anything on stdout. The one line it
+    does write is the whole diagnosis, so it becomes the kind rather than staying in the debug log."""
+    cli.script("codex", [{"deltas": ["OK"]}], die_with="Error: Unknown feature flag: a_flag_codex_dropped")
+    brain = codex_brain(cli)
+    try:
+        with pytest.raises(BrainError) as e:
+            list(brain.stream(1, talk("Hi"), 120))
+        assert (e.value.kind, e.value.detail) == ("tools_renamed", "a_flag_codex_dropped")
+    finally:
+        brain.close()

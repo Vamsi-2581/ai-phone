@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import signal
 import stat
@@ -55,7 +56,16 @@ STDOUT_BUDGET = 1 << 20        # bytes of output one call may print (plus the re
 HANDSHAKE_SEC = 10.0           # how long starting a session may take, when that is longer than the token deadline
 CLOSE_SEC = 2.0                # how long the CLI may take to exit after its stdin closes
 VERSION_SEC = 15.0             # how long `<cli> --version` may take, and `claude auth status`
+STDERR_WAIT_SEC = 0.3          # how long a CLI that has already exited may take to finish saying why
 STDERR_CHARS = 400             # how much of one of the CLI's own stderr lines reaches the log
+
+# The logins ai-phone will run on. `claude auth status --json` reports exactly one of none | third_party | claude.ai |
+# api_key_helper | oauth_token | api_key (read from the CLI 2.1.286 that builds that payload), and only the first is a
+# subscription this feature can promise: an API key and a key helper are billed per request, third_party is somebody
+# else's gateway, and oauth_token covers a token in the environment or an AWS profile, neither of which is the login the
+# person is being told ai-phone uses. An allowlist, so a value added in a later version is refused rather than accepted.
+CLAUDE_SUBSCRIPTION_LOGINS = frozenset({"claude.ai"})
+CLAUDE_BILLED_LOGINS = frozenset({"api_key", "api_key_helper"})
 
 # Anything that would move a CLI off the login the person has: a key or token it would bill instead of the plan, and a
 # base URL or token file that would send the call somewhere else. `ANTHROPIC_API_KEY` is the one that matters most --
@@ -71,11 +81,17 @@ CODEX_TOOLS_OFF = ("shell_tool", "unified_exec", "unified_exec_tty", "view_image
                    "browser_use", "browser_use_external", "browser_use_full_cdp_access", "in_app_browser",
                    "computer_use", "apps", "plugins", "hooks", "multi_agent", "goals", "worktrees", "shell_snapshot",
                    "skill_search", "skill_mcp_dependency_install", "tool_suggest", "tool_call_mcp_elicitation",
-                   "memories", "realtime_conversation")
+                   "memories", "realtime_conversation", "code_mode", "code_mode_host")
 # The only thread items a tool-free session produces; every other kind in the protocol is a tool having been called.
 # `plan` is not here because the one tool that could produce it is off in the config above (measured: Codex warns about
 # a setting it does not recognise, and it warns about none of these).
 CODEX_SAID = frozenset({"userMessage", "agentMessage", "reasoning", "contextCompaction"})
+# Notifications that mean something ran. These sit outside the item lifecycle, so the item allowlist below does not
+# see them: they are a second way to notice a tool that the feature flags and the private home were supposed to prevent.
+CODEX_RAN = frozenset({"hook/started", "hook/completed", "command/exec/outputDelta", "process/outputDelta",
+                       "process/exited", "item/commandExecution/outputDelta", "item/commandExecution/terminalInteraction",
+                       "item/fileChange/outputDelta", "item/fileChange/patchUpdated", "item/mcpToolCall/progress",
+                       "item/plan/delta", "item/autoApprovalReview/started", "item/autoApprovalReview/completed"})
 # requests the app-server makes of its client on a tool's behalf. Each one blocks the turn until it is answered, so
 # each gets an answer and ends the turn. (`account/chatgptAuthTokens/refresh` and `attestation/generate` are the
 # server's own business and are deliberately not here.)
@@ -161,12 +177,18 @@ def _pump(stream, q: queue.Queue, budget: int) -> None:
     q.put(("eof", None))
 
 
-def _pump_stderr(stream, name: str) -> None:
+def _pump_stderr(stream, name: str, fatal: list) -> None:
+    """The CLI's own stderr, at debug and truncated. A line that explains why the process will not run at all is also
+    kept: it is the difference between telling the owner `failed` and telling them which flag is gone."""
     try:
         for line in stream:
             line = line.strip()
-            if line:
-                log.debug("%s: %s", name, line[:STDERR_CHARS])
+            if not line:
+                continue
+            log.debug("%s: %s", name, line[:STDERR_CHARS])
+            m = re.search(r"Unknown feature flag:\s*([A-Za-z0-9_.-]{1,60})", line)
+            if m:
+                fatal.append(BrainError("tools_renamed", m.group(1)))
     except (OSError, ValueError):
         pass
 
@@ -232,8 +254,13 @@ class CliBrain:
         self._in_flight = False            # a turn we stopped reading: drain it before sending the next one
         self._spent = False                # this session failed in a way that makes it unsafe to reuse
         self._plan = ""                    # what the CLI calls the plan this login is on
+        self._fatal: list = []             # why the CLI would not run at all, when its stderr said so
+        self._err: threading.Thread | None = None  # the thread reading that stderr
 
     # ---- the brain protocol ----------------------------------------------------------------------
+    def _preflight(self) -> None:
+        """Whatever has to be true of this CLI before a session is worth starting. Costs no turn."""
+
     def login(self) -> dict:
         """What the CLI says about the login, without inference: {"plan": <what it calls the plan>}.
 
@@ -247,6 +274,7 @@ class CliBrain:
         tool-free, with one tiny turn. The probe is thrown away with its session, so no call inherits it."""
         t = time.monotonic_ns()
         version = self.cli_version()
+        self._preflight()
         if self.asks_at_warmup:
             self._plan = str(self.login().get("plan", ""))
         self.close()
@@ -358,7 +386,9 @@ class CliBrain:
     # ---- sessions --------------------------------------------------------------------------------
     def _begin(self, system: str, prior: list[Message], newest: Message) -> None:
         theirs = self._alive() and system == self._system and self._continues(prior) and not self._spent
-        if theirs and self._settle():
+        # `not self._spent` again, and after the drain: `_settle()` reads the abandoned turn, and the tool watch lives
+        # in that read. A turn that reaches for a tool while nobody is listening to it still loses its session.
+        if theirs and self._settle() and not self._spent:
             self._send(str(newest.get("content") or ""))
             self._seen.append(dict(newest))
             return
@@ -426,11 +456,12 @@ class CliBrain:
         except OSError as e:
             raise BrainError("cli_missing", f"{self.cli} would not start: {type(e).__name__}") from None
         self._proc, self._q, self._system, self._seen = p, queue.Queue(), system_prompt, []
-        self._in_flight, self._spent = False, False
+        self._in_flight, self._spent, self._fatal = False, False, []
         threading.Thread(target=_pump, args=(p.stdout, self._q, STDOUT_BUDGET + 100 * self.max_chars),
                          name=f"{self.cli_name}-brain", daemon=True).start()
-        threading.Thread(target=_pump_stderr, args=(p.stderr, self.cli_name), name=f"{self.cli_name}-brain-err",
-                         daemon=True).start()
+        self._err = threading.Thread(target=_pump_stderr, args=(p.stderr, self.cli_name, self._fatal),
+                                    name=f"{self.cli_name}-brain-err", daemon=True)
+        self._err.start()
 
     def _executable(self) -> str:
         found = shutil.which(self.cli)
@@ -503,13 +534,23 @@ class CliBrain:
             self.close()
             raise payload
         if kind == "eof":
+            why = self._why_it_stopped()
             self.close()
-            raise BrainError("failed", f"{self.cli} stopped")
+            raise why or BrainError("failed", f"{self.cli} stopped")
         try:
             obj = json.loads(payload)
         except ValueError:
             return {}
         return obj if isinstance(obj, dict) else {}
+
+    def _why_it_stopped(self) -> BrainError | None:
+        """A CLI that exits before it says anything usually said why on stderr, and both pipes close together, so the
+        reason may still be in flight. The wait is only for a process that has already gone -- a caller on the line is
+        not kept waiting for a reason about a CLI that is still running."""
+        p, err = self._proc, self._err
+        if not self._fatal and err is not None and p is not None and p.poll() is not None:
+            err.join(STDERR_WAIT_SEC)
+        return self._fatal[0] if self._fatal else None
 
     # ---- what a subclass provides ----------------------------------------------------------------
     def _args(self, system_prompt: str) -> list[str]:
@@ -549,9 +590,15 @@ class ClaudeCodeLLM(CliBrain):
             said = {}
         if not isinstance(said, dict) or not said.get("loggedIn"):
             raise BrainError("not_logged_in", "claude is not logged in")
-        if said.get("authMethod") == "api_key":
+        how = re.sub(r"[^A-Za-z0-9_.-]", "", str(said.get("authMethod") or "none"))[:40]
+        if how == "none":  # logged in by one reckoning and not by the other: the CLI's own word for no login wins
+            raise BrainError("not_logged_in", "claude is not logged in")
+        if how in CLAUDE_BILLED_LOGINS:
             # the variable itself is already gone from _env(), so this is a key saved in the CLI's own settings
-            raise BrainError("api_key_login", "claude is set up to use an API key, not a subscription")
+            raise BrainError("api_key_login", how)
+        if how not in CLAUDE_SUBSCRIPTION_LOGINS:
+            # named, because a login method is not a secret and a refusal nobody can read is a refusal nobody can fix
+            raise BrainError("login_unknown", how)
         return {"plan": str(said.get("subscriptionType") or "")[:40]}
 
     def _args(self, system_prompt: str) -> list[str]:
@@ -607,6 +654,7 @@ class CodexLLM(CliBrain):
         self._thread: str | None = None
         self._turn_req: int | None = None
         self._turn_id: str | None = None
+        self._past: set[str] = set()   # turns this session has finished with; their late events are not the next turn's
 
     def _args(self, system_prompt: str) -> list[str]:
         off = [a for feature in CODEX_TOOLS_OFF for a in ("--disable", feature)]
@@ -644,6 +692,23 @@ class CodexLLM(CliBrain):
         link.symlink_to(theirs)
         return d
 
+    def _preflight(self) -> None:
+        """Every tool feature ai-phone switches off must still be one this Codex has.
+
+        A renamed flag makes `codex app-server` exit with a single line on stderr and nothing else, which is the least
+        diagnosable failure in this design and a likely one (much of `codex features list` is already marked removed).
+        Asking the list first names the flags instead, from a local command that spends no turn. If the list itself
+        cannot be read, the session start is still fail-closed.
+        """
+        r = self._run(["features", "list"])
+        if r is None or r.returncode != 0 or not (r.stdout or "").strip():
+            log.debug("codex brain: could not read `codex features list`; the flags are unchecked")
+            return
+        known = {line.split()[0] for line in r.stdout.splitlines() if line.split()}
+        gone = [f for f in CODEX_TOOLS_OFF if f not in known]
+        if gone:
+            raise BrainError("tools_renamed", " ".join(gone[:6]))
+
     def login(self) -> dict:
         """`account/read` on a fresh app-server: it says whose login this is, and starts no thread, so no turn."""
         self.close()
@@ -661,7 +726,7 @@ class CodexLLM(CliBrain):
         if not kind:
             raise BrainError("not_logged_in", "codex is not logged in")
         if kind != "chatgpt":
-            raise BrainError("api_key_login", "codex is logged in with an API key, not a ChatGPT plan")
+            raise BrainError("api_key_login", re.sub(r"[^A-Za-z0-9_.-]", "", kind)[:40])
         self._plan = str(account.get("planType") or "")[:40]
         return {"plan": self._plan}
 
@@ -678,6 +743,7 @@ class CodexLLM(CliBrain):
         result = r.get("result") or {}
         self._thread = (result.get("thread") or {}).get("id")
         self._turn_req = self._turn_id = None
+        self._past = set()
         if not self._thread:
             raise BrainError("failed", "codex started no thread")
         self._confined(result)
@@ -730,6 +796,8 @@ class CodexLLM(CliBrain):
                 raise value
 
     def _send(self, text: str) -> None:
+        if self._turn_id:
+            self._past.add(self._turn_id)
         self._turn_id = None
         self._turn_req = self._request("turn/start", {"threadId": self._thread, "input": [{"type": "text", "text": text}]})
 
@@ -748,10 +816,16 @@ class CodexLLM(CliBrain):
             self._deny(obj["id"], method)  # it waits on an answer; one tool is one too many, so it gets a no and an end
             self._spent = True
             return "error", BrainError("tool_use", "the session asked to run something; a phone brain gets no tools")
-        if method == "item/started":
+        if method in CODEX_RAN:
+            log.info("codex brain: the session ran something (%s); ending the turn", method)
+            self._spent = True
+            return "error", BrainError("tool_use", "the session ran something; a phone brain gets no tools")
+        if method in ("item/started", "item/completed"):
+            # both ends of the lifecycle: the two are separate notifications carrying the same item, and an item seen
+            # only as completed would otherwise let the turn finish. A type we cannot read is not a reason to carry on.
             item = str((prm.get("item") or {}).get("type") or "")
-            if item and item not in CODEX_SAID:
-                log.info("codex brain: the session reached for a tool (%s); ending the turn", item)
+            if item not in CODEX_SAID:
+                log.info("codex brain: the session reached for a tool (%s); ending the turn", item or "unreadable")
                 self._spent = True
                 return "error", BrainError("tool_use", "the session reached for a tool; a phone brain gets none")
         if method == "item/agentMessage/delta":
@@ -790,7 +864,9 @@ class CodexLLM(CliBrain):
         if thread is not None and self._thread is not None and thread != self._thread:
             return False
         turn = turn_id if turn_id is not None else prm.get("turnId")
-        if turn is None or self._turn_id is None:  # before turn/start has been answered there is nothing to compare
+        if turn is not None and turn in self._past:
+            return False  # a turn this session is already done with: a duplicate completion, a trailing delta
+        if turn is None or self._turn_id is None:  # before turn/start is answered there is nothing else to compare
             return True
         return turn == self._turn_id
 

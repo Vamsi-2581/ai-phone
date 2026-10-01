@@ -322,7 +322,10 @@ def _fake_cli(tmp_path, monkeypatch, protocol, turns, **extra):
     exe = tmp_path / "fake-cli"
     exe.write_text(FAKE_CLI)
     exe.chmod(0o755)
+    from ai_phone.services.backends.cli_brain import CODEX_TOOLS_OFF
+
     spec = tmp_path / "script.json"
+    extra.setdefault("features", [f"{f} stable true" for f in CODEX_TOOLS_OFF])
     spec.write_text(json.dumps({"protocol": protocol, "log": str(tmp_path / "cli.jsonl"), "turns": turns, **extra}))
     monkeypatch.setenv("AI_PHONE_FAKE_CLI", str(spec))
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path / "home"))

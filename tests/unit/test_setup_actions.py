@@ -916,7 +916,10 @@ def fake_cli(tmp_path, monkeypatch):
     exe.chmod(0o755)
 
     def script(protocol, turns=None, as_name=None, **extra):
+        from ai_phone.services.backends.cli_brain import CODEX_TOOLS_OFF
+
         spec = tmp_path / "script.json"
+        extra.setdefault("features", [f"{f} stable true" for f in CODEX_TOOLS_OFF])
         spec.write_text(json.dumps({"protocol": protocol, "log": str(tmp_path / "cli.jsonl"),
                                     "turns": turns or [{}], **extra}))
         monkeypatch.setenv("AI_PHONE_FAKE_CLI", str(spec))
@@ -974,8 +977,11 @@ def test_a_login_that_is_an_api_key_says_so_before_any_turn(home, fake_cli):
     exe = fake_cli("claude", [{"deltas": ["OK"]}],
                    login={"loggedIn": True, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"})
     a = make(home, f"brain: {{kind: claude, cli: {exe}}}\n")
-    with pytest.raises(ActionError, match=r"^claude is set up to use an API key, which is billed per request\."):
+    with pytest.raises(ActionError) as e:
         a.login_status("claude")
+    # the page names the method, because a refusal nobody can read is a refusal nobody can fix
+    assert str(e.value) == ("claude is logged in as 'api_key', which is billed per request. ai-phone runs your "
+                           "subscription instead: remove the key, then log in with: claude, then type /login")
     assert [r["event"] for r in fake_cli.log()] == ["login"]
 
 

@@ -269,8 +269,16 @@ class Actions:
         if e.kind == "model_not_allowed":
             return ActionError("Your plan does not allow that model. Choose another one.")
         if e.kind == "api_key_login":
-            return ActionError(f"{cli} is set up to use an API key, which is billed per request. ai-phone runs your "
+            return ActionError(f"{cli} is logged in as {e.detail!r}, which is billed per request. ai-phone runs your "
                                f"subscription instead: remove the key, then log in with: {LOGIN[kind]}")
+        if e.kind == "login_unknown":
+            # the login method is a value from the CLI's own structured output, so it is safe to show, and showing it is
+            # the only way the person can tell which of their settings is in the way
+            return ActionError(f"{cli} is logged in as {e.detail!r}, which ai-phone cannot run a subscription on. "
+                               f"Log in with: {LOGIN[kind]}")
+        if e.kind == "tools_renamed":
+            return ActionError(f"This {cli} no longer has the settings ai-phone switches its tools off with "
+                               f"({e.detail}). Update ai-phone, or pick another brain.")
         if e.kind in ("tool_use", "tools_unknown"):
             return ActionError(f"{cli} gives a call's session tools of its own, and what callers say must not reach "
                                f"anything that can read this Mac. Update {cli}, then check again.")

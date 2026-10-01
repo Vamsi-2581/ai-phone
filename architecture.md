@@ -835,7 +835,9 @@ greeting plays, and ignored by backends without `prepare`) starts the session so
 startup. `warmup` reads the login first without inference (`claude auth status --json`, Codex's `account/read`) and
 refuses an API-key login, then spends one tiny turn ("Say OK.") to prove the plan answers and throws that session away;
 failures are the same `BrainError` kinds as the endpoint brain plus `cli_missing`, `not_logged_in`, `api_key_login`,
-`rate_limited`, `model_not_allowed`, `tool_use` and `tools_unknown`, and they carry a kind only — a provider's own
+`login_unknown`, `rate_limited`, `model_not_allowed`, `tool_use`, `tools_unknown` and `tools_renamed`, and they carry a
+kind only (plus, for the three kinds whose detail is a value ai-phone itself produced — a login method, a flag name —
+that value, so a refusal is something the person can act on) — a provider's own
 words are classified and then go to the debug log, never into the exception the worker, the daemon's log or a wizard
 page sees.
 
@@ -852,12 +854,25 @@ config.toml ai-phone writes and a symlink to the person's own `auth.json`, so th
 tokens is made, while their MCP servers, hooks, plugins, skills and AGENTS.md are all absent. (3) `thread/start` asks
 for `sandbox: read-only` with no network and `approvalPolicy: never`, and the thread's own answer is checked: anything
 else (a requirements file, an MDM policy, a newer CLI) is `BrainError("tools_unknown")` before a turn is spent — the
-mirror of the Claude side's assertion. Then, during a turn, an `item/started` whose item is not a user message, an
-agent message, reasoning or a compaction, an `mcpServer/startupStatus/updated`, a `configWarning`, or any
-`…/requestApproval` request (which is answered `denied`) is `BrainError("tool_use")`: the turn ends, the words it had
-started to say are not delivered, and the session is marked spent so the rest of the call gets a new one. Verified
-against the real CLI with one probe turn: asked to read a file outside its directory and `/etc/hosts`, the session
-produced only `userMessage`, `reasoning`, `agentMessage` and said it could not reach them.
+mirror of the Claude side's assertion. Then, during a turn, an `item/started` **or** `item/completed` whose item is not
+a user message, an agent message, reasoning or a compaction (an item whose type cannot be read counts as not), an
+`mcpServer/startupStatus/updated`, a `configWarning`, a notification that means something ran (`hook/started`,
+`command/exec/outputDelta`, `item/plan/delta`, …), or any approval or tool request (which is answered, so the turn
+cannot hang) is `BrainError("tool_use")`: the turn ends there and the session is marked spent, so the rest of the call
+gets a new one. The guarantee is **not** that the caller hears nothing — deltas are streamed to TTS as they arrive, so
+words the model said *before* it reached for a tool have already been spoken, and buffering every reply to completion
+would cost the whole latency budget this backend exists for. What is guaranteed is that **no tool output can reach the
+caller**: the event queue is strictly ordered, so the abort fires on the tool's own notification, before any delta that
+could carry its result is read. `_spent` is read *after* `_settle()`, because the drain is where the watch runs for a
+turn the caller talked over. Verified against the real CLI with one probe turn: asked to read a file outside its
+directory and `/etc/hosts`, the session produced only `userMessage`, `reasoning`, `agentMessage` and said it could not
+reach them.
+
+A tool feature ai-phone names that this Codex no longer has is its own failure, not a mystery: `codex app-server` exits
+1 with `Error: Unknown feature flag: X` on stderr and nothing on stdout, which would otherwise surface as kind `failed`
+with the reason visible only at debug. `warmup()` therefore asks `codex features list` (local, no turn) and raises
+`BrainError("tools_renamed", "<flags>")` naming them, and the stderr line is promoted to the same kind for a CLI that
+was upgraded under a running daemon. Fail-closed either way, and the wizard says which flag to blame.
 `max_tokens` cannot be imposed on a CLI, so a reply past `max_response_chars` ends the turn, and the reader stops a
 session that prints more than one call's worth of output (`BrainError("too_long")`). Nothing of the conversation is
 logged: timings and the model only, with the CLI's own stderr at debug, truncated. The session belongs to one call:
