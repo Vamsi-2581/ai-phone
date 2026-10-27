@@ -304,7 +304,7 @@ FINISH = ("You're set up", "Finish")
 def test_new_setup_local_brain_sip_line_default_voice():
     ui = ScriptedUI([
         WELCOME_NEW,
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["agent", "192.0.2.10"]),
@@ -324,7 +324,7 @@ def test_new_setup_local_brain_sip_line_default_voice():
     _question, options, default, _back = ui.menu("Which model?")
     assert options[default].label == "Qwen3.5 4B"
     assert ui.questions("Which model?")[0].detail == \
-        "This Mac has 24 GB of memory. Models that need more will swap and answer slowly."
+        "This computer has 24 GB of memory. Models that need more may swap and answer slowly."
     assert [o.label for o in ui.menu("How should people reach")[1]][3] == "Skip"
     assert ui.menu("How should people reach")[1][3].hint == "add one later"
     assert ui.menu("How should people reach")[1][0].hint == "Twilio or Telnyx · a new number, or one already on that account"
@@ -353,11 +353,11 @@ def test_welcome_shows_the_machine_checks():
     assert outcome.code == 1
     assert outcome.summary == "Setup cancelled. Nothing was changed."
     page = ui.pages[0]
-    assert page.detail == "Calls answered and placed by models running on this Mac."
+    assert page.detail == "Calls answered and placed by models running on this computer."
     assert page.note == "Picks a line, a brain and a voice, then checks it all works."
     assert page.checks == [
         Check("SIP library", "not built yet · run ./scripts/install.sh", False),
-        Check("Memory", "8 GB · 4B model recommended", None),
+        Check("Memory", "8 GB · Qwen3.5 2B recommended", True),
         Check("Models", "none downloaded yet\nMissing: a/b · setup can download them", None),
         Check("Config", "new · ~/.ai-phone/", True),
     ]
@@ -367,7 +367,7 @@ def test_welcome_shows_the_machine_checks():
     drive(ui, FakeActions(memory=36, exists=True))
     assert ui.pages[0].checks == [
         Check("SIP library", "built", True),
-        Check("Memory", "36 GB · 9B model recommended", True),
+        Check("Memory", "36 GB · Qwen3.5 9B recommended", True),
         Check("Models", "Parakeet 0.6B v2\nKokoro 82M\nPhonon 31M\nQwen3.5 4B", True),
         Check("Config", "found · ~/.ai-phone/ (setup changes only what you pick)", True),
     ]
@@ -433,7 +433,7 @@ def test_a_config_that_does_not_load_is_shown_where_the_answer_is_saved():
     broken = "config.lines.agent.aor: expected sip:user@host[:port]"
     ui = ScriptedUI([
         ("Give your AI", "Change the brain"),
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "Qwen3.5 9B"),
         ("Which model?", "<default>"),
         ("A few things need attention", "<quit>"),
@@ -1021,7 +1021,7 @@ def test_sip_address_name_taken_is_asked_again():
     assert actions.args("add_sip_line") == [("agent", "192.0.2.10"), ("desk", "192.0.2.10")]
     assert ui.questions("Name your SIP address")[1].error == taken
     assert ui.questions("Name your SIP address")[0].detail == \
-        "Softphones and other agents call sip:<name>@<this Mac>. Free; no carrier."
+        "Softphones and other agents call sip:<name>@<this computer>. Free; no carrier."
 
 
 def test_sip_address_offers_a_free_name():
@@ -1050,7 +1050,7 @@ def test_validators():
     for local in ("http://127.0.0.1:1234/v1", "http://localhost:8080/v1", "http://[::1]:8080/v1"):
         assert flow.url(local) is None
     assert flow.url("http://203.0.113.5/v1") == flow.url("http://api.example.com/v1") == \
-        "Use https:// for a server that is not on this Mac."
+        "Use https:// for a server that is not on this computer."
     assert flow.url("https://203.0.113.5/v1") is None and flow.url("http://") and flow.url("https://[bad")
     assert flow.speed("0.9") is None and flow.speed("2") is None
     assert flow.speed("2.5") == flow.speed("fast") == flow.speed("nan") == "Use a number from 0.5 to 2.0."
@@ -1070,7 +1070,7 @@ def test_price_size_and_plural_helpers():
 def test_the_brain_step_offers_the_whole_model_catalog():
     ui = ScriptedUI([
         WELCOME_NEW,
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
         ("How should people reach your agent?", "<quit>"),
     ])
@@ -1078,24 +1078,24 @@ def test_the_brain_step_offers_the_whole_model_catalog():
     drive(ui, actions)
     _q, options, default, _back = ui.menu("Which model?")
     assert ui.questions("Which model?")[0].detail == \
-        "This Mac has 24 GB of memory. Models that need more will swap and answer slowly."
+        "This computer has 24 GB of memory. Models that need more may swap and answer slowly."
     assert [(o.label, o.hint) for o in options] == [
-        ("Qwen3.5 4B", "tested · first word in 0.9 s · needs 16 GB"),
-        ("Qwen3.5 9B", "tested · smarter, swaps below 32 GB · needs 32 GB · more than this Mac has"),
-        ("Qwen3.5 2B", "untested for calls · for 8 GB Macs · needs 8 GB"),
-        ("Llama 3.2 3B", "untested for calls · needs 16 GB"),
-        ("Gemma 3 4B", "untested for calls · needs 16 GB"),
-        ("Mistral 7B", "untested for calls · needs 24 GB"),
-        ("Gemma 3 12B", "untested for calls · needs 32 GB · more than this Mac has"),
+        ("Qwen3.5 4B", "recommended for your RAM · needs 16 GB"),
+        ("Qwen3.5 9B", "needs 32 GB · exceeds system RAM"),
+        ("Qwen3.5 2B", "needs 8 GB"),
+        ("Llama 3.2 3B", "needs 16 GB"),
+        ("Gemma 3 4B", "needs 16 GB"),
+        ("Mistral 7B", "needs 24 GB"),
+        ("Gemma 3 12B", "needs 32 GB · exceeds system RAM"),
     ]
     assert options[default].label == "Qwen3.5 4B"  # 24 GB: the recommended one
     assert actions.args("save_brain_local") == [("t4",)]
 
 
-def test_a_model_this_Mac_cannot_hold_is_confirmed_first():
+def test_a_model_this_computer_cannot_hold_is_confirmed_first():
     ui = ScriptedUI([
         WELCOME_NEW,
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "Gemma 3 12B"),
         ("Use Gemma 3 12B anyway?", "<default>"),  # Enter is Back: nothing is saved
         ("Which model?", "Gemma 3 12B"),
@@ -1105,17 +1105,35 @@ def test_a_model_this_Mac_cannot_hold_is_confirmed_first():
     actions = FakeActions(memory=24)
     drive(ui, actions)
     assert ui.questions("Use Gemma 3 12B anyway?")[0].detail == \
-        "It needs 32 GB; this Mac has 24 GB, so it will swap and answer slowly."
+        "It needs 32 GB; this computer has 24 GB, so it may swap and answer slowly."
     assert ui.menu("Use Gemma 3 12B anyway?")[2:] == (1, True)  # the default is Back
     assert [o.label for o in ui.menu("Use Gemma 3 12B anyway?")[1]] == ["Use it anyway"]
     assert actions.args("save_brain_local") == [("gemma12b",)]
     assert [m[2] for m in ui.menus if "Which model?" in m[0]] == [0, 6]  # Back leaves the big one picked
 
 
+@pytest.mark.parametrize("memory,recommended,default", [
+    (0, None, "Qwen3.5 4B"), (4, None, "Qwen3.5 4B"),
+    (8, "Qwen3.5 2B", "Qwen3.5 2B"), (16, "Qwen3.5 4B", "Qwen3.5 4B"),
+    (24, "Qwen3.5 4B", "Qwen3.5 4B"), (32, "Qwen3.5 9B", "Qwen3.5 9B"),
+])
+def test_first_setup_recommends_only_a_model_that_fits_detected_ram(memory, recommended, default):
+    ui = ScriptedUI([WELCOME_NEW, ("Where should your agent think?", "On this computer"),
+                     ("Which model?", "<quit>")])
+    drive(ui, FakeActions(memory=memory))
+    _, options, picked, _ = ui.menu("Which model?")
+    assert [o.label for o in options if "recommended" in o.hint] == ([recommended] if recommended else [])
+    assert options[picked].label == default
+    if memory == 0:
+        assert ui.pages[0].checks[1] == Check("Memory", "could not detect memory", None)
+        assert "Memory could not be detected" in ui.questions("Which model?")[0].detail
+        assert not any("exceeds" in o.hint for o in options)
+
+
 def test_a_model_that_fits_is_saved_without_a_confirmation():
     ui = ScriptedUI([
         WELCOME_NEW,
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "Mistral 7B"),
         ("How should people reach your agent?", "<quit>"),
     ])
@@ -1129,7 +1147,7 @@ def test_a_repo_named_by_hand_in_the_config_keeps_the_recommended_default():
     """models.tier may be any Hub repo; the wizard cannot name that one, so it offers the recommended one."""
     ui = ScriptedUI([
         ("Give your AI", "Change the brain"),
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
         ("A few things need attention", "<quit>"),
     ])
@@ -1142,10 +1160,10 @@ def test_a_repo_named_by_hand_in_the_config_keeps_the_recommended_default():
 def test_back_at_the_first_question_goes_to_the_previous_step():
     ui = ScriptedUI([
         WELCOME_NEW,
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "Qwen3.5 9B"),
         ("How should people reach your agent?", "<back>"),
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "Qwen3.5 4B"),
         ("How should people reach your agent?", "Skip"),
         ("Which speech model?", "Kokoro"),
@@ -1164,7 +1182,7 @@ def test_back_later_in_a_step_restarts_it():
         WELCOME_NEW,
         ("Where should your agent think?", "My own endpoint"),
         ("Your endpoint", "<back>"),
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
         ("How should people reach your agent?", "<quit>"),
     ])
@@ -1200,7 +1218,7 @@ def test_back_from_the_only_step_of_a_change_returns_to_welcome():
 def test_cancel_keeps_finished_steps_only():
     ui = ScriptedUI([
         WELCOME_NEW,
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["", ""]),
@@ -1279,7 +1297,7 @@ def test_ctrl_c_during_a_purchase_says_it_may_be_half_done():
     assert ui.closed and not ui.answers and not session.left_download
     ui = ScriptedUI([
         WELCOME_NEW,
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["", ""]),
@@ -1392,7 +1410,7 @@ def test_existing_config_change_the_voice_only():
     assert [p.error for p in george] == ["", "", "could not play the sample: afplay not found", "", ""]
     assert "Playing…" in ui.labels
     assert [(o.label, o.hint) for o in ui.menu("George")[1]] == [
-        ("Use this voice", ""), ("Hear it", "plays a short sample on this Mac's speakers")]
+        ("Use this voice", ""), ("Hear it", "plays a short sample on this computer's speakers")]
     assert "Voice    Kokoro · George · British · male · 0.9×" in ui.questions("You're set up")[0].body
     question, options, default, _ = ui.menu("Which speech model?")
     assert options[default].label == "Kokoro"  # no silent change for an existing config
@@ -1401,7 +1419,7 @@ def test_existing_config_change_the_voice_only():
 def test_new_setup_recommends_phonon_previews_then_downloads_the_remaining_models():
     ui = ScriptedUI([
         WELCOME_NEW,
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["agent", "192.0.2.10"]),
@@ -1687,7 +1705,7 @@ def test_done_text_fits_the_page(monkeypatch, tmp_path):
         "         telnyx   +15550100003           Telnyx number · pending",
         "         desk     sip:desk@192.0.2.10    SIP address",
         "         odd      +15550100004           SIP trunk",
-        "Brain    on this Mac · Qwen3.5 4B",
+        "Brain    on this computer · Qwen3.5 4B",
         "Voice    Kokoro · Heart · American · female · 1.0×",
         "",
         "Start ai-phone",
@@ -1695,7 +1713,7 @@ def test_done_text_fits_the_page(monkeypatch, tmp_path):
         "",
         "Try it",
         "  call +15550100001 from any phone (your normal call rates)",
-        "  pjsua --local-port 5070 sip:agent@127.0.0.1   talk through this Mac's mic, free",
+        "  pjsua --local-port 5070 sip:agent@127.0.0.1   talk through this computer's mic, free",
         "",
         f"Give your AI the phone: from {shown}, it can run",
         '  uv run ai-phone call +15550100000 --prompt "…" --json   ai-phone\'s agent talks',
@@ -1735,7 +1753,7 @@ def test_done_text_with_one_kind_of_line():
     long_name = {"a" * 32: {"kind": "sip", "user": "a" * 32, "aor": f"sip:{'a' * 32}@192.0.2.10"}}
     lines = flow.done_text(FakeActions(exists=True, lines=long_name), flow.Session()).splitlines()
     tried = lines[lines.index("Try it") + 1:lines.index("Try it") + 3]
-    assert tried == [f"  pjsua --local-port 5070 sip:{'a' * 32}@127.0.0.1", "    talk through this Mac's mic, free"]
+    assert tried == [f"  pjsua --local-port 5070 sip:{'a' * 32}@127.0.0.1", "    talk through this computer's mic, free"]
     pending = {"twilio": dict(NUMBER_LINE, provider={"name": "twilio", "state": "pending"})}
     lines = flow.done_text(FakeActions(exists=True, lines=pending), flow.Session()).splitlines()
     assert lines[lines.index("Try it") + 1] == "  nothing to call yet: the number is still being set up"
@@ -1781,7 +1799,7 @@ def test_new_setup_with_a_claude_subscription():
     actions = FakeActions()
     outcome = drive(ui, actions)
     assert [o.label for o in ui.menu("Where should your agent think")[1]] == \
-        ["On this Mac", "My Claude subscription", "My ChatGPT subscription", "My own endpoint"]
+        ["On this computer", "My Claude subscription", "My ChatGPT subscription", "My own endpoint"]
     assert ui.menu("Where should your agent think")[1][1].hint == "uses the Claude Code login · no API key"
     assert actions.args("cli_installed") == [("claude",)]
     assert "Checking your Claude login…" in ui.labels
@@ -1798,7 +1816,7 @@ def test_new_setup_with_a_claude_subscription():
     assert "Asking Claude to answer once with Haiku…" in ui.labels
     assert Check("Brain", "Claude (Haiku) · logged in", True) in ui.questions("Everything works")[0].checks
     assert "Brain    your Claude subscription · Haiku" in outcome.summary
-    assert "nothing leaves this Mac" not in outcome.summary
+    assert "nothing leaves this computer" not in outcome.summary
 
 
 def test_a_chatgpt_plan_is_asked_which_models_it_allows():
@@ -1879,7 +1897,7 @@ def test_back_from_the_login_page_goes_back_to_the_brain_menu():
         ("Give your AI", "Change the brain"),
         ("Where should your agent think?", "My Claude subscription"),
         ("Claude Code is not installed", "<back>"),
-        ("Where should your agent think?", "On this Mac"),
+        ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
         ("A few things need attention", "Continue"),
         FINISH,
@@ -1982,7 +2000,7 @@ def test_a_login_that_stops_working_is_a_failed_check_row():
 
 
 def test_a_subscription_brain_needs_no_model_download():
-    """models.missing() already leaves the brain's weights out when the brain is not on this Mac; the Check page then
+    """models.missing() already leaves the brain's weights out when the brain is not on this computer; the Check page then
     has nothing to download and says so once the speech models are there."""
     ui = ScriptedUI([
         ("Give your AI", "Change the brain"),

@@ -15,7 +15,7 @@ from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
 
 LINE = Page(2, "How should people reach your agent?", "detail")
 OPTIONS = [Option("A phone number", "hint"), Option("A SIP address")]
-WELCOME = Page(0, "Give your AI a phone number", "Calls answered and placed by models running on this Mac.",
+WELCOME = Page(0, "Give your AI a phone number", "Calls answered and placed by models running on this computer.",
                note="Picks a line, a brain and a voice, then checks it all works.",
                checks=[Check("SIP library", "built", True), Check("Memory", "16 GB", None),
                        Check("Models", "Parakeet 0.6B v2\nKokoro 82M\nPhonon 31M\nQwen3.5 4B", True),
@@ -479,7 +479,7 @@ NARROW_DONE = "\n".join([
     "",
     "Lines    main    +15550100001           Twilio number",
     "         agent   sip:agent@192.0.2.10   SIP address",
-    "Brain    on this Mac · Qwen3.5 4B",
+    "Brain    on this computer · Qwen3.5 4B",
     "Voice    Heart · American · female · 1.0×",
     "",
     "Start ai-phone",
@@ -487,10 +487,10 @@ NARROW_DONE = "\n".join([
     "",
     "Try it",
     "  call +15550100001 from any phone (your normal call rates)",
-    "  pjsua --local-port 5070 sip:agent@127.0.0.1   talk through this Mac's mic, free",
+    "  pjsua --local-port 5070 sip:agent@127.0.0.1   talk through this computer's mic, free",
 ])
 # the widest row of the summary, and one the page keeps in view: 81 columns, so at 70 it has to wrap
-WIDEST = "pjsua --local-port 5070 sip:agent@127.0.0.1   talk through this Mac's mic, free"
+WIDEST = "pjsua --local-port 5070 sip:agent@127.0.0.1   talk through this computer's mic, free"
 
 
 def clipped(text: str) -> list[str]:

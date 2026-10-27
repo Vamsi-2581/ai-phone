@@ -568,13 +568,17 @@ Each step asks only what applies to the earlier answers:
 
 | Step | Asks | Saves |
 |---|---|---|
-| Welcome | Shows checks of this Mac: SIP library, memory and the recommended model size, models, config. With a config already there: add a line, change the brain, change the voice, change what callers hear, or run every step | — |
-| Brain | On this Mac (one model from the catalog in `models.py`; the list shows what each needs, and one that needs more memory than this Mac has is confirmed first), or your own OpenAI-compatible endpoint: URL, model and an optional key, then one short test request | `brain:`, `models.tier`; the key in `secrets.env` |
+| Welcome | Shows checks of this computer: SIP library, memory and the recommended model, downloaded models, config. With a config already there: add a line, change the brain, change the voice, change what callers hear, or run every step | — |
+| Brain | On this computer (one model from the catalog in `models.py`; the list shows memory requirements and a RAM-based recommendation, and a model exceeding detected RAM is confirmed first), or your own OpenAI-compatible endpoint: URL, model and an optional key, then one short test request | `brain:`, `models.tier`; the key in `secrets.env` |
 | Line | A phone number, a free SIP address, your own SIP trunk, or skip. For a phone number: Twilio or Telnyx; the key is checked with a free read-only request that lists the account's numbers; then a new number, bought only after a confirmation that shows the number and its monthly price, or one already on the account, connected for free (§14a.3); then, if wanted, the codes to divert your own mobile to it | the line; carrier keys and SIP passwords in `secrets.env`; the carrier journal in `lines/` |
-| Voice | Phonon or Kokoro. Phonon has one bundled English voice at normal speed; Kokoro voices are grouped American/British and female/male with adjustable speed. Either can be previewed on this Mac's speakers | `tts:` |
+| Voice | Phonon or Kokoro. Phonon has one bundled English voice at normal speed; Kokoro voices are grouped American/British and female/male with adjustable speed. Either can be previewed on this computer's speakers | `tts:` |
 | Callers | The greeting, the instructions for when no AI is listening, and the daily limit on outbound calls (20 unless the config has one) | `inbound:`, `calls.daily_limit` |
 | Check | Offers to download missing models, with the size (§10.4). Then checks that the config loads, each line (the running daemon's status, or a background start with stand-in models for up to 20 s that reports registration, then stops) and the voice (plays the outbound disclosure) | — |
 | Done | A summary: what was saved and where, how to start ai-phone, a free test call, and what to tell your AI. For a SIP address the test call is `pjsua --local-port 5070 sip:<user>@127.0.0.1`, since the daemon cannot call itself | — |
+
+The chooser recommends Qwen3.5 2B for 8–15 GB of detected RAM, 4B for 16–31 GB, and 9B for 32 GB or more.
+It shows no recommendation when memory cannot be detected or is below 8 GB. A fresh setup selects the recommendation;
+an existing choice stays selected. Setup saves the chosen model explicitly; the runtime `auto` rule in §5.5 is unchanged.
 
 Everything is saved under `~/.ai-phone/` (or `AI_PHONE_HOME`): `config.yaml` (0600) and `secrets.env` (0600, written only with `write_secret`). A step's answers are kept in memory and written when the step completes, so cancelling never leaves half a step behind. The exception is a number: once it is bought or connected, its line is written at once, because the number is set up at the carrier. Running setup again reads what is there and changes only what is picked. Keys and passwords are typed into hidden fields and never shown, logged or put in an error. Setup never places a phone call; the voice sample plays locally.
 

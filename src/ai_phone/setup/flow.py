@@ -165,11 +165,11 @@ def sip_name(v: str) -> str | None:
 
 
 def host(v: str) -> str | None:
-    return None if HOST_RE.fullmatch(v.strip()) else "Use this Mac's hostname or IP address, like 192.0.2.10."
+    return None if HOST_RE.fullmatch(v.strip()) else "Use this computer's hostname or IP address, like 192.0.2.10."
 
 
 def url(v: str) -> str | None:
-    """http(s) with a host; plain http only to this Mac, so a key never crosses the network unencrypted."""
+    """http(s) with a host; plain http only to this computer, so a key never crosses the network unencrypted."""
     try:
         u = urlsplit(v.strip())
         where = u.hostname
@@ -178,7 +178,7 @@ def url(v: str) -> str | None:
     if u.scheme not in ("http", "https") or not where:
         return "Use a URL that starts with http:// or https://."
     if u.scheme == "http" and where not in LOOPBACK:
-        return "Use https:// for a server that is not on this Mac."
+        return "Use https:// for a server that is not on this computer."
     return None
 
 
@@ -250,9 +250,17 @@ def model_names(repos: list[str]) -> str:
     return "\n".join(names.get(repo, repo) for repo in repos)
 
 
+def recommended_local_model(mem_gb: int) -> str | None:
+    for key in (models.recommended_tier(mem_gb), "qwen2b"):
+        if mem_gb > 0 and models.fits(key, mem_gb):
+            return key
+    return None
+
+
 def model_hint(entry, mem_gb: int) -> str:
-    more = "" if entry.needs_gb <= mem_gb else " · more than this Mac has"
-    return f"{entry.note} · needs {entry.needs_gb} GB{more}"
+    recommended = "recommended for your RAM · " if entry.key == recommended_local_model(mem_gb) else ""
+    more = " · exceeds system RAM" if 0 < mem_gb < entry.needs_gb else ""
+    return f"{recommended}needs {entry.needs_gb} GB{more}"
 
 
 # ---- Welcome -----------------------------------------------------------------------------------
@@ -261,17 +269,20 @@ def welcome(ui, actions) -> list[int]:
     ui.begin(WELCOME)
     m = actions.machine()
     mem = m.memory_gb
+    recommended = recommended_local_model(mem)
+    memory = (f"{mem} GB · {tier_name(recommended)} recommended" if recommended else
+              f"{mem} GB · below the models' memory requirements" if mem > 0 else "could not detect memory")
     downloaded = model_names(m.models_downloaded) or "none downloaded yet"
     if m.models_missing:
         missing = model_names(m.models_missing).replace("\n", ", ")
         downloaded += f"\nMissing: {missing} · setup can download them"
     checks = [
         Check("SIP library", "built" if m.sip_library else "not built yet · run ./scripts/install.sh", m.sip_library),
-        Check("Memory", f"{mem} GB · {'9B' if mem >= 32 else '4B'} model recommended", True if mem >= 16 else None),
+        Check("Memory", memory, True if recommended else None),
         Check("Models", downloaded, None if m.models_missing else True),
         Check("Config", f"found · {home_dir()}/ (setup changes only what you pick)" if m.config_exists else f"new · {home_dir()}/", True),
     ]
-    page = Page(WELCOME, "Give your AI a phone number", "Calls answered and placed by models running on this Mac.",
+    page = Page(WELCOME, "Give your AI a phone number", "Calls answered and placed by models running on this computer.",
                 note="Picks a line, a brain and a voice, then checks it all works.", checks=checks)
     if not m.config_exists:
         if ui.choose(page, [Option("Continue"), Option("Cancel", "exit setup, nothing is saved")], back=False) == 1:
@@ -279,7 +290,7 @@ def welcome(ui, actions) -> list[int]:
         return [BRAIN, LINE, VOICE, CALLERS, CHECK, DONE]
     plans = [[LINE], [BRAIN], [VOICE], [CALLERS], [BRAIN, LINE, VOICE, CALLERS]]
     i = ui.choose(page, [Option("Add a line", "a phone number, a SIP address or your own trunk"),
-                         Option("Change the brain", "on this Mac, a plan you pay for, or your own endpoint"),
+                         Option("Change the brain", "on this computer, a plan you pay for, or your own endpoint"),
                          Option("Change the voice", "speech model, voice and speed"),
                          Option("Change what callers hear", "greeting, instructions, daily limit"),
                          Option("Run all steps"),
@@ -295,8 +306,8 @@ def brain(ui, actions, session: Session) -> None:
     cur = actions.current()
     kinds = list(BRAIN_KINDS)
     where = ui.choose(Page(BRAIN, "Where should your agent think?",
-                           "The model that writes what your agent says. Speech and voice always run on this Mac."),
-                      [Option("On this Mac", "private · nothing leaves this Mac"),
+                           "The model that writes what your agent says. Speech and voice always run on this computer."),
+                      [Option("On this computer", "private · nothing leaves this computer"),
                        Option(PLANS["claude"].label, PLANS["claude"].hint),
                        Option(PLANS["chatgpt"].label, PLANS["chatgpt"].hint),
                        Option("My own endpoint", "any OpenAI-compatible URL: LM Studio, llama.cpp, a hosted API")],
@@ -310,17 +321,21 @@ def brain(ui, actions, session: Session) -> None:
     catalog = list(models.CATALOG.values())
     keys = [m.key for m in catalog]
     default = keys.index(cur.tier if cur.brain_kind == "local" and cur.tier in keys else models.recommended_tier(mem))
+    recommended = recommended_local_model(mem)
+    if recommended and not cur.exists and "the brain" not in session.saved:
+        default = keys.index(recommended)
+    memory = (f"This computer has {mem} GB of memory. Models that need more may swap and answer slowly." if mem > 0 else
+              "Memory could not be detected. Compare the model requirements with your system RAM.")
     error = ""
     while True:
-        default = ui.choose(Page(BRAIN, "Which model?", f"This Mac has {mem} GB of memory. Models that need more "
-                                 "will swap and answer slowly.", error=error),
+        default = ui.choose(Page(BRAIN, "Which model?", memory, error=error),
                             [Option(m.name, model_hint(m, mem)) for m in catalog], default=default)
         error = ""
         chosen = catalog[default]
-        if not models.fits(chosen.key, mem):  # a model bigger than the memory works, slowly: say so before saving it
+        if mem > 0 and not models.fits(chosen.key, mem):
             try:
-                if ui.choose(Page(BRAIN, f"Use {chosen.name} anyway?", f"It needs {chosen.needs_gb} GB; this Mac has "
-                                  f"{mem} GB, so it will swap and answer slowly."),
+                if ui.choose(Page(BRAIN, f"Use {chosen.name} anyway?", f"It needs {chosen.needs_gb} GB; this computer has "
+                                  f"{mem} GB, so it may swap and answer slowly."),
                              [Option("Use it anyway")], default=1) != 0:
                     continue
             except Back:  # Esc or the Back option: choose again, with this model still picked
@@ -649,9 +664,9 @@ def free_sip_name(lines: dict[str, dict]) -> str:
 def sip_address(ui, actions, session: Session) -> None:
     name, address, error = free_sip_name(actions.current().lines), actions.lan_address(), ""
     while True:
-        name, address = ask(ui, Page(LINE, "Name your SIP address", "Softphones and other agents call sip:<name>@<this Mac>. "
+        name, address = ask(ui, Page(LINE, "Name your SIP address", "Softphones and other agents call sip:<name>@<this computer>. "
                                      "Free; no carrier.", error=error),
-                            [Field("Name", name, validate=sip_name), Field("This Mac's address", address, validate=host)])
+                            [Field("Name", name, validate=sip_name), Field("This computer's address", address, validate=host)])
         try:
             session.note(f"line {actions.add_sip_line(name, address)} (sip:{name}@{address})")
             return
@@ -688,7 +703,7 @@ def voice(ui, actions, session: Session) -> None:
     cur = actions.current()
     default = 0 if session.new_config and "the voice" not in session.saved else SPEECH_ENGINES.index(cur.tts_engine)
     engine = SPEECH_ENGINES[ui.choose(
-        Page(VOICE, "Which speech model?", "Both run on this Mac. You can hear a sample before saving."),
+        Page(VOICE, "Which speech model?", "Both run on this computer. You can hear a sample before saving."),
         [Option("Phonon", "recommended for new setups · one English voice"),
          Option("Kokoro", "American and British voices · adjustable speed")], default=default)]
     if engine == "phonon":
@@ -725,7 +740,7 @@ def voice(ui, actions, session: Session) -> None:
     error = ""
     while True:
         page = Page(VOICE, voices.title(v), voices.describe(v), error=error)
-        if ui.choose(page, [Option("Use this voice"), Option("Hear it", "plays a short sample on this Mac's speakers")]) == 0:
+        if ui.choose(page, [Option("Use this voice"), Option("Hear it", "plays a short sample on this computer's speakers")]) == 0:
             break
         try:
             busy(ui, session, replace(page, error=""), "Playing…", lambda: actions.play_sample(v, cur.speed, SAMPLE))
@@ -764,7 +779,7 @@ def phonon_voice(ui, actions, session: Session) -> None:
     error = ""
     while True:
         page = Page(VOICE, "Phonon voice", "One bundled English voice at its natural speed.", error=error)
-        i = ui.choose(page, [Option("Use this voice"), Option("Hear it", "plays a short sample on this Mac's speakers")])
+        i = ui.choose(page, [Option("Use this voice"), Option("Hear it", "plays a short sample on this computer's speakers")])
         try:
             if i == 0:
                 actions.save_voice(name, 1.0, engine="phonon")
@@ -902,7 +917,7 @@ def done_text(actions, session: Session) -> str:
     else:
         out.append("Lines    none yet · run setup again to add one")
     if cur.brain_kind == "local":
-        brain_row = f"on this Mac · {tier_name(cur.tier)}"
+        brain_row = f"on this computer · {tier_name(cur.tier)}"
     elif cur.brain_kind in PLANS:
         brain_row = f"your {PLANS[cur.brain_kind].name} subscription · {model_name(cur.brain_kind, cur.model)}"
     else:
@@ -926,7 +941,7 @@ def try_it(lines: dict[str, dict]) -> list[str]:
              for ln in lines.values() if ln.get("kind") == "sip"]
     out = [f"  call {numbers[0]} from any phone (your normal call rates)"] if numbers else []
     if users:
-        command, what = f"  pjsua --local-port 5070 sip:{users[0]}@127.0.0.1", "talk through this Mac's mic, free"
+        command, what = f"  pjsua --local-port 5070 sip:{users[0]}@127.0.0.1", "talk through this computer's mic, free"
         out += [f"{command}   {what}"] if len(command) + 3 + len(what) <= WIDTH else [command, f"    {what}"]
     if out:
         return out

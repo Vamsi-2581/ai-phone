@@ -288,7 +288,7 @@ class Actions:
                                f"({e.detail}). Update ai-phone, or pick another brain.")
         if e.kind in ("tool_use", "tools_unknown"):
             return ActionError(f"{cli} gives a call's session tools of its own, and what callers say must not reach "
-                               f"anything that can read this Mac. Update {cli}, then check again.")
+                               f"anything that can read this computer. Update {cli}, then check again.")
         if e.kind == "rate_limited":
             return ActionError(f"Your {cli} plan has reached its limit for now. Try again later, or pick another brain.")
         # anything else (an org policy, a provider incident) was classified from the CLI's own text, which is
@@ -527,7 +527,7 @@ class Actions:
     # ---- lines by hand ---------------------------------------------------------------------------
 
     def lan_address(self) -> str:
-        """The address other devices reach this Mac on: the source address of the default route (nothing is sent)."""
+        """The address other devices reach this computer on: the source address of the default route (nothing is sent)."""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(("192.0.2.1", 9))
@@ -750,7 +750,7 @@ def _samples(audio):
 
 
 class KokoroPlayer:
-    """Speaks a sample through this Mac's speakers with the downloaded Kokoro model (loaded on first use)."""
+    """Speaks a sample through this computer's speakers with the downloaded Kokoro model (loaded on first use)."""
 
     def __init__(self, load=None, run=subprocess.run):
         self._load, self._run = load, run

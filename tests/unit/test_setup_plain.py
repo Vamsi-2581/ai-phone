@@ -57,7 +57,7 @@ def test_choose_prints_the_page_and_enter_takes_the_default(typed, capsys):
 
 def test_welcome_page_has_a_title_note_and_no_back(typed, capsys):
     typed.answers += ["b", "2"]
-    page = Page(0, "Give your AI a phone number", "Calls answered and placed by models running on this Mac.",
+    page = Page(0, "Give your AI a phone number", "Calls answered and placed by models running on this computer.",
                 note="Picks a line, a brain and a voice, then checks it all works.",
                 checks=[Check("SIP library", "not built yet · run ./scripts/install.sh", False),
                         Check("Memory", "8 GB · 4B model recommended", None),
@@ -68,7 +68,7 @@ def test_welcome_page_has_a_title_note_and_no_back(typed, capsys):
         "",
         "ai-phone setup",
         "Give your AI a phone number",
-        "Calls answered and placed by models running on this Mac.",
+        "Calls answered and placed by models running on this computer.",
         "Picks a line, a brain and a voice, then checks it all works.",
         "  ✗ SIP library   not built yet · run ./scripts/install.sh",
         "  ○ Memory        8 GB · 4B model recommended",
@@ -138,9 +138,9 @@ def test_ask_takes_defaults_and_asks_again_until_valid(typed, capsys):
     typed.answers += ["", "Agent", "desk", "192.0.2.10", "5"]
     must_be_lower = lambda v: None if v.islower() else "Use lowercase letters, digits and dashes."  # noqa: E731
     fields = [Field("Name", "agent", validate=must_be_lower), Field("Desk", validate=must_be_lower),
-              Field("This Mac's address", "", placeholder="192.0.2.1"), Field("Outbound calls per day", "20")]
+              Field("This computer's address", "", placeholder="192.0.2.1"), Field("Outbound calls per day", "20")]
     assert PlainUI().ask(Page(2, "Name your SIP address"), fields) == ["agent", "desk", "192.0.2.10", "5"]
-    assert typed.prompts == ["Name [agent]: ", "Desk: ", "Desk: ", "This Mac's address (192.0.2.1): ",
+    assert typed.prompts == ["Name [agent]: ", "Desk: ", "Desk: ", "This computer's address (192.0.2.1): ",
                              "Outbound calls per day [20]: "]
     assert capsys.readouterr().out.count("! Use lowercase letters, digits and dashes.\n") == 1
 
@@ -219,7 +219,7 @@ def test_progress_prints_at_most_once_per_five_percent(capsys):
 def sip_setup_answers():
     return [
         "",   # Welcome: Continue
-        "",   # Brain: On this Mac
+        "",   # Brain: On this computer
         "",   # model: Qwen3.5 4B
         "2",  # Line: A SIP address
         "", "",  # name and address: defaults
@@ -307,7 +307,7 @@ def test_run_setup_in_a_terminal_runs_the_full_screen_app(capsys, monkeypatch, t
     seen = {}
 
     def run_tui(flow_fn, summary=None):
-        seen["flow"] = flow_fn(ScriptedUI([("Give your AI", "Continue"), ("Where should your agent think?", "On this Mac"),
+        seen["flow"] = flow_fn(ScriptedUI([("Give your AI", "Continue"), ("Where should your agent think?", "On this computer"),
                                            ("Which model?", "<default>"), ("How should people reach", "<quit>")]))
         seen["summary"] = summary()  # what a run the app had to leave early says: the same session
         return Outcome(0, "Saved\n  summary")
