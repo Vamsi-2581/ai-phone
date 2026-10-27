@@ -56,6 +56,7 @@ class Session:
     saved: list[str] = field(default_factory=list)  # in words: "the brain", "line twilio (+1555…, …)"
     working: tuple[str, str] | None = None  # the step running now: (its label, "carrier" | "download" | "")
     new_config: bool = False
+    caller_id_only: bool = False  # the returning user's caller-ID shortcut uses the Settings step
 
     def note(self, what: str) -> None:
         if what not in self.saved:
@@ -86,7 +87,7 @@ def run(ui, actions, session: Session | None = None) -> Outcome:
     session = Session() if session is None else session
     try:
         session.new_config = not actions.current().exists
-        plan = welcome(ui, actions)
+        plan = welcome(ui, actions, session)
         i = 0
         while i < len(plan):
             ui.begin(plan[i])
@@ -97,7 +98,7 @@ def run(ui, actions, session: Session | None = None) -> Outcome:
                 if not b.at_start:
                     continue  # a later question in the step: start the step again
                 if i == 0:
-                    plan, i = welcome(ui, actions), 0
+                    plan, i = welcome(ui, actions, session), 0
                 else:
                     i -= 1
         return Outcome(0, session.summary or done_text(actions, session))
@@ -265,8 +266,9 @@ def model_hint(entry, mem_gb: int) -> str:
 
 # ---- Welcome -----------------------------------------------------------------------------------
 
-def welcome(ui, actions) -> list[int]:
+def welcome(ui, actions, session: Session) -> list[int]:
     ui.begin(WELCOME)
+    session.caller_id_only = False
     m = actions.machine()
     mem = m.memory_gb
     recommended = recommended_local_model(mem)
@@ -288,16 +290,18 @@ def welcome(ui, actions) -> list[int]:
         if ui.choose(page, [Option("Continue"), Option("Cancel", "exit setup, nothing is saved")], back=False) == 1:
             raise Cancel()
         return [MODE, BRAIN, LINE, VOICE, CALLERS, CHECK, DONE]
-    plans = [[LINE], [BRAIN], [VOICE], [MODE, CALLERS], [CALLERS], [MODE, BRAIN, LINE, VOICE, CALLERS]]
+    plans = [[LINE], [BRAIN], [VOICE], [MODE, CALLERS], [CALLERS], [CALLERS], [MODE, BRAIN, LINE, VOICE, CALLERS]]
     i = ui.choose(page, [Option("Add a line", "a phone number, a SIP address or your own trunk"),
                          Option("Change the brain", "on this computer, a plan you pay for, or your own endpoint"),
                          Option("Change the voice", "speech model, voice and speed"),
                          Option("Change call directions", "receive calls, place calls, or both"),
                          Option("Change call settings", "greeting, instructions, daily limit"),
+                         Option("Change caller ID", "show your line's number or your own verified number"),
                          Option("Run all steps"),
                          Option("Cancel", "exit setup, nothing is changed")], back=False)
     if i == len(plans):
         raise Cancel()
+    session.caller_id_only = i == 5
     return plans[i] + [CHECK, DONE]
 
 
@@ -626,48 +630,54 @@ def caller_id(ui, actions, session: Session, carrier: str, name: str, creds: dic
             return
         error = ""
         try:
-            (mine,) = ask(ui, Page(LINE, "Your mobile number", "In international format, like +447700900123."),
-                          [Field("Mobile number", mobile, validate=e164)])
-            step = busy(ui, session, Page(LINE, f"Verifying {mine}"), f"Asking {name} to verify {mine}…",
-                        lambda: actions.start_caller_id(carrier, creds, mine))
-            verified = (typed_code(ui, actions, session, carrier, creds, step, name) if step.kind == "enter_code_in_cli"
-                        else keyed_code(ui, actions, session, carrier, creds, step, name))
+            verify_caller_id(ui, actions, session, carrier, name, creds, line_id, number, mobile)
         except Back:
             continue
         except ActionError as e:
             error = str(e)
             continue
-        if verified:
-            try:
-                actions.record_caller_id(line_id, mine, carrier)
-                session.note(f"line {line_id} calls out as {mine}")
-            except ActionError as e:  # the carrier has accepted it by now: never lose that quietly
-                ui.choose(Page(LINE, f"{mine} is verified, but not saved",
-                               f"{mine} is verified with {name}; run: uv run ai-phone lines verify-caller-id "
-                               f"{line_id} {mine} --key-env <NAME> to record it.", error=str(e)),
-                          [Option("Continue")], back=False)
-        else:
-            ui.choose(Page(LINE, "Verification did not complete",
-                           f"Your agent still calls out as {number}. To try again: "
-                           f"uv run ai-phone lines verify-caller-id {line_id} {mine} --key-env <NAME>"),
-                      [Option("Continue")], back=False)
         return
 
 
-def typed_code(ui, actions, session: Session, carrier: str, creds: dict, step, name: str) -> bool:
+def verify_caller_id(ui, actions, session: Session, carrier: str, name: str, creds: dict, line_id: str,
+                     current: str, mobile: str = "", stage: int = LINE) -> None:
+    """Shared verification for a newly connected number and the existing-line settings shortcut."""
+    (mine,) = ask(ui, Page(stage, "Your mobile number", "In international format, like +447700900123."),
+                  [Field("Mobile number", mobile, validate=e164)])
+    step = busy(ui, session, Page(stage, f"Verifying {mine}"), f"Asking {name} to verify {mine}…",
+                lambda: actions.start_caller_id(carrier, creds, mine))
+    verified = (typed_code(ui, actions, session, carrier, creds, step, name, stage) if step.kind == "enter_code_in_cli"
+                else keyed_code(ui, actions, session, carrier, creds, step, name, stage))
+    if verified:
+        try:
+            actions.record_caller_id(line_id, mine, carrier)
+            session.note(f"line {line_id} calls out as {mine}")
+        except ActionError as e:  # the carrier has accepted it by now: never lose that quietly
+            ui.choose(Page(stage, f"{mine} is verified, but not saved",
+                           f"{mine} is verified with {name}; run: uv run ai-phone lines verify-caller-id "
+                           f"{line_id} {mine} --key-env <NAME> to record it.", error=str(e)),
+                      [Option("Continue")], back=False)
+    else:
+        ui.choose(Page(stage, "Verification did not complete",
+                       f"Your agent still calls out as {current}. To try again: "
+                       f"uv run ai-phone lines verify-caller-id {line_id} {mine} --key-env <NAME>"),
+                  [Option("Continue")], back=False)
+
+
+def typed_code(ui, actions, session: Session, carrier: str, creds: dict, step, name: str, stage: int = LINE) -> bool:
     """The carrier texted a code: up to three tries at it, as the CLI's verify-caller-id allows."""
     error = ""
     for _ in range(CALLER_ID_TRIES):
-        (typed,) = ask(ui, Page(LINE, "Enter the code", step.instructions, error=error),
+        (typed,) = ask(ui, Page(stage, "Enter the code", step.instructions, error=error),
                        [Field("Code", placeholder="6 digits", validate=six_digits)])
-        if busy(ui, session, Page(LINE, "Enter the code", step.instructions), f"Asking {name} to check the code…",
+        if busy(ui, session, Page(stage, "Enter the code", step.instructions), f"Asking {name} to check the code…",
                 lambda: actions.check_caller_id(carrier, creds, step, typed)):
             return True
         error = "That code was not accepted."
     return False
 
 
-def keyed_code(ui, actions, session: Session, carrier: str, creds: dict, step, name: str) -> bool:
+def keyed_code(ui, actions, session: Session, carrier: str, creds: dict, step, name: str, stage: int = LINE) -> bool:
     """The carrier is calling the phone and the instructions hold the code to key in; wait for it to accept."""
     def wait() -> bool:
         deadline = time.monotonic() + CALLER_ID_WAIT_SEC
@@ -678,7 +688,7 @@ def keyed_code(ui, actions, session: Session, carrier: str, creds: dict, step, n
                 return False
             time.sleep(CALLER_ID_POLL_SEC)
 
-    return busy(ui, session, Page(LINE, f"{name} is calling you now", body=step.instructions),
+    return busy(ui, session, Page(stage, f"{name} is calling you now", body=step.instructions),
                 "Waiting for you to enter the code on the call… (up to 2 minutes)", wait)
 
 
@@ -828,7 +838,76 @@ def phonon_voice(ui, actions, session: Session) -> None:
 
 # ---- Callers -----------------------------------------------------------------------------------
 
+def change_caller_id(ui, actions, session: Session) -> None:
+    cur = actions.current()
+    if not cur.allow_outbound:
+        ui.choose(Page(CALLERS, "Outgoing calls are off",
+                       "Choose Change call directions in setup to allow outgoing calls before choosing a caller ID."),
+                  [Option("Continue")])
+        return
+    lines = [(line_id, ln) for line_id, ln in cur.lines.items()
+             if ln.get("kind", "trunk") == "trunk" and ln.get("number")
+             and (ln.get("provider") is None or provider_of(ln).get("state", "pending") == "ready")]
+    if not lines:
+        ui.choose(Page(CALLERS, "No phone-number lines are ready",
+                       "Add a phone-number line first, or finish setting up its pending order. "
+                       "SIP addresses do not have a phone-number caller ID."), [Option("Continue")])
+        return
+    line_id, ln = lines[ui.choose(Page(CALLERS, "Which line's caller ID?",
+                                      "Choose the line whose outgoing number you want to change."),
+                                 [Option(f"{line_id} · {ln['number']}",
+                                         f"currently shows {ln.get('caller_id') or ln['number']}")
+                                  for line_id, ln in lines])]
+    number, current = ln["number"], ln.get("caller_id") or ln["number"]
+    carrier = provider_of(ln).get("name", "")
+    name = dict(CARRIERS).get(carrier)
+    verified = dict.fromkeys(v["number"] for v in (ln.get("verified_caller_ids") or [])
+                             if v.get("provider", "") == carrier and v.get("number") and v["number"] != number)
+    numbers = [number, *verified]
+    options = [Option(f"Line's number · {number}", "the number on this line"),
+               *[Option(f"Your verified number · {n}", "already verified for this line") for n in verified]]
+    if name:
+        options.append(Option("Verify another number you own", f"{name} will text or call you with a verification code"))
+    default = numbers.index(current) if current in numbers else 0
+    error = ""
+    while True:
+        detail = f"Currently shows {current}. Your carrier controls what the recipient sees."
+        if not name:
+            detail += " To verify another number on this trunk, contact your provider."
+        selected = ui.choose(Page(CALLERS, "Which number should people see?", detail, error=error), options, default=default)
+        error = ""
+        try:
+            if selected < len(numbers):
+                actions.use_caller_id(line_id, numbers[selected])
+                session.note(f"line {line_id} calls out as {numbers[selected]}")
+            else:
+                creds = actions.saved_keys(carrier)
+                if creds and ui.choose(Page(CALLERS, f"Use the saved {name} key?",
+                                            "Use the account this line belongs to."),
+                                       [Option("Use the saved key"), Option("Enter a different key")]) == 1:
+                    creds = None
+                if not creds:
+                    typed = [v.strip() for v in ask(ui, Page(CALLERS, f"Your {name} credentials",
+                                                           "Use the account this line belongs to. These credentials "
+                                                           "are used only for this verification."), credential_fields(carrier))]
+                    creds = dict(zip(CARRIER_KEYS[carrier], typed, strict=True))
+                owned = busy(ui, session, Page(CALLERS, f"Checking your {name} account"),
+                             f"Checking your {name} account…",
+                             lambda: actions.owned_numbers(carrier, creds))
+                if not any(n.e164 == number for n in owned):
+                    raise ActionError(f"Could not find {number} on this {name} account. "
+                                      "Enter credentials for the account this line belongs to.")
+                verify_caller_id(ui, actions, session, carrier, name, creds, line_id, current, stage=CALLERS)
+            return
+        except Back:
+            continue
+        except ActionError as e:
+            error = str(e)
+
+
 def callers(ui, actions, session: Session) -> None:
+    if session.caller_id_only:
+        return change_caller_id(ui, actions, session)
     cur = actions.current()
     greeting, instructions, limit, error = cur.greeting, cur.instructions, str(cur.daily_limit), ""
     while True:

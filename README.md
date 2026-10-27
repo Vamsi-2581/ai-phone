@@ -56,6 +56,11 @@ Setup does not install a background service. These choices set independent `call
 receiving is off, and outgoing commands are refused when placing calls is off. Change them by running setup again
 and choosing **Change call directions**, then restart a running daemon to apply the change.
 
+To change the number people see when your agent calls, run setup again and choose **Change caller ID**.
+Pick a line, then its purchased number or one of your verified numbers. You can also verify another number you
+own through Twilio or Telnyx. Switching back to the line's number keeps your verified numbers for later;
+restart a running daemon to apply the selection.
+
 The Voice step offers Phonon 31M English (streaming, one bundled voice at normal speed) and Kokoro
 (American and British voices, adjustable speed). Both run directly through MLX in the daemon's TTS worker.
 Existing configurations keep Kokoro. To select Phonon by hand, set

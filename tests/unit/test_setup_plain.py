@@ -9,7 +9,7 @@ import pytest
 from ai_phone.setup import flow, run_setup
 from ai_phone.setup.plain import BLANK_LIMIT, NO_ANSWER, PlainUI
 from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
-from tests.unit.test_setup_flow import FakeActions, ScriptedUI
+from tests.unit.test_setup_flow import FakeActions, ScriptedUI, caller_id_line
 
 LINE_PAGE = Page(3, "Which connection should ai-phone use?", "You can add more lines later by running setup again.",
                  checks=[Check("Twilio key", "works · 2 numbers on this account", True)])
@@ -247,6 +247,22 @@ def test_run_setup_plain_end_to_end(typed, capsys, monkeypatch, tmp_path):
     assert "  pjsua --local-port 5070 sip:agent@127.0.0.1" in out
     assert out.splitlines()[-2:] == ["  1) Finish", "Choose [1]: "]
     assert not typed.answers
+
+
+def test_plain_setup_can_change_an_existing_lines_caller_id(typed, capsys, monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    actions = FakeActions(exists=True, lines={"main": caller_id_line()})
+    monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
+    # Change caller ID, main, use the line's own number, Check, Finish.
+    typed.answers += ["6", "1", "1", "", ""]
+    assert run_setup(plain=True) == 0
+    assert actions.args("use_caller_id") == [("main", "+15555550100")]
+    assert not actions.args("saved_keys") and not actions.args("start_caller_id")
+    out = capsys.readouterr().out
+    assert "6) Change caller ID" in out and "Which line's caller ID?" in out
+    assert "1) Line's number · +15555550100" in out and "2) Your verified number · +15555550101" in out
+    assert "S T E P  6  O F  8  ·  S E T T I N G S" in out
+    assert "restart" in out.lower() and not typed.answers
 
 
 class EndOfInput:

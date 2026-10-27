@@ -128,6 +128,35 @@ async def test_call_directions_page_explains_runtime_and_all_choices_fit(width):
 
 
 @pytest.mark.asyncio
+async def test_existing_setup_caller_id_shortcut_is_visible_and_changes_the_selected_number():
+    from ai_phone.setup import flow
+    from tests.unit.test_setup_flow import FakeActions, caller_id_line
+
+    actions = FakeActions(exists=True, lines={"main": caller_id_line()})
+    app = SetupApp(lambda ui: flow.run(ui, actions))
+    async with app.run_test(size=(104, 40)) as pilot:
+        await wait_for(pilot, app, showing(app, "[6] Change caller ID"))
+        await pilot.press("6")
+        await wait_for(pilot, app, showing(app, "Which line's caller ID?"))
+        assert "● Settings" in screen_text(app)
+        await pilot.press("1")
+        await wait_for(pilot, app, showing(app, "Which number should people see?"))
+        text = screen_text(app)
+        assert "Line's number · +15555550100" in text
+        assert "Your verified number · +15555550101" in text
+        assert "Verify another number you own" in text
+        await pilot.press("1")
+        await wait_for(pilot, app, showing(app, "Everything works"))
+        await pilot.press("enter")
+        await wait_for(pilot, app, showing(app, "You're set up"))
+        await pilot.press("enter")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert app.outcome.code == 0
+    assert actions.args("use_caller_id") == [("main", "+15555550100")]
+    assert not actions.args("saved_keys") and not actions.args("start_caller_id")
+
+
+@pytest.mark.asyncio
 async def test_digits_jump_and_escape_goes_back():
     got = {}
 

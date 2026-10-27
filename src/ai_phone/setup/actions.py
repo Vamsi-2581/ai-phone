@@ -32,7 +32,7 @@ import yaml
 import ai_phone
 from ai_phone import models, paths, voices
 from ai_phone.cli_lines import journal_setups, manual_line, next_line_id, provision_flow, write_line
-from ai_phone.config import SUBSCRIPTION_MODELS, Config, ConfigError, line_password_env, load_config
+from ai_phone.config import E164_RE, SUBSCRIPTION_MODELS, Config, ConfigError, line_password_env, load_config
 from ai_phone.control.client import probe
 from ai_phone.lines.config_writer import read_raw, write_raw
 from ai_phone.lines.forward import divert_codes
@@ -531,6 +531,31 @@ class Actions:
             verified.append({"number": number, "provider": carrier,
                              "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
             ln["verified_caller_ids"] = verified
+            ln["caller_id"] = number
+        self._edit(change)
+
+    def use_caller_id(self, line_id: str, number: str) -> None:
+        """Select the line's own number or an ID already verified for its carrier, without contacting it."""
+        def change(raw: dict) -> None:
+            lines = raw.get("lines")
+            ln = lines.get(line_id) if isinstance(lines, dict) else None
+            if not isinstance(ln, dict):
+                raise ActionError(f"no line {line_id}; add a phone line before choosing its caller ID")
+            if ln.get("kind", "trunk") != "trunk":
+                raise ActionError(f"line {line_id} uses a SIP address; choose a phone line to change its caller ID")
+            provider = ln.get("provider")
+            if provider is not None and (not isinstance(provider, dict) or provider.get("state", "pending") != "ready"):
+                raise ActionError(f"line {line_id} is not ready; finish its setup before choosing its caller ID")
+            carrier = provider.get("name", "") if provider else ""
+            if not isinstance(number, str) or not E164_RE.fullmatch(number):
+                raise ActionError("choose a phone number in E.164 format, like +15555550100")
+            verified = ln.get("verified_caller_ids") or []
+            allowed = isinstance(verified, list) and any(
+                isinstance(v, dict) and v.get("number") == number and v.get("provider", "") == carrier
+                for v in verified
+            )
+            if number != ln.get("number") and not allowed:
+                raise ActionError(f"{number} is not verified for line {line_id}; verify it first or choose the line's own number")
             ln["caller_id"] = number
         self._edit(change)
 

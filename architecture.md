@@ -575,7 +575,7 @@ Each step asks only what applies to the earlier answers:
 
 | Step | Asks | Saves |
 |---|---|---|
-| Welcome | Shows checks of this computer: SIP library, memory and the recommended model, downloaded models, config. With a config already there: add a line, change the brain, voice, call directions or call settings, or run every step | — |
+| Welcome | Shows checks of this computer: SIP library, memory and the recommended model, downloaded models, config. With a config already there: add a line, change the brain, voice, call directions, call settings or caller ID, or run every step | — |
 | Mode | Receive and place calls, place calls only, or receive calls only. Explains that receiving needs the daemon to stay running; outgoing-only users start and stop it when needed | `calls.allow_inbound`, `calls.allow_outbound` |
 | Brain | On this computer (one model from the catalog in `models.py`; the list shows memory requirements and a RAM-based recommendation, and a model exceeding detected RAM is confirmed first), or your own OpenAI-compatible endpoint: URL, model and an optional key, then one short test request | `brain:`, `models.tier`; the key in `secrets.env` |
 | Line | A phone number, a free SIP address, your own SIP trunk, or skip. For a phone number: Twilio or Telnyx; the key is checked with a free read-only request that lists the account's numbers; then a new number, bought only after a confirmation that shows the number and its monthly price, or one already on the account, connected for free (§14a.3); then, if wanted, the codes to divert your own mobile to it | the line; carrier keys and SIP passwords in `secrets.env`; the carrier journal in `lines/` |
@@ -588,11 +588,20 @@ The Line step offers mobile forwarding only when receiving is enabled, and calle
 placing calls is enabled. Connecting an existing carrier number still changes its routing; setup explains
 that incoming calls will be rejected in outbound-only mode.
 
+Returning users can choose **Change caller ID** in Welcome to open the existing-line chooser in Settings.
+It shows each ready trunk's current outgoing number, then offers the line's own number, numbers already verified
+for that line and provider, or fresh Twilio/Telnyx verification. Selecting an existing number writes only that
+line's `caller_id`, keeps verification history and needs no carrier request or credentials. Fresh verification
+uses saved keys or credentials entered for that verification only, first checking that the account lists the
+selected line's number; failure or cancellation keeps the current caller ID. The shortcut explains when outgoing
+calls are disabled or no phone-number line is ready. Changes
+take effect on daemon restart.
+
 The chooser recommends Qwen3.5 2B for 8–15 GB of detected RAM, 4B for 16–31 GB, and 9B for 32 GB or more.
 It shows no recommendation when memory cannot be detected or is below 8 GB. A fresh setup selects the recommendation;
 an existing choice stays selected. Setup saves the chosen model explicitly; the runtime `auto` rule in §5.5 is unchanged.
 
-Everything is saved under `~/.ai-phone/` (or `AI_PHONE_HOME`): `config.yaml` (0600) and `secrets.env` (0600, written only with `write_secret`). A step's answers are kept in memory and written when the step completes, so cancelling never leaves half a step behind. The exception is a number: once it is bought or connected, its line is written at once, because the number is set up at the carrier. Running setup again reads what is there and changes only what is picked. Keys and passwords are typed into hidden fields and never shown, logged or put in an error. Setup never places a phone call; the voice sample plays locally.
+Everything is saved under `~/.ai-phone/` (or `AI_PHONE_HOME`): `config.yaml` (0600) and `secrets.env` (0600, written only with `write_secret`). A step's answers are kept in memory and written when the step completes, so cancelling never leaves half a step behind. The exception is a number: once it is bought or connected, its line is written at once, because the number is set up at the carrier. Running setup again reads what is there and changes only what is picked. Keys and passwords are typed into hidden fields and never shown, logged or put in an error. Setup never places an agent call; the voice sample plays locally. Choosing caller-ID verification asks the carrier to text or call the owner's number.
 
 ### 10.4 Models (`ai-phone models pull [--tier <model>]`)
 

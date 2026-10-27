@@ -517,6 +517,123 @@ def test_record_caller_id_needs_a_line(home):
         a.record_caller_id("ghost", "+447700900123", "fake")
 
 
+def caller_id_actions(home, **line_settings):
+    line = {"kind": "trunk", "number": BOUGHT, "caller_id": "+15555550100", "user": "mainuser",
+            "registrar": "sip:trunk.example.org", "dial_domain": "trunk.example.org",
+            "provider": {"name": "fake", "state": "ready", "resources": {"number_id": "number-1"}},
+            "verified_caller_ids": [{"number": "+15555550100", "provider": "fake", "verified_at": "2026-09-10T12:00:00Z"}],
+            **line_settings}
+    return make(home, yaml.safe_dump({
+        "lines": {"main": line, "agent": {"kind": "sip", "user": "agent", "aor": "sip:agent@example.org",
+                                            "accept_invites_from": "lan"}},
+        "inbound": {"greeting": "Hello there."}, "calls": {"daily_limit": 7, "allow_inbound": False},
+    }))
+
+
+def test_use_caller_id_switches_both_ways_without_keys_or_carrier_requests(home, monkeypatch):
+    a = caller_id_actions(home)
+    before = raw(home)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("selecting an existing caller ID must not read secrets or contact a carrier")
+
+    monkeypatch.setattr(act, "load_secrets", forbidden)
+    monkeypatch.setattr(a, "_provider", forbidden)
+    a.use_caller_id("main", BOUGHT)
+    expected = before.copy()
+    expected["lines"]["main"]["caller_id"] = BOUGHT
+    assert raw(home) == expected  # includes verification history, carrier resources, other lines and settings
+    assert stat.S_IMODE((home / "config.yaml").stat().st_mode) == 0o600
+    a.use_caller_id("main", "+15555550100")
+    expected["lines"]["main"]["caller_id"] = "+15555550100"
+    assert raw(home) == expected
+    assert load_config(home / "config.yaml").lines["main"].caller_id == "+15555550100"
+
+
+@pytest.mark.parametrize("provider", [None, {"name": "fake", "state": "ready"}])
+def test_use_caller_id_keeps_an_omitted_verification_list_omitted(home, provider):
+    a = caller_id_actions(home, provider=provider)
+    content = raw(home)
+    del content["lines"]["main"]["verified_caller_ids"]
+    (home / "config.yaml").write_text(yaml.safe_dump(content))
+    a.use_caller_id("main", BOUGHT)
+    content["lines"]["main"]["caller_id"] = BOUGHT
+    assert raw(home) == content
+
+
+@pytest.mark.parametrize("provider", [{}, {"name": "fake"}, {"name": "fake", "state": "pending"},
+                                    {"name": "fake", "state": "failed"}, {"name": "fake", "state": "rollback_failed"}])
+def test_use_caller_id_refuses_a_line_whose_provider_is_not_ready(home, provider):
+    a = caller_id_actions(home, provider=provider)
+    before = (home / "config.yaml").read_bytes()
+    with pytest.raises(ActionError, match="not ready; finish its setup"):
+        a.use_caller_id("main", BOUGHT)
+    assert (home / "config.yaml").read_bytes() == before
+
+
+@pytest.mark.parametrize(("line_id", "number", "message"), [
+    ("missing", BOUGHT, "no line missing"),
+    ("agent", BOUGHT, "uses a SIP address"),
+    ("main", "+15555550101", "not verified for line main"),
+    ("main", "sip:agent@example.org", "E.164 format"),
+    ("main", "", "E.164 format"),
+])
+def test_use_caller_id_rejects_invalid_selections_without_writing(home, line_id, number, message):
+    a = caller_id_actions(home)
+    before = (home / "config.yaml").read_bytes()
+    with pytest.raises(ActionError, match=message):
+        a.use_caller_id(line_id, number)
+    assert (home / "config.yaml").read_bytes() == before
+
+
+@pytest.mark.parametrize("verified", [[{"number": "+15555550100", "provider": "telnyx"}],
+                                    [{"number": "+15555550100"}], []])
+def test_use_caller_id_requires_verification_for_this_lines_carrier_even_when_already_selected(home, verified):
+    a = caller_id_actions(home, verified_caller_ids=verified)
+    before = (home / "config.yaml").read_bytes()
+    with pytest.raises(ActionError, match="not verified for line main"):
+        a.use_caller_id("main", "+15555550100")
+    assert (home / "config.yaml").read_bytes() == before
+
+
+def test_use_caller_id_does_not_borrow_verification_from_another_line(home):
+    a = caller_id_actions(home, verified_caller_ids=[])
+    content = raw(home)
+    content["lines"]["other"] = {**content["lines"]["main"], "user": "otheruser",
+                                  "verified_caller_ids": [{"number": "+15555550100", "provider": "fake"}]}
+    (home / "config.yaml").write_text(yaml.safe_dump(content))
+    with pytest.raises(ActionError, match="not verified for line main"):
+        a.use_caller_id("main", "+15555550100")
+    assert raw(home) == content
+
+
+@pytest.mark.parametrize("explicit_null", [False, True])
+def test_use_caller_id_on_a_manual_trunk_matches_empty_provider_verification(home, explicit_null):
+    a = caller_id_actions(home, provider=None, verified_caller_ids=[{"number": "+15555550100"}])
+    content = raw(home)
+    if not explicit_null:
+        del content["lines"]["main"]["provider"]
+    (home / "config.yaml").write_text(yaml.safe_dump(content))
+    a.use_caller_id("main", BOUGHT)
+    a.use_caller_id("main", "+15555550100")
+    assert raw(home) == content
+    content["lines"]["main"]["verified_caller_ids"][0]["provider"] = "fake"
+    (home / "config.yaml").write_text(yaml.safe_dump(content))
+    with pytest.raises(ActionError, match="not verified for line main"):
+        a.use_caller_id("main", "+15555550100")
+    assert raw(home) == content
+
+
+def test_use_caller_id_rolls_back_if_the_rest_of_the_config_is_invalid(home):
+    a = caller_id_actions(home)
+    content = raw(home)
+    content["calls"]["daily_limit"] = -1
+    (home / "config.yaml").write_text(yaml.safe_dump(content))
+    with pytest.raises(ActionError, match="daily_limit"):
+        a.use_caller_id("main", BOUGHT)
+    assert raw(home) == content
+
+
 # ---- lines by hand ---------------------------------------------------------------------------
 
 def test_lan_address(home, monkeypatch):

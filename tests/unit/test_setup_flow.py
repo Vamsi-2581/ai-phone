@@ -150,7 +150,7 @@ class FakeActions:
         return [a for n, a in self.calls if n == name]
 
     def changes(self):
-        return [n for n, _ in self.calls if n.startswith(("save_", "add_", "buy_", "attach_", "forward", "record_"))]
+        return [n for n, _ in self.calls if n.startswith(("save_", "add_", "buy_", "attach_", "forward", "record_", "use_"))]
 
     # what the flow reads
     def machine(self):
@@ -261,6 +261,10 @@ class FakeActions:
 
     def record_caller_id(self, line_id, number, carrier):
         self._call("record_caller_id", line_id, number, carrier)
+        self.cur.lines[line_id]["caller_id"] = number
+
+    def use_caller_id(self, line_id, number):
+        self._call("use_caller_id", line_id, number)
         self.cur.lines[line_id]["caller_id"] = number
 
     def add_sip_line(self, name, host):
@@ -382,7 +386,8 @@ def test_welcome_shows_the_machine_checks():
         Check("Config", "found · ~/.ai-phone/ (setup changes only what you pick)", True),
     ]
     assert [o.label for o in ui.menus[0][1]] == ["Add a line", "Change the brain", "Change the voice",
-                                                "Change call directions", "Change call settings", "Run all steps", "Cancel"]
+                                                "Change call directions", "Change call settings", "Change caller ID",
+                                                "Run all steps", "Cancel"]
 
 
 @pytest.mark.parametrize("label,inbound,outbound", [
@@ -882,6 +887,235 @@ def test_the_caller_id_step_is_only_for_a_carrier_number_that_is_ready():
     sip = FakeActions(exists=True)
     drive(ui, sip)
     assert not ui.questions("Show your own number") and not sip.args("start_caller_id")
+
+
+def caller_id_line(*, carrier="telnyx", number="+15555550100", caller="+15555550101"):
+    return {"kind": "trunk", "number": number, "caller_id": caller,
+            "provider": {"name": carrier, "state": "ready"} if carrier else None,
+            "verified_caller_ids": [{"number": caller, "provider": carrier, "verified_at": "2026-10-27T00:00:00Z"}]}
+
+
+CALLER_ID_OWNED = [Number("+15555550100", None, None, False, "PN-test")]
+
+
+def edit_caller_id(*answers, line_id="main", number="+15555550100"):
+    return ScriptedUI([("Give your AI", "Change caller ID"),
+                       ("Which line's caller ID?", f"{line_id} · {number}"), *answers])
+
+
+@pytest.mark.parametrize("selection,expected", [("Line's number · +15555550100", "+15555550100"),
+                                                ("<default>", "+15555550101")])
+def test_saved_caller_id_can_be_changed_without_contacting_the_carrier(selection, expected):
+    line = caller_id_line()
+    history = list(line["verified_caller_ids"])
+    actions = FakeActions(exists=True, lines={"main": line})
+    ui = edit_caller_id(("Which number should people see?", selection),
+                        ("Everything works", "Continue"), FINISH)
+    outcome = drive(ui, actions)
+    assert outcome.code == 0
+    assert actions.changes() == ["use_caller_id"]
+    assert actions.args("use_caller_id") == [("main", expected)]
+    assert line["caller_id"] == expected and line["verified_caller_ids"] == history
+    assert not actions.args("saved_keys") and not actions.args("start_caller_id")
+    assert not actions.args("owned_numbers") and not actions.args("attach_number")
+    assert ui.steps == [WELCOME, CALLERS, CHECK, DONE]
+    _, options, default, _ = ui.menu("Which number should people see?")
+    assert options[default].label == "Your verified number · +15555550101"
+    assert "restart" in outcome.summary.lower()
+
+
+def test_caller_id_choices_filter_other_carriers_and_deduplicate_numbers():
+    line = caller_id_line()
+    line["verified_caller_ids"] += [dict(line["verified_caller_ids"][0]),
+                                    {"number": "+15555550100", "provider": "telnyx"},
+                                    {"number": "+15555550102", "provider": "twilio"}]
+    ui = edit_caller_id(("Which number should people see?", "<quit>"))
+    actions = FakeActions(exists=True, lines={"main": line})
+    assert drive(ui, actions).code == 1
+    assert [o.label for o in ui.menu("Which number should people see?")[1]] == [
+        "Line's number · +15555550100", "Your verified number · +15555550101", "Verify another number you own"]
+    assert not actions.changes()
+
+
+def test_caller_id_line_picker_shows_ready_phone_lines_and_edits_only_the_selected_line():
+    first, second = caller_id_line(), caller_id_line(carrier="twilio", number="+15555550102", caller="+15555550103")
+    lines = {"main": first, "office": second, "agent": SIP_LINE,
+             "pending": {**caller_id_line(), "provider": {"name": "telnyx", "state": "pending"}},
+             "unknown": {**caller_id_line(), "provider": {"name": "telnyx"}},
+             "no-number": {"kind": "trunk"}}
+    actions = FakeActions(exists=True, lines=lines)
+    ui = edit_caller_id(("Which number should people see?", "Line's number · +15555550102"),
+                        ("Everything works", "<quit>"), line_id="office", number="+15555550102")
+    drive(ui, actions)
+    options = ui.menu("Which line's caller ID?")[1]
+    assert [o.label for o in options] == ["main · +15555550100", "office · +15555550102"]
+    assert "+15555550101" in options[0].hint and "+15555550103" in options[1].hint
+    assert actions.args("use_caller_id") == [("office", "+15555550102")]
+    assert first["caller_id"] == "+15555550101" and second["caller_id"] == "+15555550102"
+
+
+@pytest.mark.parametrize("provider", [None, "absent"])
+def test_manual_trunks_can_reuse_caller_ids_but_do_not_offer_carrier_verification(provider):
+    line = caller_id_line(carrier="")
+    if provider == "absent":
+        del line["provider"]
+    actions = FakeActions(exists=True, lines={"main": line})
+    ui = edit_caller_id(("Which number should people see?", "Your verified number · +15555550101"),
+                        ("Everything works", "<quit>"))
+    drive(ui, actions)
+    assert [o.label for o in ui.menu("Which number should people see?")[1]] == [
+        "Line's number · +15555550100", "Your verified number · +15555550101"]
+    assert actions.args("use_caller_id") == [("main", "+15555550101")]
+    assert not actions.args("saved_keys")
+
+
+@pytest.mark.parametrize("outbound,lines,question", [
+    (False, {"main": caller_id_line()}, "Outgoing calls are off"),
+    (True, {"agent": SIP_LINE}, "No phone-number lines are ready"),
+])
+def test_unavailable_caller_id_editor_explains_why_without_changing_settings(outbound, lines, question):
+    actions = FakeActions(exists=True, allow_outbound=outbound, lines=lines)
+    ui = ScriptedUI([("Give your AI", "Change caller ID"), (question, "Continue"),
+                     ("Everything works", "<quit>")])
+    drive(ui, actions)
+    assert not actions.changes() and not actions.args("saved_keys")
+    assert not ui.questions("Which line's caller ID?")
+
+
+def test_back_from_caller_id_choices_returns_to_lines_then_welcome_and_clears_the_shortcut():
+    actions = FakeActions(exists=True, lines={"main": caller_id_line()})
+    ui = edit_caller_id(("Which number should people see?", "<back>"),
+                        ("Which line's caller ID?", "<back>"),
+                        ("Give your AI", "Change call settings"),
+                        ("What should callers hear?", ["", "", ""]),
+                        ("Everything works", "<quit>"))
+    drive(ui, actions)
+    assert actions.changes() == ["save_callers"]
+    assert len(ui.questions("Which line's caller ID?")) == 2
+
+
+@pytest.mark.parametrize("saved", [True, False])
+def test_existing_line_can_verify_another_number_with_saved_or_entered_credentials(saved):
+    creds = {"TELNYX_API_KEY": "KEYtest"}
+    actions = FakeActions(exists=True, lines={"main": caller_id_line()}, saved_keys=creds if saved else None,
+                          owned_numbers=CALLER_ID_OWNED)
+    credentials = [("Use the saved Telnyx key?", "Use the saved key")] if saved else [
+        ("Your Telnyx credentials", ["KEYtest"])]
+    ui = edit_caller_id(("Which number should people see?", "Verify another number you own"), *credentials,
+                        ("Your mobile number", ["+15555550102"]), ("Enter the code", ["123456"]),
+                        ("Everything works", "Continue"), FINISH)
+    outcome = drive(ui, actions)
+    assert outcome.code == 0
+    assert actions.args("start_caller_id") == [("telnyx", creds, "+15555550102")]
+    assert actions.args("record_caller_id") == [("main", "+15555550102", "telnyx")]
+    assert not actions.args("use_caller_id")
+    assert actions.args("owned_numbers") == [("telnyx", creds)]
+    assert "calls out as +15555550102" in outcome.summary
+    assert all(p.step == CALLERS for p in ui.pages if any(t in p.question for t in ("credentials", "mobile", "code", "Verifying")))
+    assert all("KEYtest" not in page_text(p) for p in ui.pages)
+
+
+def test_existing_twilio_line_uses_the_phone_verification_flow(monkeypatch):
+    monkeypatch.setattr(flow, "CALLER_ID_POLL_SEC", 0)
+    step = VerificationStep("enter_code_on_phone", "Key in 314159 when Twilio calls.", {"e164": "+15555550102"})
+    actions = FakeActions(exists=True, lines={"main": caller_id_line(carrier="twilio")}, saved_keys=TWILIO,
+                          start_caller_id=step, check_caller_id=Seq(False, True), owned_numbers=CALLER_ID_OWNED)
+    ui = edit_caller_id(("Which number should people see?", "Verify another number you own"),
+                        ("Use the saved Twilio key?", "Enter a different key"),
+                        ("Your Twilio credentials", ["ACother", "OTHERtest"]),
+                        ("Your mobile number", ["+15555550102"]), ("Everything works", "<quit>"))
+    drive(ui, actions)
+    assert actions.args("start_caller_id") == [("twilio", {"TWILIO_ACCOUNT_SID": "ACother", "TWILIO_AUTH_TOKEN": "OTHERtest"},
+                                                "+15555550102")]
+    assert [a[3] for a in actions.args("check_caller_id")] == [None, None]
+    assert actions.args("record_caller_id") == [("main", "+15555550102", "twilio")]
+    assert ui.questions("Twilio is calling you now")[0].step == CALLERS
+    assert all("OTHERtest" not in page_text(p) and "tokSECRET" not in page_text(p) for p in ui.pages)
+
+
+@pytest.mark.parametrize("leave", ["<back>", "<quit>"])
+def test_leaving_existing_caller_id_verification_preserves_the_current_number(leave):
+    line = caller_id_line()
+    actions = FakeActions(exists=True, lines={"main": line}, saved_keys={"TELNYX_API_KEY": "KEYtest"},
+                          owned_numbers=CALLER_ID_OWNED)
+    after = [("Which number should people see?", "<quit>")] if leave == "<back>" else []
+    ui = edit_caller_id(("Which number should people see?", "Verify another number you own"),
+                        ("Use the saved Telnyx key?", "Use the saved key"),
+                        ("Your mobile number", ["+15555550102"]), ("Enter the code", leave), *after)
+    outcome = drive(ui, actions)
+    assert outcome.code == 1 and "Nothing was changed" in outcome.summary
+    assert line["caller_id"] == "+15555550101"
+    assert not actions.changes()
+
+
+def test_failed_existing_caller_id_verification_names_the_current_number():
+    line = caller_id_line()
+    actions = FakeActions(exists=True, lines={"main": line}, saved_keys={"TELNYX_API_KEY": "KEYtest"},
+                          owned_numbers=CALLER_ID_OWNED)
+    ui = edit_caller_id(("Which number should people see?", "Verify another number you own"),
+                        ("Use the saved Telnyx key?", "Use the saved key"),
+                        ("Your mobile number", ["+15555550102"]),
+                        *[("Enter the code", ["000000"])] * 3,
+                        ("Verification did not complete", "Continue"), ("Everything works", "<quit>"))
+    drive(ui, actions)
+    assert "still calls out as +15555550101" in ui.questions("Verification did not complete")[0].detail
+    assert line["caller_id"] == "+15555550101" and not actions.changes()
+
+
+@pytest.mark.parametrize("failure", ["start_caller_id", "use_caller_id"])
+def test_caller_id_errors_return_to_the_choices_without_changing_the_saved_number(failure):
+    line = caller_id_line()
+    actions = FakeActions(exists=True, lines={"main": line}, saved_keys={"TELNYX_API_KEY": "KEYtest"},
+                          owned_numbers=CALLER_ID_OWNED,
+                          **{failure: ActionError("Could not update caller ID")})
+    select = [("Which number should people see?", "Line's number · +15555550100")] if failure == "use_caller_id" else [
+        ("Which number should people see?", "Verify another number you own"),
+        ("Use the saved Telnyx key?", "Use the saved key"), ("Your mobile number", ["+15555550102"])]
+    ui = edit_caller_id(*select, ("Which number should people see?", "<quit>"))
+    drive(ui, actions)
+    assert ui.questions("Which number should people see?")[-1].error == "Could not update caller ID"
+    assert line["caller_id"] == "+15555550101" and not actions.args("record_caller_id")
+
+
+def test_verification_with_another_carrier_account_stops_before_sending_a_code():
+    line = caller_id_line()
+    actions = FakeActions(exists=True, lines={"main": line}, saved_keys={"TELNYX_API_KEY": "KEYtest"}, owned_numbers=[])
+    ui = edit_caller_id(("Which number should people see?", "Verify another number you own"),
+                        ("Use the saved Telnyx key?", "Use the saved key"),
+                        ("Which number should people see?", "<quit>"))
+    drive(ui, actions)
+    assert "Could not find +15555550100 on this Telnyx account" in ui.questions("Which number should people see?")[-1].error
+    assert not ui.questions("Your mobile number") and not actions.args("start_caller_id")
+    assert line["caller_id"] == "+15555550101" and not actions.changes()
+
+
+def test_verification_can_retry_with_the_selected_lines_account():
+    wrong, right = {"TELNYX_API_KEY": "KEYwrong"}, {"TELNYX_API_KEY": "KEYright"}
+    actions = FakeActions(exists=True, lines={"main": caller_id_line()}, saved_keys=wrong,
+                          owned_numbers=Seq([], CALLER_ID_OWNED))
+    ui = edit_caller_id(("Which number should people see?", "Verify another number you own"),
+                        ("Use the saved Telnyx key?", "Use the saved key"),
+                        ("Which number should people see?", "Verify another number you own"),
+                        ("Use the saved Telnyx key?", "Enter a different key"),
+                        ("Your Telnyx credentials", ["KEYright"]),
+                        ("Your mobile number", ["+15555550102"]), ("Enter the code", ["123456"]),
+                        ("Everything works", "<quit>"))
+    drive(ui, actions)
+    assert actions.args("owned_numbers") == [("telnyx", wrong), ("telnyx", right)]
+    assert actions.args("start_caller_id") == [("telnyx", right, "+15555550102")]
+    assert actions.args("record_caller_id") == [("main", "+15555550102", "telnyx")]
+    assert all("KEYwrong" not in page_text(p) and "KEYright" not in page_text(p) for p in ui.pages)
+
+
+@pytest.mark.parametrize("at_mobile", [False, True])
+def test_back_before_verifying_returns_to_the_existing_caller_id_choices(at_mobile):
+    actions = FakeActions(exists=True, lines={"main": caller_id_line()}, owned_numbers=CALLER_ID_OWNED)
+    credentials = [("Your Telnyx credentials", ["KEYtest"]), ("Your mobile number", "<back>")] if at_mobile else [
+        ("Your Telnyx credentials", "<back>")]
+    ui = edit_caller_id(("Which number should people see?", "Verify another number you own"), *credentials,
+                        ("Which number should people see?", "<quit>"))
+    drive(ui, actions)
+    assert not actions.changes() and not actions.args("start_caller_id")
 
 
 def test_no_owned_numbers_offers_to_buy_one():
