@@ -38,7 +38,8 @@ class PlainUI(BaseUI):
             print(f"! {page.error}")
         width = max((len(c.label) for c in page.checks), default=0)
         for c in page.checks:
-            print(f"  {MARKS[c.ok]} {c.label.ljust(width)}   {c.value}")
+            value = c.value.replace("\n", "\n" + " " * (width + 7))
+            print(f"  {MARKS[c.ok]} {c.label.ljust(width)}   {value}")
         for line in page.body.splitlines():
             print(f"  {line}".rstrip())
 

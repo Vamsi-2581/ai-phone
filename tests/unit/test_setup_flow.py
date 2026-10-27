@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import ai_phone
+from ai_phone import models
 from ai_phone.config import SUBSCRIPTION_MODELS, InboundConfig
 from ai_phone.lines.forward import divert_codes
 from ai_phone.pipeline.prompts import DISCLOSURE
@@ -121,9 +122,12 @@ class ScriptedUI(BaseUI):
 
 
 class FakeActions:
-    def __init__(self, *, exists=False, memory=24, missing=(), sip_library=True, lines=None, **results):
+    def __init__(self, *, exists=False, memory=24, missing=(), downloaded=None, sip_library=True, lines=None, **results):
         self.calls: list[tuple[str, tuple]] = []
-        self.m = Machine(sip_library=sip_library, memory_gb=memory, models_missing=list(missing), config_exists=exists)
+        if downloaded is None:
+            downloaded = [r for r in (models.STT, models.TTS, models.PHONON, models.LLM["t4"]) if r not in missing]
+        self.m = Machine(sip_library=sip_library, memory_gb=memory, models_missing=list(missing), config_exists=exists,
+                         models_downloaded=downloaded)
         self.cur = Current(exists=exists, lines=dict(lines or {}), brain_kind="local", tier="t4",
                            base_url="http://127.0.0.1:1234/v1", model="local", brain_key_saved=False, brain_cli=None,
                            voice="af_heart", speed=1.0, greeting=GREETING, instructions=INSTRUCTIONS, daily_limit=20)
@@ -336,7 +340,7 @@ def test_new_setup_local_brain_sip_line_default_voice():
     assert actions.args("save_callers") == [(GREETING, INSTRUCTIONS, 20)]
     assert actions.args("play_sample") == [("af_heart", 1.0, DISCLOSURE, "kokoro")]
     check = ui.questions("Everything works")[0]
-    assert check.checks == [Check("Models", "downloaded", True), Check("Config", "loads", True),
+    assert check.checks == [Check("Models", "Parakeet 0.6B v2\nKokoro 82M\nQwen3.5 4B", True), Check("Config", "loads", True),
                             Check("Line agent", "ready · listening", True), Check("Voice", "Heart · played", True)]
     assert "uv run ai-phone run" in outcome.summary
     assert "pjsua --local-port 5070 sip:agent@127.0.0.1" in outcome.summary
@@ -345,7 +349,7 @@ def test_new_setup_local_brain_sip_line_default_voice():
 
 def test_welcome_shows_the_machine_checks():
     ui = ScriptedUI([("Give your AI", "Cancel")])
-    outcome = drive(ui, FakeActions(memory=8, sip_library=False, missing=["a/b"]))
+    outcome = drive(ui, FakeActions(memory=8, sip_library=False, missing=["a/b"], downloaded=[]))
     assert outcome.code == 1
     assert outcome.summary == "Setup cancelled. Nothing was changed."
     page = ui.pages[0]
@@ -354,7 +358,7 @@ def test_welcome_shows_the_machine_checks():
     assert page.checks == [
         Check("SIP library", "not built yet · run ./scripts/install.sh", False),
         Check("Memory", "8 GB · 4B model recommended", None),
-        Check("Models", "not downloaded yet · setup can download them", None),
+        Check("Models", "none downloaded yet\nMissing: a/b · setup can download them", None),
         Check("Config", "new · ~/.ai-phone/", True),
     ]
     assert [(o.label, o.hint) for o in ui.menus[0][1]] == [("Continue", ""), ("Cancel", "exit setup, nothing is saved")]
@@ -364,7 +368,7 @@ def test_welcome_shows_the_machine_checks():
     assert ui.pages[0].checks == [
         Check("SIP library", "built", True),
         Check("Memory", "36 GB · 9B model recommended", True),
-        Check("Models", "downloaded", True),
+        Check("Models", "Parakeet 0.6B v2\nKokoro 82M\nPhonon 31M\nQwen3.5 4B", True),
         Check("Config", "found · ~/.ai-phone/ (setup changes only what you pick)", True),
     ]
     assert [o.label for o in ui.menus[0][1]] == ["Add a line", "Change the brain", "Change the voice",
@@ -1421,6 +1425,8 @@ def test_new_setup_recommends_phonon_previews_then_downloads_the_remaining_model
     assert names.index("play_sample") < names.index("pull_models")
     assert not any(field.label == "Speed" for field in ui.fields)
     assert "Voice    Phonon · English · bundled voice" in outcome.summary
+    assert ui.questions("Everything works")[0].checks[0] == \
+        Check("Models", "Parakeet 0.6B v2\nPhonon 31M\nQwen3.5 4B", True)
 
 
 @pytest.mark.parametrize("leave", ["<quit>", "<back>"])
@@ -1594,6 +1600,8 @@ def test_check_offers_the_download_and_reports():
     actions = FakeActions(exists=True, missing=["mlx-community/Qwen3.5-4B-MLX-4bit"], lines={"agent": SIP_LINE},
                           pull_models=Seq(None, ActionError(failed)))
     assert drive(ui, actions).code == 0
+    assert ui.pages[0].checks[2] == Check("Models", "Parakeet 0.6B v2\nKokoro 82M\nPhonon 31M\n"
+                                         "Missing: Qwen3.5 4B · setup can download them", None)
     offer = ui.questions("Download the models now?")[0]
     assert offer.detail == "About 4.3 GB, saved in the Hugging Face cache. ai-phone needs them to answer calls."
     assert [(o.label, o.hint) for o in ui.menu("Download the models now?")[1]] == [
@@ -1603,7 +1611,7 @@ def test_check_offers_the_download_and_reports():
     assert downloading.detail == "You can leave this running. It picks up where it stopped if interrupted."
     assert all(callable(a[0]) for a in actions.args("pull_models")) and len(actions.args("pull_models")) == 2
     ok, later, failed_page = [p for p in ui.pages if p.step == CHECK and p.question in ("Everything works", "A few things need attention")]
-    assert ok.checks[0] == Check("Models", "downloaded", True)
+    assert ok.checks[0] == Check("Models", "Parakeet 0.6B v2\nKokoro 82M\nQwen3.5 4B", True)
     assert later.checks[0] == Check("Models", "not downloaded yet · uv run ai-phone models pull", None)
     assert failed_page.checks[0] == Check("Models", failed, False)
     assert [(o.label) for o in ui.menu("Everything works")[1]] == ["Continue", "Check again"]
@@ -1623,7 +1631,7 @@ def test_endpoint_brain_check_lines_and_voice_rows():
     outcome = drive(ui, actions)
     assert "Checking your lines… (up to 20 seconds)" in ui.labels and "Playing your agent's voice…" in ui.labels
     rows = ui.questions("A few things need attention")[0].checks
-    assert rows == [Check("Models", "downloaded", True), Check("Config", "loads", True),
+    assert rows == [Check("Models", "Parakeet 0.6B v2\nKokoro 82M", True), Check("Config", "loads", True),
                     Check("Line main", "registered", True), Check("Line office", "degraded · 403 Forbidden", False),
                     Check("Voice", "Heart · played", True)]
     assert "Brain    https://api.example.com/v1 · qwen" in outcome.summary
@@ -1639,7 +1647,7 @@ def test_check_skips_lines_when_the_config_does_not_load():
                           play_sample=ActionError("could not play the sample: no audio device"))
     drive(ui, actions)
     rows = ui.questions("A few things need attention")[0].checks
-    assert rows == [Check("Models", "downloaded", True), Check("Config", "config.lines.agent.aor: expected sip:user@host", False),
+    assert rows == [Check("Models", "Parakeet 0.6B v2\nKokoro 82M\nQwen3.5 4B", True), Check("Config", "config.lines.agent.aor: expected sip:user@host", False),
                     Check("Voice", "could not play the sample: no audio device", False)]
     assert not actions.args("check_lines")
 
@@ -1986,5 +1994,5 @@ def test_a_subscription_brain_needs_no_model_download():
     actions = FakeActions(exists=True)
     drive(ui, actions)
     rows = ui.questions("A few things need attention")[0].checks
-    assert rows[0] == Check("Models", "downloaded", True) and not actions.args("pull_models")
+    assert rows[0] == Check("Models", "Parakeet 0.6B v2\nKokoro 82M", True) and not actions.args("pull_models")
     assert Check("Brain", "Claude (Opus) · logged in", True) in rows

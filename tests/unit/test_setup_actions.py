@@ -73,7 +73,7 @@ def raw(home) -> dict:
 
 # ---- machine and current ---------------------------------------------------------------------
 
-def test_machine_and_current_for_a_new_config(home):
+def test_machine_and_current_for_a_new_config(home, monkeypatch):
     a = make(home)
     assert a.machine() == Machine(sip_library=True, memory_gb=24, config_exists=False,
                                   models_missing=[models.STT, models.TTS, models.LLM["t4"]])
@@ -81,6 +81,14 @@ def test_machine_and_current_for_a_new_config(home):
     assert a.current() == Current(exists=False, lines={}, brain_kind="local", tier="t4", base_url="http://127.0.0.1:1234/v1",
                                   model="local", brain_key_saved=False, brain_cli=None, voice="af_heart", speed=1.0,
                                   greeting=inbound.greeting, instructions=inbound.instructions, daily_limit=20)
+    cached = [models.STT, models.TTS, models.PHONON, models.LLM["t9"]]
+    monkeypatch.setattr(models, "local_path", lambda repo: home if repo in cached else None)
+    assert a.machine().models_downloaded == cached  # includes alternate voices and brains, even before a config exists
+    assert a.machine().models_missing == [models.LLM["t4"]]
+    a.save_brain_local("example/custom-model")
+    cached.append("example/custom-model")
+    assert a.machine().models_downloaded == cached
+    assert a.machine().models_missing == []
     for so in act.VENDOR.iterdir():
         so.unlink()
     assert a.machine().sip_library is False

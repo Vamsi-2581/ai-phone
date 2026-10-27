@@ -18,7 +18,8 @@ OPTIONS = [Option("A phone number", "hint"), Option("A SIP address")]
 WELCOME = Page(0, "Give your AI a phone number", "Calls answered and placed by models running on this Mac.",
                note="Picks a line, a brain and a voice, then checks it all works.",
                checks=[Check("SIP library", "built", True), Check("Memory", "16 GB", None),
-                       Check("Models", "not downloaded yet", False)])
+                       Check("Models", "Parakeet 0.6B v2\nKokoro 82M\nPhonon 31M\nQwen3.5 4B", True),
+                       Check("Config", "not saved yet", False)])
 TWILIO = Page(2, "Your Twilio credentials",
               "Saved to ~/.ai-phone/secrets.env, readable only by you. Never shown or sent anywhere else.")
 KEY_FIELDS = [Field("Account SID", secret=True, placeholder="AC…"),
@@ -445,7 +446,7 @@ async def test_welcome_shows_the_wordmark_when_wide_and_a_title_when_narrow():
     assert "▀" in wide or "█" in wide
     assert "● Welcome ←" in wide and "○ Done" in wide
     for part in ("Give your AI a phone number", "Picks a line, a brain and a voice", "SIP library",
-                 "not downloaded yet", "✓", "✗", "○"):
+                 "Parakeet 0.6B v2", "Kokoro 82M", "Phonon 31M", "Qwen3.5 4B", "✓", "✗", "○"):
         assert part in wide
     assert "esc back" not in wide and "[3]" not in wide  # no Back on Welcome
 
@@ -454,6 +455,8 @@ async def test_welcome_shows_the_wordmark_when_wide_and_a_title_when_narrow():
     assert "ai-phone" in lines
     assert not any(block in narrow for block in "▀▄█")
     assert "● Welcome  1/7" in narrow and "○ Brain" not in narrow
+    for model in ("Parakeet 0.6B v2", "Kokoro 82M", "Phonon 31M", "Qwen3.5 4B"):
+        assert model in narrow
 
 
 @pytest.mark.asyncio

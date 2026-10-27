@@ -244,6 +244,12 @@ def tier_name(tier: str) -> str:
     return entry.name if entry else tier
 
 
+def model_names(repos: list[str]) -> str:
+    names = {models.STT: "Parakeet 0.6B v2", models.TTS: "Kokoro 82M", models.PHONON: "Phonon 31M",
+             **{entry.repo: entry.name for entry in models.CATALOG.values()}}
+    return "\n".join(names.get(repo, repo) for repo in repos)
+
+
 def model_hint(entry, mem_gb: int) -> str:
     more = "" if entry.needs_gb <= mem_gb else " · more than this Mac has"
     return f"{entry.note} · needs {entry.needs_gb} GB{more}"
@@ -255,11 +261,14 @@ def welcome(ui, actions) -> list[int]:
     ui.begin(WELCOME)
     m = actions.machine()
     mem = m.memory_gb
+    downloaded = model_names(m.models_downloaded) or "none downloaded yet"
+    if m.models_missing:
+        missing = model_names(m.models_missing).replace("\n", ", ")
+        downloaded += f"\nMissing: {missing} · setup can download them"
     checks = [
         Check("SIP library", "built" if m.sip_library else "not built yet · run ./scripts/install.sh", m.sip_library),
         Check("Memory", f"{mem} GB · {'9B' if mem >= 32 else '4B'} model recommended", True if mem >= 16 else None),
-        Check("Models", "not downloaded yet · setup can download them" if m.models_missing else "downloaded",
-              None if m.models_missing else True),
+        Check("Models", downloaded, None if m.models_missing else True),
         Check("Config", f"found · {home_dir()}/ (setup changes only what you pick)" if m.config_exists else f"new · {home_dir()}/", True),
     ]
     page = Page(WELCOME, "Give your AI a phone number", "Calls answered and placed by models running on this Mac.",
@@ -831,8 +840,10 @@ def check_brain(ui, actions, session: Session, page: Page, cur) -> Check:
 
 
 def check_models(ui, actions, session: Session, page: Page) -> Check:
+    cur = actions.current()
+    downloaded = model_names(models.needed(cur.tier, cur.brain_kind, cur.tts_engine))
     if not actions.missing_models():
-        return Check("Models", "downloaded", True)
+        return Check("Models", downloaded, True)
     size = busy(ui, session, page, "Checking the download size…", actions.download_size)
     later = ui.choose(Page(CHECK, "Download the models now?", f"About {gb(size)}, saved in the Hugging Face cache. "
                            "ai-phone needs them to answer calls."),
@@ -843,7 +854,7 @@ def check_models(ui, actions, session: Session, page: Page) -> Check:
         progress(ui, session, Page(CHECK, "Downloading the models", "You can leave this running. It picks up where it "
                                    "stopped if interrupted."), "Downloading…", actions.pull_models)
         session.note("the downloaded models")
-        return Check("Models", "downloaded", True)
+        return Check("Models", downloaded, True)
     except ActionError as e:
         return Check("Models", str(e), False)
 

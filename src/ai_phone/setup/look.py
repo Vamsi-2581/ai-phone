@@ -121,11 +121,11 @@ def crumbs(active: int, width: int = 200) -> Text:
 
 
 def checks_text(rows: list[Check]) -> Text:
-    t = Text(no_wrap=True)
+    t = Text()
     label_w = max(len(r.label) for r in rows) + 3
     for i, row in enumerate(rows):
         t.append(row.label.ljust(label_w), Style(color=DIM))
-        t.append(row.value, Style(color=WHITE))
+        t.append(row.value.replace("\n", "\n" + " " * label_w), Style(color=WHITE))
         if row.ok is True:
             t.append("  ✓", Style(color=GREEN, bold=True))
         elif row.ok is False:
@@ -179,10 +179,12 @@ Screen {{ background: {BG}; align: center top; }}
 #logo {{ width: 100%; text-align: center; margin: 1 0 1 0; }}
 .centre {{ width: 100%; text-align: center; }}
 #note {{ width: 100%; text-align: center; }}
-#checks {{ width: auto; margin: 2 0 1 0; }}
+#checks {{ width: auto; max-width: 100%; margin: 2 0 1 0; }}
 #body {{ width: auto; max-width: 100%; margin: 1 0 0 0; }}
 .dense #body {{ margin: 0; }}
 .dense #logo {{ margin: 1 0 0 0; }}
+.dense #checks {{ margin: 1 0 0 0; }}
+.dense #menu, .dense #hint {{ margin: 1 0 0 0; }}
 Center {{ height: auto; }}
 #menu {{ width: auto; margin: 2 0 0 0; }}
 #hint {{ width: auto; margin: 2 0 0 0; }}

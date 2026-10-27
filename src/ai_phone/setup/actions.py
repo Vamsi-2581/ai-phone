@@ -21,7 +21,7 @@ import threading
 import time
 import warnings
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
@@ -63,6 +63,7 @@ class Machine:
     memory_gb: int
     models_missing: list[str]   # models still to download for the current config (defaults when there is none)
     config_exists: bool
+    models_downloaded: list[str] = field(default_factory=list)  # complete cached models known to ai-phone
 
 
 @dataclass
@@ -140,8 +141,12 @@ class Actions:
 
     def machine(self) -> Machine:
         cur = self.current()
+        needed = models.needed(cur.tier, cur.brain_kind, cur.tts_engine)
+        candidates = dict.fromkeys([models.STT, models.TTS, models.PHONON, *models.LLM.values(), *needed])
+        downloaded = [repo for repo in candidates if models.local_path(repo) is not None]
         return Machine(sip_library=sip_library_built(), memory_gb=models.memory_gb(),
-                       models_missing=models.missing(cur.tier, cur.brain_kind, cur.tts_engine), config_exists=cur.exists)
+                       models_missing=[repo for repo in needed if repo not in downloaded], config_exists=cur.exists,
+                       models_downloaded=downloaded)
 
     def current(self) -> Current:
         exists = self.config_path.exists()
@@ -603,7 +608,8 @@ class Actions:
     # ---- check -----------------------------------------------------------------------------------
 
     def missing_models(self) -> list[str]:
-        return self.machine().models_missing
+        cur = self.current()
+        return models.missing(cur.tier, cur.brain_kind, cur.tts_engine)
 
     def download_size(self) -> int | None:
         return models.download_size(self.missing_models())

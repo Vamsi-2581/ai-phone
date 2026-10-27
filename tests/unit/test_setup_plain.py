@@ -60,10 +60,11 @@ def test_welcome_page_has_a_title_note_and_no_back(typed, capsys):
     page = Page(0, "Give your AI a phone number", "Calls answered and placed by models running on this Mac.",
                 note="Picks a line, a brain and a voice, then checks it all works.",
                 checks=[Check("SIP library", "not built yet · run ./scripts/install.sh", False),
-                        Check("Memory", "8 GB · 4B model recommended", None)])
+                        Check("Memory", "8 GB · 4B model recommended", None),
+                        Check("Models", "Parakeet 0.6B v2\nPhonon 31M", True)])
     assert PlainUI().choose(page, [Option("Continue"), Option("Cancel", "exit setup, nothing is saved")], back=False) == 1
     out = capsys.readouterr().out.splitlines()
-    assert out[:9] == [
+    assert out[:11] == [
         "",
         "ai-phone setup",
         "Give your AI a phone number",
@@ -71,6 +72,8 @@ def test_welcome_page_has_a_title_note_and_no_back(typed, capsys):
         "Picks a line, a brain and a voice, then checks it all works.",
         "  ✗ SIP library   not built yet · run ./scripts/install.sh",
         "  ○ Memory        8 GB · 4B model recommended",
+        "  ✓ Models        Parakeet 0.6B v2",
+        "                  Phonon 31M",
         "  1) Continue",
         "  2) Cancel     exit setup, nothing is saved",
     ]
