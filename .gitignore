@@ -53,4 +53,6 @@ docs/reviews/
 
 # Private planning documents are kept locally, outside the repository
 docs/private/
+docs/superpowers/
+.superpowers/
 AGENTS.md

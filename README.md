@@ -6,6 +6,8 @@ or reach it at a SIP address; speech-to-text, the language model and text-to-spe
 default, and during a call the daemon talks to nothing but SIP/RTP (and one brain only if you chose
 one that is not on this Mac: your own endpoint, or the Claude or ChatGPT plan you already pay for).
 
+Currently supported on **macOS with Apple Silicon**.
+
 **Status: Milestone 1 (latency proof) passed; Milestone 4 (get started: install script and setup wizard) complete, verified from a fresh clone; Milestones 2 (lines) and 3 (agent tool) code complete, their live gates pending.**
 English only, one call at a time. See `architecture-essentials.md` for how it works.
 
@@ -125,7 +127,7 @@ asks, and the daemon says at start where the words of a call go.
 
 | Brain | First word (measured here) | What leaves this Mac | What it needs |
 |---|---|---|---|
-| **On this Mac** (default) | 874 ms p50 on the 4B tier | nothing: no socket is opened | about 4 GB of models |
+| **On this Mac** (default) | 1500 ms p50 in the [2026-10-27 local call run](docs/phonon-2026-10-27.md) | nothing: no socket is opened | downloaded local speech and language models |
 | **Your Claude subscription** | 2.4–5.5 s on a call's first turn, about 1 s after | what callers say, the call's instructions and the conversation go to Anthropic (not audio) | `claude` installed and logged in; your plan's own limits apply |
 | **Your ChatGPT subscription** | 3.9–4.4 s on a call's first turn, 1.1–1.9 s after | the same, to OpenAI | `codex` installed and logged in; your plan's own limits apply |
 | **Your own endpoint** | whatever that server does | the same, to that server | an OpenAI-compatible URL, `https` unless it is on this Mac; a key if it wants one |
@@ -219,4 +221,5 @@ transcript.
 
 ## License
 
-AGPL-3.0-or-later. `native/pjsua2/` carries PJSIP's GPLv2-or-later interface files; see its README.
+AGPL-3.0-or-later; see [LICENSE](LICENSE). `native/pjsua2/` carries PJSIP's GPLv2-or-later interface files;
+see its [README](native/pjsua2/README.md) and [license copy](native/pjsua2/COPYING).
