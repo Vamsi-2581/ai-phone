@@ -49,7 +49,7 @@ Non-goals that shape the architecture: single-call, English-only, no web UI, no 
 | `ai-phoned` (main) | PJSIP endpoint, asyncio event loop, pipeline, control plane, supervisor of workers | Owns the 20 ms media clock; must never block on model compute |
 | `stt-worker` | Speech-to-text backend (parakeet) | GIL isolation; a slow decode cannot stall the media thread |
 | `llm-worker` | Language model backend (mlx-lm / llama-cpp-python) | Largest memory; isolated crash domain |
-| `tts-worker` | Text-to-speech backend (Kokoro) | Same |
+| `tts-worker` | Text-to-speech backend (Phonon or Kokoro) | Same |
 
 Workers are children of the main process (`multiprocessing`, spawn start method on both platforms for consistency). There is no external model server in the default install: Ollama, vLLM and similar are excluded as a dependency **[D]** (they conflict with one-command install and would appear in the isolation firewall log). Since Milestone 2 the user may *choose* an OpenAI-compatible endpoint as the brain (`brain.kind: openai_compatible`, §14a.7), and since Milestone 4 the Claude or ChatGPT plan they already pay for, through the CLI they are logged into (`claude` / `chatgpt`, a child process of the LLM worker); that is their configuration, announced at start, not something ai-phone installs or needs.
 
@@ -273,8 +273,9 @@ One `TurnController` per call. Every generation carries a monotonically increasi
 
 ### 4.6 TTS, output, and cancellation
 
-- The TTS worker returns 24 kHz float32 chunks per unit **[V]** (Kokoro's native rate). The pipeline resamples to 16 kHz int16 with `soxr` (VHQ) **[P]** and pushes 640-byte frames to `tx_ring`. First frame pushed = t5 candidate; the actual t5 is stamped by the media port when it hands the first non-silent frame to PJSIP (a flag on the ring entry).
+- Both TTS models generate 24 kHz float32 audio. Their backends resample inside the worker to 16 kHz int16 with `soxr` (VHQ) and emit 640-byte frames. Phonon streams at an explicit 80 ms audio interval; Kokoro emits sentence chunks. Leading silent frames are trimmed. First frame pushed = t5 candidate; the actual t5 is stamped by the media port when it hands the first non-silent frame to PJSIP (a flag on the ring entry).
 - Underrun: if `tx_ring` empties mid-utterance (TTS slower than real time), the port sends silence and increments `tx_underruns`; the latency record shows it. Persistent underrun → switch to the lighter tier (a later check command will recommend it, §7.3).
+- When speech is generated faster than playback, the TTS worker waits for space in its output ring and checks cancellation/shutdown while waiting. The pipeline transfers only what fits in `tx_ring`, preserving order and one pending tagged frame; cached greetings and other phrases also wait for playback space. Startup caching drains on chunk events, and a turn completes only after all its audio has drained. The PJSIP callback never waits for a producer.
 - **Cancellation semantics [D]**: `cancel(gen_id)` is sent to all three workers; they abandon work for that id at their next check (≤ 1 chunk). The pipeline flushes `tx_ring` immediately (the caller stops hearing us within one frame plus the phone's jitter buffer), drops any in-flight chunks whose `gen_id` is stale, and keeps the partial assistant text in history marked `[interrupted]` so the model knows what the caller heard.
 
 ### 4.7 Barge-in **[D]**
@@ -316,14 +317,14 @@ class LLMBackend(Protocol):
 
 class TTSBackend(Protocol):
     def warmup(self) -> Timings
-    def stream(self, gen_id: int, seq: int, text: str) -> Iterator[np.ndarray]   # float32 @ native rate
+    def stream(self, gen_id: int, seq: int, text: str) -> Iterator[bytes]   # 16 kHz PCM16, 640-byte / 20 ms frames
     def cancel(self, gen_id: int) -> None
     native_rate: int
 ```
 
 ### 5.2 IPC **[D]**
 
-- **Audio** travels through `multiprocessing.shared_memory` rings (same layout as §3.5): main → stt-worker (utterance audio), tts-worker → main (synthesised audio at 24 kHz). No pickling of audio, ever.
+- **Audio** travels through `multiprocessing.shared_memory` rings (same layout as §3.5): main → stt-worker (utterance audio), tts-worker → main (16 kHz PCM16 / 20 ms frames tagged with the generation ID). No pickling of audio, ever.
 - **Control** travels over a `multiprocessing.Pipe` per worker carrying newline-delimited JSON messages (small, human-readable in logs):
 
 | Direction | Message | Fields |
@@ -347,7 +348,14 @@ Workers check for `cancel` between chunks/tokens; a cancelled `gen_id` is rememb
 | STT | `mlx-audio[stt]` parakeet (has streaming) | `mlx-community/parakeet-tdt-0.6b-v2` (English) | v3 is multilingual, post-launch. Standalone `parakeet-mlx` is the fallback only if measurably faster. |
 | LLM | `mlx-lm` | `mlx-community/Qwen3.5-9B-MLX-4bit` (32 GB+); `mlx-community/Qwen3.5-4B-MLX-4bit` (16 GB tier; the default below 32 GB, §5.5) | Both checkpoints include a vision tower; mlx-lm discards it at load (`sanitize()`), so only the text model is resident. No text-only checkpoint exists. |
 | TTS | `mlx-audio[tts]` Kokoro | `mlx-community/Kokoro-82M-bf16`, voice from `tts.voice` (default `af_heart`), 24 kHz | Needs `misaki[en]` (G2P), which pulls spaCy and PyTorch (~80 packages) and **downloads `en_core_web_sm` from GitHub at first use if absent**; `pyproject.toml` pins that model as a dependency, so `uv sync` installs it. The voice is loaded by file path from the model's own snapshot (`voices/<name>.safetensors`): given a bare name, mlx-audio looks in `prince-canuma/Kokoro-82M`, which holds only two voices. `a…` voices use American pronunciation and `b…` voices British (Kokoro's `lang_code`). |
+| TTS | Direct `mlx-audio` Phonon | `gradium/phonon-31m-en`, `tts.engine: phonon`, `voice: default`, speed 1.0, 24 kHz | Apache-2.0 model, pinned revision `92741c5b07d085ff840e26fea8ce43110b87852f`. Bundled tokenizer and default voice are required locally before loading. `stream=True`, `streaming_interval=0.08`, `temperature=0.3`; no server or voice-cloning input. Empty final chunks are ignored and cancellation is checked between chunks and frames. |
 | VAD | `mlx-audio` Silero (or `silero-vad`) | — | 16 kHz, 512-sample chunks |
+
+The Phonon integration pins MLX-Audio to commit `f6d5da9626bcdc5be6eccb3e7b79648548dd1b22`
+(0.6.2), with MLX 0.32.4. `tts.engine` defaults to `kokoro` for existing configurations; setup offers
+both engines. Each backend receives a local voice file, and Phonon also loads its pinned snapshot by `Path`.
+Phonon has no adjustable speed in this path: settings other than 1.0 are refused. Raw numbers and abbreviations
+use the model's text handling; no additional number-normalization pass is applied.
 
 LLM worker specifics: `mlx_lm.load(model_id)`; `make_prompt_cache(model)` primed with the system prompt at warm-up (since Milestone 3, with the fixed phone instructions and the "This call:" header, §14b.4); `stream_generate(model, tokenizer, prompt, max_tokens=..., prompt_cache=cache)`. Because history is a suffix of a stable prefix, the cache is reused every turn; the worker reports `prompt_eval_ms` and `gen_ms` separately so the LLM budget row (250 ms, zero slack) is diagnosable.
 
@@ -363,7 +371,7 @@ LLM worker specifics: `mlx_lm.load(model_id)`; `make_prompt_cache(model)` primed
 ### 5.5 Model registry, weights, and verification **[D]**
 
 - Weights live in the Hugging Face cache (`~/.cache/huggingface/hub`, or wherever `HF_HOME` points), where the backends load them by repo id (amended 2026-09-17; `models.home` is not used). They are fetched only by `ai-phone models pull` and `ai-phone setup`, both through `ai_phone.models.pull`; never at daemon runtime.
-- What is needed: the STT and TTS models always, and the tier's LLM only for the local brain. A model counts as present when its cached snapshot has a `config.json` and weights. `pull` fetches only what is missing, first checks that the download plus 1 GB fits on the disk, reports progress, and picks up an interrupted download where it stopped. Checking every file against a per-tier manifest (sizes and SHA-256) is left to a later check command (§7.3).
+- What is needed: the STT and selected TTS model always, and the tier's LLM only for the local brain. Phonon additionally requires its pinned tokenizer files and bundled default voice; a partial snapshot is missing until these exist. A model counts as present when its cached snapshot has a `config.json` and weights. `pull` fetches only what is missing, first checks that the download plus 1 GB fits on the disk, reports progress, and picks up an interrupted download where it stopped. Checking every file against a per-tier manifest (sizes and SHA-256) is left to a later check command (§7.3).
 - Models: the curated catalog lives in `models.py` (`CATALOG`), one entry per local brain with its repo, name, weights size, the memory it wants and whether ai-phone has made calls with it: `t4`, `t9`, `qwen2b`, `llama3b`, `gemma4b`, `mistral7b`, `gemma12b`. Selection: `ai-phone run --tier`, else `models.tier` in the config (setup writes it); `auto` picks by total memory: 32 GB or more → t9, else t4 (the 9B model does not fit beside normal apps on 24 GB, §15). A `models.tier` containing a `/` is taken as a Hub repo id, so a hand-edited config can run any mlx-lm model; anything else is refused with the list of keys.
 - Environment in every process: `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `TOKENIZERS_PARALLELISM=false`.
 
@@ -393,8 +401,8 @@ Resident means resident. Three things keep an idle worker's weights in RAM on a 
 | PJSIP bridge | 16 kHz int16 | PJSIP resampler (8→16) | bridge default rate **[V]** |
 | Bridge → our port | 16 kHz int16, 320 samples/frame | none | `rx_ring` |
 | Port → VAD/STT | 16 kHz | none | VAD chunks of 512 samples |
-| TTS → pipeline | 24 kHz float32 | none | Kokoro native |
-| Pipeline → port | 16 kHz int16 | `soxr` 24→16 | `tx_ring` |
+| TTS model → worker framing | 24 kHz float32 | none | Phonon / Kokoro native |
+| Worker → pipeline → port | 16 kHz int16 | `soxr` 24→16 in worker | `tx_ring` |
 | Port → PJSIP → wire | 8 kHz G.711 | PJSIP resampler (16→8) + codec | |
 
 Two resamples on the outbound path (24→16 in Python, 16→8 in PJSIP) and one inbound (8→16 in PJSIP). The 100 ms "transport" budget row covers all of them plus one 20 ms frame of jitter.
@@ -563,7 +571,7 @@ Each step asks only what applies to the earlier answers:
 | Welcome | Shows checks of this Mac: SIP library, memory and the recommended model size, models, config. With a config already there: add a line, change the brain, change the voice, change what callers hear, or run every step | — |
 | Brain | On this Mac (one model from the catalog in `models.py`; the list shows what each needs, and one that needs more memory than this Mac has is confirmed first), or your own OpenAI-compatible endpoint: URL, model and an optional key, then one short test request | `brain:`, `models.tier`; the key in `secrets.env` |
 | Line | A phone number, a free SIP address, your own SIP trunk, or skip. For a phone number: Twilio or Telnyx; the key is checked with a free read-only request that lists the account's numbers; then a new number, bought only after a confirmation that shows the number and its monthly price, or one already on the account, connected for free (§14a.3); then, if wanted, the codes to divert your own mobile to it | the line; carrier keys and SIP passwords in `secrets.env`; the carrier journal in `lines/` |
-| Voice | An English voice from the speech model, grouped American/British and female/male; each can be played on this Mac's speakers first. Then the speed | `tts:` |
+| Voice | Phonon or Kokoro. Phonon has one bundled English voice at normal speed; Kokoro voices are grouped American/British and female/male with adjustable speed. Either can be previewed on this Mac's speakers | `tts:` |
 | Callers | The greeting, the instructions for when no AI is listening, and the daily limit on outbound calls (20 unless the config has one) | `inbound:`, `calls.daily_limit` |
 | Check | Offers to download missing models, with the size (§10.4). Then checks that the config loads, each line (the running daemon's status, or a background start with stand-in models for up to 20 s that reports registration, then stops) and the voice (plays the outbound disclosure) | — |
 | Done | A summary: what was saved and where, how to start ai-phone, a free test call, and what to tell your AI. For a SIP address the test call is `pjsua --local-port 5070 sip:<user>@127.0.0.1`, since the daemon cannot call itself | — |
@@ -713,14 +721,15 @@ brain:
   stream_idle_timeout_ms: 4000
   max_response_chars: 2000
 
-tts:                                                # Milestone 4 (2026-09-17)
-  voice: af_heart                                   # an English Kokoro voice from the speech model: af_/am_ American, bf_/bm_ British
-  speed: 1.0                                        # 0.5 to 2.0
+tts:                                                # Milestone 4, extended 2026-10-27
+  engine: kokoro                                    # kokoro (default) | phonon
+  voice: af_heart                                   # Kokoro: af_/am_ American, bf_/bm_ British; Phonon: default
+  speed: 1.0                                        # Kokoro: 0.5 to 2.0; Phonon: 1.0 only
 
 conversation: {endpoint_silence_ms, bargein_*, timers …unchanged…}
 ```
 
-Validation (extending `config.py`): grammar first: `user` `[A-Za-z0-9]{4,32}`; `display_name` printable ASCII without `"`, `\\`, CR or LF (name-addr strings are built only from validated parts, never escaped); registrar and proxy `sip:host[:port][;transport=x]` with host a DNS name or IP; `dial_domain` `host[:port]`; `aor` `sip:user@host[:port]`; environment-variable names `[A-Z_][A-Z0-9_]*`; E.164 `\\+[1-9][0-9]{6,14}`. Then: line ids unique; trunk `user` unique; `number` and `caller_id` E.164 (or a `sip:` URI on sip lines); `registrar`/`outbound_proxy` are `sip:` URIs and `dial_domain` a hostname; `srtp != off` requires `transport: tls`; `trusted` requires non-empty `trusted_peers`; `registered_trunk` requires non-empty `trusted_cidrs` or a resolvable registrar (a warning if only the registrar); `tls` transport on a sip line requires `sip.tls.cert_file` and `key_file`; `tcp_port != tls_port`; `password_env` must be set in the environment at start, otherwise that line is skipped with an error and the others start; `brain.base_url` non-loopback must be `https`; `tts.voice` must be an English voice name (`[ab][fm]_[a-z]+`) and, unless it is the default `af_heart`, one of the voices installed with the speech model (only a warning while the model is not downloaded); `tts.speed` is 0.5 to 2.0. The M1 `sip:` block (`user`, `domain`, `password_env`, `bind`, `public_addr`, `trusted_peers`, `accept_invites_from`) is read for one release and mapped to `sip.bind`/`sip.public_addr` plus `lines.main`, with a deprecation warning.
+Validation (extending `config.py`): grammar first: `user` `[A-Za-z0-9]{4,32}`; `display_name` printable ASCII without `"`, `\\`, CR or LF (name-addr strings are built only from validated parts, never escaped); registrar and proxy `sip:host[:port][;transport=x]` with host a DNS name or IP; `dial_domain` `host[:port]`; `aor` `sip:user@host[:port]`; environment-variable names `[A-Z_][A-Z0-9_]*`; E.164 `\\+[1-9][0-9]{6,14}`. Then: line ids unique; trunk `user` unique; `number` and `caller_id` E.164 (or a `sip:` URI on sip lines); `registrar`/`outbound_proxy` are `sip:` URIs and `dial_domain` a hostname; `srtp != off` requires `transport: tls`; `trusted` requires non-empty `trusted_peers`; `registered_trunk` requires non-empty `trusted_cidrs` or a resolvable registrar (a warning if only the registrar); `tls` transport on a sip line requires `sip.tls.cert_file` and `key_file`; `tcp_port != tls_port`; `password_env` must be set in the environment at start, otherwise that line is skipped with an error and the others start; `brain.base_url` non-loopback must be `https`; for Kokoro, `tts.voice` must be an English voice name (`[ab][fm]_[a-z]+`) and, unless it is the default `af_heart`, one of the voices installed with the speech model (only a warning while the model is not downloaded); `tts.speed` is 0.5 to 2.0 for Kokoro. With `tts.engine: phonon`, `tts.voice` must be `default` and speed must be 1.0. The M1 `sip:` block (`user`, `domain`, `password_env`, `bind`, `public_addr`, `trusted_peers`, `accept_invites_from`) is read for one release and mapped to `sip.bind`/`sip.public_addr` plus `lines.main`, with a deprecation warning.
 
 ### 14a.2 Line lifecycle in the daemon (as built: registration state, state file, control socket)
 
@@ -1073,6 +1082,7 @@ Each came out of planning or a review:
 
 | Date | Decision | Status |
 |---|---|---|
+| 2026-10-27 | Add Phonon 31M English through direct MLX, with the bundled local voice and 80 ms streaming chunks. Setup selects the engine; existing configs keep Kokoro. Same framing, generation cancellation and offline worker boundary. Call latency and interruption are measured separately from the standalone TTS benchmark | [D] |
 | 2026-09-02 | Complete appliance (Approach B) with the weekend prototype as Milestone 1 inside it | [D] |
 | 2026-09-02 | Python; Go rejected by owner; TS/Swift/Rust evaluated and rejected | [D] |
 | 2026-09-02 | PJSIP via pjsua2, vendored into the platform wheel; AGPLv3 | [D] |

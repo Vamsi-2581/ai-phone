@@ -44,7 +44,7 @@ caller audio → `rx_ring` → VAD (Silero, 32 ms chunks) → **speech_end after
 | Pipeline | hand-rolled asyncio | Pipecat (only if it ever deletes more code than it adds) |
 | STT (Mac) | mlx-audio parakeet `mlx-community/parakeet-tdt-0.6b-v2` | parakeet-mlx (fallback only) |
 | LLM (Mac) | mlx-lm, `mlx-community/Qwen3.5-9B-MLX-4bit` (32 GB+) or `-4B-` (16 GB; the default below 32 GB), `enable_thinking=False`, in the daemon's worker process | Ollama or any model server |
-| TTS (Mac) | mlx-audio Kokoro `mlx-community/Kokoro-82M-bf16`, English voice from `tts.voice` (default `af_heart`), 24 kHz | — |
+| TTS (Mac) | Direct mlx-audio, 24 kHz: `tts.engine: phonon` uses `gradium/phonon-31m-en` with `voice: default`, speed 1.0; `kokoro` uses `mlx-community/Kokoro-82M-bf16` with configurable English voice/speed (existing config default `af_heart`) | — |
 | VAD | Silero, 16 kHz, in the main process | — |
 | Linux | sherpa-onnx or faster-whisper · llama-cpp-python CUDA (wheel index, not PyPI) · kokoro-onnx · silero-vad | — |
 | Install | clone the repo, ./scripts/install.sh, uv run ai-phone setup | Homebrew tap, Docker, PyPI (dropped 2026-09-17) |
@@ -65,7 +65,7 @@ src/ai_phone/  telephony/ (endpoint, call, media_port, policy, events, state, ri
                control/   (protocol, server, client)                        — the unix control socket
                setup/     (ui, flow, actions, plain, tui, look)              — `ai-phone setup` (CLI only)
                calls.py (call records), call_guard.py (emergency block, daily limit)
-               models.py (model ids, download), voices.py (the English Kokoro voices), vendor/ (the built SIP library, git-ignored)
+               models.py (model ids, download), voices.py (English voices by speech engine), vendor/ (the built SIP library, git-ignored)
                cli.py, cli_lines.py, cli_status.py, cli_call.py (call, listen, say, hangup), cli_models.py, daemon.py, config.py, secrets.py, paths.py
 native/pjsua2/ SWIG interface + build script (the extension's GPL source)
 scripts/       install.sh, latency_report.py, pjsua_peer.sh, pf/ ruleset, utterances.txt

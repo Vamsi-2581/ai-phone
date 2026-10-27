@@ -38,6 +38,7 @@ PLANS = {"claude": Plan("Claude", "Claude Code", "My Claude subscription", "uses
 SAMPLE = "Hi, this is your agent. This is how I sound on the phone."
 CARRIERS = (("twilio", "Twilio"), ("telnyx", "Telnyx"))
 VOICE_GROUPS = (("af", "American · female"), ("am", "American · male"), ("bf", "British · female"), ("bm", "British · male"))
+SPEECH_ENGINES = ("phonon", "kokoro")
 FORWARD_WHEN = ("no-answer", "busy", "unreachable", "all")
 CALLER_ID_TRIES = 3        # codes the carrier lets a person type, as `ai-phone lines verify-caller-id` does
 CALLER_ID_WAIT_SEC = 120   # how long to wait while the carrier's call asks for the code
@@ -54,6 +55,7 @@ class Session:
     summary: str = ""
     saved: list[str] = field(default_factory=list)  # in words: "the brain", "line twilio (+1555…, …)"
     working: tuple[str, str] | None = None  # the step running now: (its label, "carrier" | "download" | "")
+    new_config: bool = False
 
     def note(self, what: str) -> None:
         if what not in self.saved:
@@ -83,6 +85,7 @@ def cancel_text(session: Session) -> str:
 def run(ui, actions, session: Session | None = None) -> Outcome:
     session = Session() if session is None else session
     try:
+        session.new_config = not actions.current().exists
         plan = welcome(ui, actions)
         i = 0
         while i < len(plan):
@@ -268,7 +271,7 @@ def welcome(ui, actions) -> list[int]:
     plans = [[LINE], [BRAIN], [VOICE], [CALLERS], [BRAIN, LINE, VOICE, CALLERS]]
     i = ui.choose(page, [Option("Add a line", "a phone number, a SIP address or your own trunk"),
                          Option("Change the brain", "on this Mac, a plan you pay for, or your own endpoint"),
-                         Option("Change the voice", "voice and speed"),
+                         Option("Change the voice", "speech model, voice and speed"),
                          Option("Change what callers hear", "greeting, instructions, daily limit"),
                          Option("Run all steps"),
                          Option("Cancel", "exit setup, nothing is changed")], back=False)
@@ -674,6 +677,17 @@ def english_voices(actions) -> list[str]:
 
 def voice(ui, actions, session: Session) -> None:
     cur = actions.current()
+    default = 0 if session.new_config and "the voice" not in session.saved else SPEECH_ENGINES.index(cur.tts_engine)
+    engine = SPEECH_ENGINES[ui.choose(
+        Page(VOICE, "Which speech model?", "Both run on this Mac. You can hear a sample before saving."),
+        [Option("Phonon", "recommended for new setups · one English voice"),
+         Option("Kokoro", "American and British voices · adjustable speed")], default=default)]
+    if engine == "phonon":
+        phonon_voice(ui, actions, session)
+        return
+    # A switch from Phonon starts at Kokoro's normal speed and default voice.
+    if cur.tts_engine != "kokoro":
+        cur = replace(cur, voice=voices.DEFAULT, speed=1.0)
     names, error = english_voices(actions), ""
     while not names:
         i = ui.choose(Page(VOICE, "How should your agent sound?",
@@ -721,6 +735,39 @@ def voice(ui, actions, session: Session) -> None:
             error = str(e)
 
 
+def phonon_voice(ui, actions, session: Session) -> None:
+    name, error = voices.default_voice("phonon"), ""
+    while not actions.voices(engine="phonon"):
+        i = ui.choose(Page(VOICE, "Download Phonon?", "The model includes its English voice. You can download it now to hear a sample.",
+                           error=error),
+                      [Option("Download it now"), Option("Use the bundled voice", "download at the Check step")])
+        try:
+            if i == 1:
+                actions.save_voice(name, 1.0, engine="phonon")
+                session.note("the voice")
+                return
+            progress(ui, session, Page(VOICE, "Downloading Phonon"), "Downloading…",
+                     lambda report: actions.pull_voice_model(report, engine="phonon"))
+            session.note("the downloaded speech model")
+            error = "The model downloaded, but its bundled voice is missing. Try the download again."
+        except ActionError as e:
+            error = str(e)
+    error = ""
+    while True:
+        page = Page(VOICE, "Phonon voice", "One bundled English voice at its natural speed.", error=error)
+        i = ui.choose(page, [Option("Use this voice"), Option("Hear it", "plays a short sample on this Mac's speakers")])
+        try:
+            if i == 0:
+                actions.save_voice(name, 1.0, engine="phonon")
+                session.note("the voice")
+                return
+            busy(ui, session, replace(page, error=""), "Playing…",
+                 lambda: actions.play_sample(name, 1.0, SAMPLE, engine="phonon"))
+            error = ""
+        except ActionError as e:
+            error = str(e)
+
+
 # ---- Callers -----------------------------------------------------------------------------------
 
 def callers(ui, actions, session: Session) -> None:
@@ -754,11 +801,11 @@ def check(ui, actions, session: Session) -> None:
             rows.append(check_brain(ui, actions, session, checking(rows), cur))
         if error is None:
             rows.extend(check_lines(ui, actions, session, checking(rows), cur))
-        if actions.voices():  # the speech model is here
+        if actions.voices(engine=cur.tts_engine):  # the selected speech model is here
             try:
                 busy(ui, session, checking(rows), "Playing your agent's voice…",
-                     lambda: actions.play_sample(cur.voice, cur.speed, DISCLOSURE))
-                rows.append(Check("Voice", f"{voices.title(cur.voice)} · played", True))
+                     lambda: actions.play_sample(cur.voice, cur.speed, DISCLOSURE, engine=cur.tts_engine))
+                rows.append(Check("Voice", f"{voices.title(cur.voice, engine=cur.tts_engine)} · played", True))
             except ActionError as e:
                 rows.append(Check("Voice", str(e), False))
         fine = all(r.ok is True for r in rows)
@@ -849,8 +896,9 @@ def done_text(actions, session: Session) -> str:
         brain_row = f"your {PLANS[cur.brain_kind].name} subscription · {model_name(cur.brain_kind, cur.model)}"
     else:
         brain_row = f"{cur.base_url} · {cur.model}"
-    out += [f"Brain    {brain_row}",
-            f"Voice    {voices.title(cur.voice)} · {voices.describe(cur.voice)} · {speed_text(cur.speed)}×",
+    voice_row = (f"Phonon · {voices.describe(cur.voice, engine='phonon')}" if cur.tts_engine == "phonon" else
+                 f"Kokoro · {voices.title(cur.voice)} · {voices.describe(cur.voice)} · {speed_text(cur.speed)}×")
+    out += [f"Brain    {brain_row}", f"Voice    {voice_row}",
             "", "Start ai-phone", "  uv run ai-phone run", "", "Try it"]
     out += try_it(cur.lines)
     width = max(len(command) for command, _ in AI_COMMANDS)

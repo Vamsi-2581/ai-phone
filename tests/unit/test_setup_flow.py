@@ -128,7 +128,7 @@ class FakeActions:
                            base_url="http://127.0.0.1:1234/v1", model="local", brain_key_saved=False, brain_cli=None,
                            voice="af_heart", speed=1.0, greeting=GREETING, instructions=INSTRUCTIONS, daily_limit=20)
         self.results = {"saved_keys": None, "owned_numbers": OWNED, "search_numbers": FOUND, "lan_address": "192.0.2.10",
-                        "voices": VOICES, "check_config": None, "download_size": 4_300_000_000, "test_endpoint": "OK"}
+                        "voices": VOICES, "phonon_voices": ["default"], "check_config": None, "download_size": 4_300_000_000, "test_endpoint": "OK"}
         self.results.update(results)
 
     def _call(self, name, *args):
@@ -162,8 +162,8 @@ class FakeActions:
     def unfinished_numbers(self):
         return self._call("unfinished_numbers") or set()
 
-    def voices(self):
-        return self._call("voices")
+    def voices(self, *, engine="kokoro"):
+        return self._call("voices", engine) if engine == "kokoro" else self._call("phonon_voices", engine)
 
     def missing_models(self):
         return self._call("missing_models") or self.m.models_missing
@@ -204,11 +204,11 @@ class FakeActions:
     def search_numbers(self, carrier, creds, country, area):
         return self._call("search_numbers", carrier, dict(creds), country, area)
 
-    def play_sample(self, voice, speed, text):
-        return self._call("play_sample", voice, speed, text)
+    def play_sample(self, voice, speed, text, *, engine="kokoro"):
+        return self._call("play_sample", voice, speed, text, engine)
 
-    def pull_voice_model(self, report):
-        self._call("pull_voice_model", report)
+    def pull_voice_model(self, report, *, engine="kokoro"):
+        self._call("pull_voice_model", report, engine)
         report(1, 1)
 
     def pull_models(self, report):
@@ -267,9 +267,9 @@ class FakeActions:
         self.cur.lines[line_id] = {"kind": "trunk", "number": number}
         return line_id
 
-    def save_voice(self, voice, speed):
-        self._call("save_voice", voice, speed)
-        self.cur.voice, self.cur.speed = voice, speed
+    def save_voice(self, voice, speed, *, engine="kokoro"):
+        self._call("save_voice", voice, speed, engine)
+        self.cur.voice, self.cur.speed, self.cur.tts_engine = voice, speed, engine
 
     def save_callers(self, greeting, instructions, daily_limit):
         self._call("save_callers", greeting, instructions, daily_limit)
@@ -304,6 +304,7 @@ def test_new_setup_local_brain_sip_line_default_voice():
         ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["agent", "192.0.2.10"]),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "American · female"),
         ("American · female", "<default>"),
         ("Heart", "Use this voice"),
@@ -331,9 +332,9 @@ def test_new_setup_local_brain_sip_line_default_voice():
     assert actions.changes() == ["save_brain_local", "add_sip_line", "save_voice", "save_callers"]
     assert actions.args("save_brain_local") == [("t4",)]
     assert actions.args("add_sip_line") == [("agent", "192.0.2.10")]
-    assert actions.args("save_voice") == [("af_heart", 1.0)]
+    assert actions.args("save_voice") == [("af_heart", 1.0, "kokoro")]
     assert actions.args("save_callers") == [(GREETING, INSTRUCTIONS, 20)]
-    assert actions.args("play_sample") == [("af_heart", 1.0, DISCLOSURE)]
+    assert actions.args("play_sample") == [("af_heart", 1.0, DISCLOSURE, "kokoro")]
     check = ui.questions("Everything works")[0]
     assert check.checks == [Check("Models", "downloaded", True), Check("Config", "loads", True),
                             Check("Line agent", "ready · listening", True), Check("Voice", "Heart · played", True)]
@@ -1143,13 +1144,15 @@ def test_back_at_the_first_question_goes_to_the_previous_step():
         ("Where should your agent think?", "On this Mac"),
         ("Which model?", "Qwen3.5 4B"),
         ("How should people reach your agent?", "Skip"),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "<quit>"),
     ])
     actions = FakeActions(memory=32)
     assert drive(ui, actions).code == 1
     assert ui.steps == [WELCOME, BRAIN, LINE, BRAIN, LINE, VOICE]
     assert actions.args("save_brain_local") == [("t9",), ("t4",)]
-    assert ui.menus[-3][2] == 1  # the model menu now defaults to what was saved
+    model_menus = [menu for menu in ui.menus if menu[0] == "Which model?"]
+    assert model_menus[-1][2] == 1  # the model menu now defaults to what was saved
 
 
 def test_back_later_in_a_step_restarts_it():
@@ -1197,6 +1200,7 @@ def test_cancel_keeps_finished_steps_only():
         ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["", ""]),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "<quit>"),
     ])
     actions = FakeActions()
@@ -1275,6 +1279,7 @@ def test_ctrl_c_during_a_purchase_says_it_may_be_half_done():
         ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["", ""]),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "American · female"),
         ("American · female", "Heart"),
         ("Heart", "Hear it"),
@@ -1296,7 +1301,7 @@ def test_ctrl_c_during_a_download_says_it_resumes():
     assert outcome == Outcome(1, "Setup cancelled. The download stops now and picks up where it left off next time. "
                                  "Saved in this run: what callers hear.")
     assert session.left_download and flow.cancel_text(session) == outcome.summary
-    ui = ScriptedUI([("Give your AI", "Change the voice"), ("How should your agent sound?", "Download it now")])
+    ui = ScriptedUI([("Give your AI", "Change the voice"), ("Which speech model?", "Kokoro"), ("How should your agent sound?", "Download it now")])
     session = flow.Session()
     outcome = flow.run(ui, FakeActions(exists=True, voices=[], pull_voice_model=KeyboardInterrupt()), session)
     assert outcome == Outcome(1, "Setup cancelled. The download stops now and picks up where it left off next time.")
@@ -1358,6 +1363,7 @@ def test_callers_that_do_not_validate_are_asked_again():
 def test_existing_config_change_the_voice_only():
     ui = ScriptedUI([
         ("Give your AI", "Change the voice"),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "British · male"),
         ("British · male", "George"),
         ("George", "Hear it"),
@@ -1372,8 +1378,8 @@ def test_existing_config_change_the_voice_only():
     assert drive(ui, actions).code == 0
     assert ui.steps == [WELCOME, VOICE, CHECK, DONE]
     assert actions.changes() == ["save_voice"]
-    assert actions.args("save_voice") == [("bm_george", 0.9)]
-    assert actions.args("play_sample") == [("bm_george", 1.0, flow.SAMPLE)] * 2 + [("bm_george", 0.9, DISCLOSURE)]
+    assert actions.args("save_voice") == [("bm_george", 0.9, "kokoro")]
+    assert actions.args("play_sample") == [("bm_george", 1.0, flow.SAMPLE, "kokoro")] * 2 + [("bm_george", 0.9, DISCLOSURE, "kokoro")]
     groups = ui.menu("How should your agent sound?")
     assert [(o.label, o.hint) for o in groups[1]] == [("American · female", "2 voices"), ("American · male", "1 voice"),
                                                       ("British · female", "1 voice"), ("British · male", "1 voice")]
@@ -1383,12 +1389,98 @@ def test_existing_config_change_the_voice_only():
     assert "Playing…" in ui.labels
     assert [(o.label, o.hint) for o in ui.menu("George")[1]] == [
         ("Use this voice", ""), ("Hear it", "plays a short sample on this Mac's speakers")]
-    assert "Voice    George · British · male · 0.9×" in ui.questions("You're set up")[0].body
+    assert "Voice    Kokoro · George · British · male · 0.9×" in ui.questions("You're set up")[0].body
+    question, options, default, _ = ui.menu("Which speech model?")
+    assert options[default].label == "Kokoro"  # no silent change for an existing config
+
+
+def test_new_setup_recommends_phonon_previews_then_downloads_the_remaining_models():
+    ui = ScriptedUI([
+        WELCOME_NEW,
+        ("Where should your agent think?", "On this Mac"),
+        ("Which model?", "<default>"),
+        ("How should people reach your agent?", "A SIP address"),
+        ("Name your SIP address", ["agent", "192.0.2.10"]),
+        ("Which speech model?", "<default>"),
+        ("Phonon voice", "Hear it"),
+        ("Phonon voice", "Use this voice"),
+        ("What should callers hear?", ["", "", ""]),
+        ("Download the models now?", "Download now"),
+        ("Everything works", "Continue"),
+        FINISH,
+    ])
+    actions = FakeActions(missing=["speech-to-text", "language-model"])
+    outcome = drive(ui, actions)
+    assert outcome.code == 0
+    _, options, default, _ = ui.menu("Which speech model?")
+    assert options[default].label == "Phonon" and "recommended" in options[default].hint
+    assert actions.args("save_voice") == [("default", 1.0, "phonon")]
+    assert actions.args("play_sample") == [("default", 1.0, flow.SAMPLE, "phonon"),
+                                             ("default", 1.0, DISCLOSURE, "phonon")]
+    names = [name for name, _ in actions.calls]
+    assert names.index("play_sample") < names.index("pull_models")
+    assert not any(field.label == "Speed" for field in ui.fields)
+    assert "Voice    Phonon · English · bundled voice" in outcome.summary
+
+
+@pytest.mark.parametrize("leave", ["<quit>", "<back>"])
+def test_leaving_a_phonon_preview_keeps_the_existing_voice(leave):
+    answers = [("Give your AI", "Change the voice"), ("Which speech model?", "Phonon"),
+               ("Phonon voice", "Hear it"), ("Phonon voice", leave)]
+    if leave == "<back>":
+        answers.append(("Which speech model?", "<quit>"))
+    ui = ScriptedUI(answers)
+    actions = FakeActions(exists=True, lines={"agent": SIP_LINE})
+    actions.cur.voice, actions.cur.speed = "bm_george", 0.9
+    assert drive(ui, actions).code == 1
+    assert not actions.changes()
+    assert (actions.cur.tts_engine, actions.cur.voice, actions.cur.speed) == ("kokoro", "bm_george", 0.9)
+
+
+def test_existing_phonon_is_selected_and_switching_to_kokoro_uses_its_defaults():
+    ui = ScriptedUI([
+        ("Give your AI", "Change the voice"), ("Which speech model?", "Kokoro"),
+        ("How should your agent sound?", "American · female"), ("American · female", "<default>"),
+        ("Heart", "Use this voice"), ("How fast should it talk?", [""]),
+        ("Everything works", "Continue"), FINISH,
+    ])
+    actions = FakeActions(exists=True, lines={"agent": SIP_LINE})
+    actions.cur.tts_engine, actions.cur.voice = "phonon", "default"
+    assert drive(ui, actions).code == 0
+    _, options, default, _ = ui.menu("Which speech model?")
+    assert options[default].label == "Phonon"
+    assert actions.args("save_voice") == [("af_heart", 1.0, "kokoro")]
+
+
+def test_missing_phonon_offers_its_own_download_before_preview():
+    ui = ScriptedUI([
+        ("Give your AI", "Change the voice"), ("Which speech model?", "Phonon"),
+        ("Download Phonon?", "Download it now"), ("Phonon voice", "Hear it"),
+        ("Phonon voice", "Use this voice"), ("Everything works", "Continue"), FINISH,
+    ])
+    actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, phonon_voices=Seq([], ["default"], ["default"]))
+    assert drive(ui, actions).code == 0
+    assert actions.args("pull_voice_model")[0][1] == "phonon"
+    assert actions.args("save_voice") == [("default", 1.0, "phonon")]
+    assert actions.args("play_sample")[0] == ("default", 1.0, flow.SAMPLE, "phonon")
+
+
+def test_phonon_download_can_wait_for_check_without_changing_speed():
+    ui = ScriptedUI([
+        ("Give your AI", "Change the voice"), ("Which speech model?", "Phonon"),
+        ("Download Phonon?", "Use the bundled voice"), ("Everything works", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, phonon_voices=[])
+    actions.cur.voice, actions.cur.speed = "bm_george", 0.9
+    assert drive(ui, actions).code == 1
+    assert actions.args("save_voice") == [("default", 1.0, "phonon")]
+    assert not actions.args("pull_voice_model") and not actions.args("play_sample")
 
 
 def test_no_voices_offers_the_speech_model_download():
     ui = ScriptedUI([
         ("Give your AI", "Change the voice"),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "Download it now"),
         ("How should your agent sound?", "American · female"),
         ("American · female", "Heart"),
@@ -1398,24 +1490,25 @@ def test_no_voices_offers_the_speech_model_download():
     ])
     actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, voices=Seq([], ["af_heart"], ["af_heart"]))
     drive(ui, actions)
-    first = ui.pages[1]
+    first = ui.questions("How should your agent sound?")[0]
     assert first.detail == "The speech model is not downloaded yet, so there are no voices to pick from."
-    assert [(o.label, o.hint) for o in ui.menus[1][1]] == [
+    assert [(o.label, o.hint) for o in ui.menu("How should your agent sound?")[1]] == [
         ("Download it now", "about 0.4 GB"), ("Keep the default voice", "Heart · American · female")]
     assert len(actions.args("pull_voice_model")) == 1 and callable(actions.args("pull_voice_model")[0][0])
     assert ui.questions("Downloading the speech model")
-    assert actions.args("save_voice") == [("af_heart", 1.0)]
+    assert actions.args("save_voice") == [("af_heart", 1.0, "kokoro")]
 
 
 def test_no_voices_keep_the_default():
     ui = ScriptedUI([
         ("Give your AI", "Change the voice"),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "Keep the default voice"),
         ("Everything works", "<quit>"),
     ])
     actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, voices=[])
     drive(ui, actions)
-    assert actions.args("save_voice") == [("af_heart", 1.0)]
+    assert actions.args("save_voice") == [("af_heart", 1.0, "kokoro")]
     assert not actions.args("pull_voice_model")
     rows = ui.questions("Everything works")[0].checks
     assert [r.label for r in rows] == ["Models", "Config", "Line agent"]  # no speech model: no voice row
@@ -1426,6 +1519,7 @@ def test_no_voices_download_failure_is_shown_on_the_voice_page():
     broken = "config.yaml is not valid YAML; fix it or move it away, then run setup again"
     ui = ScriptedUI([
         ("Give your AI", "Change the voice"),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "Download it now"),
         ("How should your agent sound?", "Keep the default voice"),
         ("How should your agent sound?", "Keep the default voice"),
@@ -1436,12 +1530,13 @@ def test_no_voices_download_failure_is_shown_on_the_voice_page():
     drive(ui, actions)
     pages = [p for p in ui.pages if p.question == "How should your agent sound?"]
     assert [p.error for p in pages] == ["", failed, broken]
-    assert actions.args("save_voice") == [("af_heart", 1.0)] * 2
+    assert actions.args("save_voice") == [("af_heart", 1.0, "kokoro")] * 2
 
 
 def test_no_voices_after_the_download_says_so():
     ui = ScriptedUI([
         ("Give your AI", "Change the voice"),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "Download it now"),
         ("How should your agent sound?", "<quit>"),
     ])
@@ -1456,6 +1551,7 @@ def test_a_voice_that_cannot_be_saved_is_asked_again():
     broken = "config.yaml is not valid YAML; fix it or move it away, then run setup again"
     ui = ScriptedUI([
         ("Give your AI", "Change the voice"),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "<default>"),
         ("American · female", "<default>"),
         ("Heart", "Use this voice"),
@@ -1468,7 +1564,7 @@ def test_a_voice_that_cannot_be_saved_is_asked_again():
     first, second = ui.questions("How fast")
     assert first.error == "" and second.error == broken
     assert [f.default for f in ui.fields] == ["1.0", "1.2"]
-    assert actions.args("save_voice") == [("af_heart", 1.2)] * 2
+    assert actions.args("save_voice") == [("af_heart", 1.2, "kokoro")] * 2
 
 
 def test_unexpected_errors_stop_setup_without_a_traceback():
@@ -1477,7 +1573,7 @@ def test_unexpected_errors_stop_setup_without_a_traceback():
     outcome = flow.run(ui, FakeActions(exists=True, check_config=ActionError(broken)))
     assert (outcome.code, outcome.summary) == (3, f"Setup stopped: {broken}\nSaved in this run: what callers hear. "
                                                   "Nothing else was changed.") and ui.closed
-    ui = ScriptedUI([("Give your AI", "Change the voice")])
+    ui = ScriptedUI([("Give your AI", "Change the voice"), ("Which speech model?", "Kokoro")])
     outcome = flow.run(ui, FakeActions(exists=True, voices=KeyError("af_secret_detail")))
     assert (outcome.code, outcome.summary) == (3, "Setup stopped: KeyError\nNothing was changed.") and ui.closed
 
@@ -1584,7 +1680,7 @@ def test_done_text_fits_the_page(monkeypatch, tmp_path):
         "         desk     sip:desk@192.0.2.10    SIP address",
         "         odd      +15550100004           SIP trunk",
         "Brain    on this Mac · Qwen3.5 4B",
-        "Voice    Heart · American · female · 1.0×",
+        "Voice    Kokoro · Heart · American · female · 1.0×",
         "",
         "Start ai-phone",
         "  uv run ai-phone run",
@@ -1665,6 +1761,7 @@ def test_new_setup_with_a_claude_subscription():
         ("Which model?", "<default>"),
         ("How should people reach your agent?", "A SIP address"),
         ("Name your SIP address", ["agent", "192.0.2.10"]),
+        ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "American · female"),
         ("American · female", "<default>"),
         ("Heart", "Use this voice"),

@@ -26,7 +26,7 @@ from ai_phone.providers.base import Number, ProviderError, VerificationStep
 from ai_phone.providers.fake import OWNED, FakeProvider
 from ai_phone.secrets import load_secrets, write_secret
 from ai_phone.setup import actions as act
-from ai_phone.setup.actions import BRAIN_KEY_ENV, ActionError, Actions, Current, KokoroPlayer, LineResult, Machine
+from ai_phone.setup.actions import BRAIN_KEY_ENV, ActionError, Actions, Current, KokoroPlayer, PhononPlayer, LineResult, Machine
 from ai_phone.telephony.state import LineStatus, StateFile
 
 FAKE_KEY = {"FAKE_API_KEY": "fake-key-SECRET"}
@@ -50,7 +50,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.delenv("AI_PHONE_FAKE_PENDING", raising=False)
     monkeypatch.setattr(models, "memory_gb", lambda: 24)
     monkeypatch.setattr(models, "local_path", lambda repo: None)  # nothing downloaded, and never the real cache
-    monkeypatch.setattr(voices, "installed_voices", lambda root=None: ["af_heart", "bf_emma", "bm_george"])
+    monkeypatch.setattr(voices, "installed_voices", lambda root=None, engine="kokoro": ["default"] if engine == "phonon" else ["af_heart", "bf_emma", "bm_george"])
     monkeypatch.setattr(act, "probe", lambda path: False)
     vendor = tmp_path / "vendor"
     vendor.mkdir()
@@ -603,11 +603,39 @@ def test_pull_voice_model(home, monkeypatch):
 def test_save_voice(home):
     a = make(home, "tts: {speed: 1.2}\ninbound: {greeting: Hi}\n")
     a.save_voice("bm_george", 0.9)
-    assert raw(home) == {"tts": {"speed": 0.9, "voice": "bm_george"}, "inbound": {"greeting": "Hi"}}
+    assert raw(home) == {"tts": {"engine": "kokoro", "speed": 0.9, "voice": "bm_george"}, "inbound": {"greeting": "Hi"}}
     before = (home / "config.yaml").read_text()
     with pytest.raises(ActionError, match="bm_nobody is not installed"):
         a.save_voice("bm_nobody", 1.0)
     assert (home / "config.yaml").read_text() == before
+
+
+def test_phonon_selection_replaces_voice_and_downloads_only_the_selected_model(home, monkeypatch):
+    a = make(home, "tts: {voice: bm_george, speed: 0.9}\nbrain: {kind: local}\nmodels: {tier: t4}\n")
+    a.save_voice("default", 1.0, engine="phonon")
+    assert raw(home)["tts"] == {"engine": "phonon", "voice": "default", "speed": 1.0}
+    assert a.current().tts_engine == "phonon" and a.voices(engine="phonon") == ["default"]
+    assert a.missing_models() == [models.STT, models.PHONON, models.LLM["t4"]]
+    pulled = []
+    monkeypatch.setattr(models, "pull", lambda repos, report=None: pulled.append(repos))
+    a.pull_voice_model(lambda done, total: None, engine="phonon")
+    a.pull_models(lambda done, total: None)
+    assert pulled == [[models.PHONON], [models.STT, models.PHONON, models.LLM["t4"]]]
+    before = (home / "config.yaml").read_text()
+    with pytest.raises(ActionError, match="speed"):
+        a.save_voice("default", 0.9, engine="phonon")
+    assert (home / "config.yaml").read_text() == before
+    a.save_voice("bf_emma", 1.1)
+    assert a.current().tts_engine == "kokoro" and a.current().voice == "bf_emma"
+
+
+def test_phonon_preview_routes_to_its_player(home):
+    a = make(home)
+    phonon = FakePlayer()
+    a.phonon_player = phonon
+    a.play_sample("default", 1.0, "Hello.", engine="phonon")
+    assert phonon.played == [("default", 1.0, "Hello.")]
+    assert not a.player.played
 
 
 def test_save_callers_merges_into_the_sections(home):
@@ -898,6 +926,48 @@ def test_kokoro_player_needs_the_model_and_the_voice(tmp_path, monkeypatch):
     monkeypatch.setattr(voices, "voices_dir", lambda: None)
     with pytest.raises(ActionError, match="^could not play the sample: the voice bf_emma is not installed$"):
         player.play("bf_emma", 1.0, "Hi.")
+
+
+def test_phonon_player_previews_the_daemons_frames_and_reuses_the_backend(tmp_path, monkeypatch):
+    (tmp_path / "default-voice.safetensors").write_bytes(b"voice")
+    monkeypatch.setattr(models, "local_path", lambda repo: tmp_path if repo == models.PHONON else None)
+    calls, played = [], []
+    frame = np.full(320, 1234, dtype="<i2").tobytes()
+
+    class Backend:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        def warmup(self):
+            calls.append(("warmup",))
+
+        def stream(self, gen, seq, text):
+            calls.append(("stream", gen, seq, text))
+            yield frame
+            yield b""
+
+    def play(argv, **kwargs):
+        with wave.open(argv[1], "rb") as wav:
+            assert (wav.getframerate(), wav.getsampwidth(), wav.getnchannels()) == (16000, 2, 1)
+            assert wav.readframes(wav.getnframes()) == frame
+        played.append(Path(argv[1]))
+
+    player = PhononPlayer(factory=Backend, run=play)
+    player.play("default", 1.0, "Hello.")
+    player.play("default", 1.0, "Again.")
+    assert calls == [("init", {"voice": "default", "speed": 1.0}), ("warmup",),
+                     ("stream", 1, 0, "Hello."), ("stream", 2, 0, "Again.")]
+    assert len(played) == 2 and not any(path.exists() for path in played)
+
+
+def test_phonon_player_refuses_missing_assets_before_loading(tmp_path, monkeypatch):
+    player = PhononPlayer(factory=lambda **kw: pytest.fail("must not load"))
+    monkeypatch.setattr(models, "local_path", lambda repo: None)
+    with pytest.raises(ActionError, match="speech model is not downloaded"):
+        player.play("default", 1.0, "Hello.")
+    monkeypatch.setattr(models, "local_path", lambda repo: tmp_path)
+    with pytest.raises(ActionError, match="voice default is not installed"):
+        player.play("default", 1.0, "Hello.")
 
 
 # ---- a Claude or ChatGPT plan as the brain -------------------------------------------------------

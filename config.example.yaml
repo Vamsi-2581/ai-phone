@@ -67,8 +67,9 @@ brain:
   # 12000 unless you set a number here yourself (its first word takes seconds — its CLI starts, then the provider).
 
 tts:
-  voice: af_heart   # English voices from the speech model: af_/am_ American, bf_/bm_ British (ai-phone setup lists them)
-  speed: 1.0        # 0.5 to 2.0
+  engine: kokoro    # kokoro (also the default for existing configs) | phonon
+  voice: af_heart   # Kokoro: af_/am_ American, bf_/bm_ British; Phonon: default
+  speed: 1.0        # Kokoro: 0.5 to 2.0; Phonon: 1.0 only
 
 conversation:
   endpoint_silence_ms: 300

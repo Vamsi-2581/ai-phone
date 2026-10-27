@@ -220,6 +220,7 @@ def sip_setup_answers():
         "",   # model: Qwen3.5 4B
         "2",  # Line: A SIP address
         "", "",  # name and address: defaults
+        "2",  # speech model: Kokoro
         "", "", "",  # voice group, voice, Use this voice
         "",   # speed
         "", "", "",  # greeting, instructions, daily limit
@@ -368,6 +369,7 @@ def test_a_subscription_brain_in_plain_mode(typed, capsys, monkeypatch, tmp_path
         "2",   # Brain: My Claude subscription
         "",    # model: Haiku
         "2", "", "",          # a SIP address, with its defaults
+        "2",                  # speech model: Kokoro
         "", "", "", "",       # voice group, voice, use it, speed
         "", "", "",           # greeting, instructions, daily limit
         "",    # Check: Continue

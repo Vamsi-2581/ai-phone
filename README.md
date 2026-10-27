@@ -23,11 +23,16 @@ own jitter buffer (60–100 ms) for mouth-to-ear. Measured while the host was al
 10 GB of other applications, over 20 LAN calls using 8 kHz PCMU. Callers who talk over the greeting
 are heard in full.
 
-A current-code rerun on **2026-10-26**, using the same Mac and model tier over 20 loopback PCMU
+A Kokoro rerun on **2026-10-26**, using the same Mac and model tier over 20 loopback PCMU
 calls, measured **1074 ms p50 / 1719 ms p95**. All 20 turns completed, but this run missed the
 1000 ms p50 gate. The host still held about 20 GB in swap and paged during the run; current
 default phone instructions also differ from M1. The historical result is retained separately.
 See the [rerun measurements and conditions](docs/latency-2026-10-26.md).
+
+With Phonon integrated on **2026-10-27**, all 20 local calls completed at **1500 ms p50 / 1939 ms p95**;
+the TTS stage measured **52 / 84 ms**. All five interruption calls cancelled and resumed speech, but one
+stopped in 396 ms, above the 300 ms limit. Both timing gates remain unmet in this run. The host paged
+heavily, and runtime and caller-duration conditions changed. See the [Phonon integration results](docs/phonon-2026-10-27.md).
 
 ## Try it (macOS, Apple Silicon)
 
@@ -42,6 +47,12 @@ uv run ai-phone run         # start ai-phone
 readable only by you) and changes only what you pick when you run it again. `uv run ai-phone setup --plain` asks the
 same questions as plain prompts. The models go to the Hugging Face cache; `uv run ai-phone models pull` fetches them
 without the wizard. The commands below are written as `ai-phone …`; from the repo folder that is `uv run ai-phone …`.
+
+The Voice step offers Phonon 31M English (streaming, one bundled voice at normal speed) and Kokoro
+(American and British voices, adjustable speed). Both run directly through MLX in the daemon's TTS worker.
+Existing configurations keep Kokoro. To select Phonon by hand, set
+`tts: {engine: phonon, voice: default, speed: 1.0}`, run `uv run ai-phone models pull`, then restart the daemon.
+Only the selected speech model is required; voices and weights are loaded from disk before calls begin.
 
 No carrier yet? Pick "A SIP address" in setup and talk to your agent from this Mac with
 `pjsua --local-port 5070 sip:agent@127.0.0.1` (free).
@@ -81,7 +92,8 @@ ai-phone status
 #   brain: {kind: chatgpt, model: gpt-5.6-luna}         # your ChatGPT plan, through the Codex login
 #   brain: {kind: openai_compatible, base_url: "http://127.0.0.1:1234/v1", model: "…"}
 # And the voice
-#   tts: {voice: bf_emma, speed: 1.0}   (English voices: af_/am_ American, bf_/bm_ British)
+#   tts: {engine: phonon, voice: default, speed: 1.0}
+#   tts: {engine: kokoro, voice: bf_emma, speed: 1.0}   (af_/am_ American, bf_/bm_ British)
 ```
 
 `--key-env` and `--secret-env` name variables in your environment or in `~/.ai-phone/secrets.env` (where setup saves them).

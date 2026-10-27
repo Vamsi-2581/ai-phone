@@ -49,7 +49,7 @@ VENDOR = Path(ai_phone.__file__).parent / "vendor"  # where install.sh puts the 
 DAEMON = [sys.executable, "-c", "import sys; from ai_phone.cli import main; sys.exit(main(sys.argv[1:]))", "run", "--fake"]
 CHECK_SEC, POLL_SEC, STOP_SEC = 20, 0.5, 10  # how long a trial start may take to register, how often to look, how long to stop
 EXIT_STOP_SEC = 2  # how long a trial start may take to stop when setup itself is exiting
-SAMPLE_RATE = 24000  # Kokoro's own rate
+SAMPLE_RATE = 24000  # both speech models' native rate
 LOOPBACK = ("127.0.0.1", "localhost", "::1")  # the config's rule: plain http only to this machine
 BRAINS = {"claude": ClaudeCodeLLM, "chatgpt": CodexLLM}  # the subscription brains, by the config's kind
 INSTALL = {"claude": "npm install -g @anthropic-ai/claude-code", "chatgpt": "npm install -g @openai/codex"}
@@ -81,6 +81,7 @@ class Current:
     greeting: str
     instructions: str
     daily_limit: int            # calls.daily_limit, or 20 when the config has none
+    tts_engine: str = "kokoro"
 
 
 @dataclass
@@ -129,6 +130,7 @@ class Actions:
     def __init__(self, config_path: Path, player=None, provider_loader=None, http: httpx.Client | None = None):
         self.config_path = Path(config_path)
         self.player = player or KokoroPlayer()
+        self.phonon_player = player or PhononPlayer()
         self.provider_loader = provider_loader
         self.http = http  # tests pass a client with a mock transport
         self._probed: dict[tuple[str, str], dict] = {}  # a model already proved in this run, by (kind, model)
@@ -139,7 +141,7 @@ class Actions:
     def machine(self) -> Machine:
         cur = self.current()
         return Machine(sip_library=sip_library_built(), memory_gb=models.memory_gb(),
-                       models_missing=models.missing(cur.tier, cur.brain_kind), config_exists=cur.exists)
+                       models_missing=models.missing(cur.tier, cur.brain_kind, cur.tts_engine), config_exists=cur.exists)
 
     def current(self) -> Current:
         exists = self.config_path.exists()
@@ -159,7 +161,7 @@ class Actions:
                        base_url=cfg.brain.base_url, model=cfg.brain.model, brain_key_saved=bool(key_env and _saved().get(key_env)),
                        brain_cli=cfg.brain.cli,
                        voice=cfg.tts.voice, speed=cfg.tts.speed, greeting=cfg.inbound.greeting,
-                       instructions=cfg.inbound.instructions, daily_limit=limit)
+                       instructions=cfg.inbound.instructions, daily_limit=limit, tts_engine=cfg.tts.engine)
 
     def _read(self) -> dict:
         """The raw config for a change. A file that is not a YAML mapping is never overwritten."""
@@ -568,26 +570,26 @@ class Actions:
 
     # ---- voice -----------------------------------------------------------------------------------
 
-    def voices(self) -> list[str]:
-        return voices.installed_voices()
+    def voices(self, *, engine: str = "kokoro") -> list[str]:
+        return voices.installed_voices(engine=engine)
 
-    def play_sample(self, voice: str, speed: float, text: str) -> None:
+    def play_sample(self, voice: str, speed: float, text: str, *, engine: str = "kokoro") -> None:
         try:
-            self.player.play(voice, speed, text)
+            (self.phonon_player if engine == "phonon" else self.player).play(voice, speed, text)
         except ActionError:
             raise
         except Exception as e:  # the audio stack can fail in many ways; none of them should end setup
             raise ActionError(f"could not play the sample: {type(e).__name__}: {e}"[:200]) from None
 
-    def pull_voice_model(self, report: Callable[[int, int], None]) -> None:
+    def pull_voice_model(self, report: Callable[[int, int], None], *, engine: str = "kokoro") -> None:
         try:
-            models.pull([models.TTS], report)
+            models.pull([models.tts_repo(engine)], report)
         except models.ModelsError as e:
             raise ActionError(str(e)) from None
 
-    def save_voice(self, voice: str, speed: float) -> None:
+    def save_voice(self, voice: str, speed: float, *, engine: str = "kokoro") -> None:
         def change(raw: dict) -> None:
-            raw["tts"] = {**_section(raw, "tts"), "voice": voice, "speed": speed}
+            raw["tts"] = {**_section(raw, "tts"), "engine": engine, "voice": voice, "speed": speed}
         self._edit(change)
 
     # ---- callers ---------------------------------------------------------------------------------
@@ -749,7 +751,6 @@ class KokoroPlayer:
         self._model = None
 
     def play(self, voice: str, speed: float, text: str) -> None:
-        import numpy as np
         snapshot = models.local_path(models.TTS)
         if snapshot is None:
             raise ActionError("could not play the sample: the speech model is not downloaded")
@@ -765,15 +766,55 @@ class KokoroPlayer:
                 self._model = load(str(snapshot), model_type="kokoro")
             parts = [_samples(r.audio) for r in self._model.generate(text=text, voice=str(path), speed=speed,
                                                                       lang_code=voices.lang_code(voice))]
-        pcm = (np.clip(np.concatenate(parts), -1.0, 1.0) * 32767).astype("<i2")
-        fd, wav = tempfile.mkstemp(prefix="ai-phone-voice-", suffix=".wav")
-        os.close(fd)
-        try:
-            with wave.open(wav, "wb") as w:
-                w.setnchannels(1)
-                w.setsampwidth(2)
-                w.setframerate(SAMPLE_RATE)
-                w.writeframes(pcm.tobytes())
-            self._run(["afplay", wav], timeout=30, check=True, capture_output=True)
-        finally:
-            os.unlink(wav)
+        _play_audio(parts, self._run)
+
+
+class PhononPlayer:
+    """Preview the bundled voice through the same offline backend the daemon uses."""
+
+    def __init__(self, factory=None, run=subprocess.run):
+        self._factory, self._run = factory, run
+        self._backend = None
+        self._gen = 0
+
+    def play(self, voice: str, speed: float, text: str) -> None:
+        if models.local_path(models.PHONON) is None:
+            raise ActionError("could not play the sample: the speech model is not downloaded")
+        if voices.voice_path(voice, engine="phonon") is None:
+            raise ActionError(f"could not play the sample: the voice {voice} is not installed")
+        with _quiet():
+            if self._backend is None:
+                factory = self._factory
+                if factory is None:
+                    from ai_phone.services.backends.mlx_phonon import PhononTTS as factory
+                backend = factory(voice=voice, speed=speed)
+                backend.warmup()
+                self._backend = backend
+            self._gen += 1
+            pcm = b"".join(self._backend.stream(self._gen, 0, text))
+        _play_pcm(pcm, self._run, 16000)
+
+
+def _play_audio(parts, run) -> None:
+    import numpy as np
+    parts = [part for part in parts if part.size]
+    if not parts:
+        raise ActionError("could not play the sample: the speech model returned no audio")
+    pcm = (np.clip(np.concatenate(parts), -1.0, 1.0) * 32767).astype("<i2")
+    _play_pcm(pcm.tobytes(), run, SAMPLE_RATE)
+
+
+def _play_pcm(pcm: bytes, run, sample_rate: int) -> None:
+    if not pcm:
+        raise ActionError("could not play the sample: the speech model returned no audio")
+    fd, wav = tempfile.mkstemp(prefix="ai-phone-voice-", suffix=".wav")
+    os.close(fd)
+    try:
+        with wave.open(wav, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sample_rate)
+            w.writeframes(pcm)
+        run(["afplay", wav], timeout=30, check=True, capture_output=True)
+    finally:
+        os.unlink(wav)
