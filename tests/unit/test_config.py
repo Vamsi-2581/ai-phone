@@ -69,6 +69,33 @@ def test_empty_config_has_no_lines_and_a_default_greeting(tmp_path: Path):
     cfg = _load(tmp_path, "")
     assert cfg.lines == {}
     assert cfg.inbound.greeting.strip()
+    assert cfg.calls.allow_inbound is True and cfg.calls.allow_outbound is True
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("allow_inbound: false", (False, True)),
+    ("allow_outbound: false", (True, False)),
+    ("allow_inbound: true, allow_outbound: true", (True, True)),
+])
+def test_call_directions_can_be_enabled_independently(tmp_path, text, expected):
+    cfg = _load(tmp_path, f"calls: {{{text}}}\n")
+    assert (cfg.calls.allow_inbound, cfg.calls.allow_outbound) == expected
+
+
+@pytest.mark.parametrize("text, match", [
+    ("allow_inbound: false, allow_outbound: false", "at least one"),
+    ('allow_inbound: "false"', "calls.allow_inbound: expected true or false"),
+    ("allow_outbound: 1", "calls.allow_outbound: expected true or false"),
+])
+def test_call_directions_require_booleans_and_at_least_one_enabled(tmp_path, text, match):
+    with pytest.raises(ConfigError, match=match):
+        _load(tmp_path, f"calls: {{{text}}}\n")
+
+
+def test_outbound_only_does_not_warn_that_any_incoming_call_will_be_answered(tmp_path):
+    cfg = _load(tmp_path, "calls: {allow_inbound: false}\n"
+                         "lines:\n  agents: {kind: sip, aor: 'sip:ai@127.0.0.1', accept_invites_from: any}\n")
+    assert cfg.warnings == []
 
 
 def test_legacy_m1_config_is_migrated_with_a_warning(tmp_path: Path):

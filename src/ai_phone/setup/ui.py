@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Protocol, TypeVar
 
-STEPS = ("Welcome", "Brain", "Line", "Voice", "Callers", "Check", "Done")
+STEPS = ("Welcome", "Mode", "Brain", "Line", "Voice", "Settings", "Check", "Done")
 T = TypeVar("T")
 
 

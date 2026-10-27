@@ -419,6 +419,8 @@ class Daemon:
             ended = self.calls.unread_ended()
             if ended is not None:  # a relay call ended since anyone last listened: report that first
                 return await self._reply_event(send, ended, await ended.next_event(0))
+            if not self.cfg.calls.allow_inbound:
+                return await self._err(send, "rejected", "inbound calls are disabled (calls.allow_inbound is false)")
             try:
                 fut = self.calls.start_listening()
             except ListenerBusy as e:
@@ -483,6 +485,8 @@ class Daemon:
         await self._send_quiet(send, {"ok": True, "result": rec.result()})
 
     async def _cmd_call(self, msg: dict, send, ctx: dict) -> None:
+        if not self.cfg.calls.allow_outbound:
+            return await self._err(send, "rejected", "outbound calls are disabled (calls.allow_outbound is false)")
         tel, to = ctx["tel"], msg["to"]
         relay, prompt = bool(msg.get("relay")), msg.get("prompt")
         if is_emergency(to):

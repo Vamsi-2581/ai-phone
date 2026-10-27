@@ -20,7 +20,7 @@ from ai_phone.services.backends.cli_brain import CLAUDE_MODELS
 from ai_phone.setup.actions import CARRIER_KEYS, INSTALL, LOGIN, LOOPBACK, ActionError, LineResult
 from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
 
-WELCOME, BRAIN, LINE, VOICE, CALLERS, CHECK, DONE = range(7)
+WELCOME, MODE, BRAIN, LINE, VOICE, CALLERS, CHECK, DONE = range(8)
 BRAIN_KINDS = ("local", "claude", "chatgpt", "openai_compatible")  # in the order the Brain menu offers them
 
 
@@ -287,17 +287,47 @@ def welcome(ui, actions) -> list[int]:
     if not m.config_exists:
         if ui.choose(page, [Option("Continue"), Option("Cancel", "exit setup, nothing is saved")], back=False) == 1:
             raise Cancel()
-        return [BRAIN, LINE, VOICE, CALLERS, CHECK, DONE]
-    plans = [[LINE], [BRAIN], [VOICE], [CALLERS], [BRAIN, LINE, VOICE, CALLERS]]
+        return [MODE, BRAIN, LINE, VOICE, CALLERS, CHECK, DONE]
+    plans = [[LINE], [BRAIN], [VOICE], [MODE, CALLERS], [CALLERS], [MODE, BRAIN, LINE, VOICE, CALLERS]]
     i = ui.choose(page, [Option("Add a line", "a phone number, a SIP address or your own trunk"),
                          Option("Change the brain", "on this computer, a plan you pay for, or your own endpoint"),
                          Option("Change the voice", "speech model, voice and speed"),
-                         Option("Change what callers hear", "greeting, instructions, daily limit"),
+                         Option("Change call directions", "receive calls, place calls, or both"),
+                         Option("Change call settings", "greeting, instructions, daily limit"),
                          Option("Run all steps"),
                          Option("Cancel", "exit setup, nothing is changed")], back=False)
     if i == len(plans):
         raise Cancel()
     return plans[i] + [CHECK, DONE]
+
+
+# ---- Mode --------------------------------------------------------------------------------------
+
+CALL_MODES = ((True, True, "receive and place calls"),
+              (False, True, "place calls only"),
+              (True, False, "receive calls only"))
+
+
+def call_mode(ui, actions, session: Session) -> None:
+    cur = actions.current()
+    default = next(i for i, (incoming, outgoing, _) in enumerate(CALL_MODES)
+                   if (incoming, outgoing) == (cur.allow_inbound, cur.allow_outbound))
+    error = ""
+    while True:
+        default = ui.choose(Page(MODE, "How should ai-phone work?",
+                                 "To receive calls, ai-phone must stay running. For outgoing calls only, start it "
+                                 "when you need it and stop it afterward. You can change this later.", error=error),
+                            [Option("Receive and place calls", "keep ai-phone running to receive calls"),
+                             Option("Place calls only", "start ai-phone when you want to call"),
+                             Option("Receive calls only", "keep ai-phone running; outgoing calls are blocked")],
+                            default=default)
+        incoming, outgoing, _ = CALL_MODES[default]
+        try:
+            actions.save_call_directions(incoming, outgoing)
+            session.note("call directions")
+            return
+        except ActionError as e:
+            error = str(e)
 
 
 # ---- Brain -------------------------------------------------------------------------------------
@@ -322,7 +352,7 @@ def brain(ui, actions, session: Session) -> None:
     keys = [m.key for m in catalog]
     default = keys.index(cur.tier if cur.brain_kind == "local" and cur.tier in keys else models.recommended_tier(mem))
     recommended = recommended_local_model(mem)
-    if recommended and not cur.exists and "the brain" not in session.saved:
+    if recommended and session.new_config and "the brain" not in session.saved:
         default = keys.index(recommended)
     memory = (f"This computer has {mem} GB of memory. Models that need more may swap and answer slowly." if mem > 0 else
               "Memory could not be detected. Compare the model requirements with your system RAM.")
@@ -429,7 +459,7 @@ def brain_endpoint(ui, actions, session: Session, cur) -> None:
 
 def line(ui, actions, session: Session) -> None:
     cur = actions.current()
-    i = ui.choose(Page(LINE, "How should people reach your agent?", "You can add more lines later by running setup again."),
+    i = ui.choose(Page(LINE, "Which connection should ai-phone use?", "You can add more lines later by running setup again."),
                   [Option("A phone number", "Twilio or Telnyx · a new number, or one already on that account"),
                    Option("A SIP address", "free · softphones and other agents"),
                    Option("My own SIP trunk", "your PBX or provider"),
@@ -486,8 +516,10 @@ def phone_number(ui, actions, session: Session) -> None:
         ui.choose(Page(LINE, "The number is not ready yet" if result.code == 2 else "Something went wrong",
                        body="\n".join(result.messages)), [Option("Continue")], back=False)
         return
-    mobile = forward(ui, actions, session, result.line_id)
-    caller_id(ui, actions, session, carrier, name, creds, result.line_id, n.e164, mobile)
+    cur = actions.current()
+    mobile = forward(ui, actions, session, result.line_id) if cur.allow_inbound else ""
+    if cur.allow_outbound:
+        caller_id(ui, actions, session, carrier, name, creds, result.line_id, n.e164, mobile)
 
 
 def line_note(result: LineResult, number: str, carrier: str, bought: bool) -> str:
@@ -533,7 +565,9 @@ def buy_number(ui, actions, session: Session, carrier: str, name: str, creds: di
 def attach_number(ui, actions, session: Session, carrier: str, name: str, creds: dict, owned: list):
     shown = owned[:20]
     n = shown[ui.choose(Page(LINE, "Which number?", f"The numbers on your {name} account."), [Option(n.e164) for n in shown])]
-    if ui.choose(Page(LINE, f"Connect {n.e164} to ai-phone?", "Its incoming calls will ring ai-phone. Nothing is bought. "
+    routing = ("Its incoming calls will ring ai-phone." if actions.current().allow_inbound else
+               "Its incoming calls will be routed to ai-phone and rejected while receiving is disabled.")
+    if ui.choose(Page(LINE, f"Connect {n.e164} to ai-phone?", f"{routing} Nothing is bought. "
                       "Removing the line later disconnects it and keeps the number."),
                  [Option(f"Connect {n.e164}", "free")], default=1) != 0:  # Enter means Back
         raise Back()
@@ -798,15 +832,23 @@ def callers(ui, actions, session: Session) -> None:
     cur = actions.current()
     greeting, instructions, limit, error = cur.greeting, cur.instructions, str(cur.daily_limit), ""
     while True:
-        greeting, instructions, limit = ask(ui, Page(CALLERS, "What should callers hear?", "The greeting plays when ai-phone "
-                                                     "answers. The instructions tell ai-phone's own model what to do when your "
-                                                     "AI isn't listening.", error=error),
-                                           [Field("Greeting", greeting, validate=required),
-                                            Field("Instructions", instructions, validate=required),
-                                            Field("Outbound calls per day", limit, placeholder="0 means no limit", validate=count)])
+        fields = []
+        if cur.allow_inbound:
+            fields += [Field("Greeting", greeting, validate=required), Field("Instructions", instructions, validate=required)]
+        if cur.allow_outbound:
+            fields.append(Field("Outbound calls per day", limit, placeholder="0 means no limit", validate=count))
+        question = "What should callers hear?" if cur.allow_inbound else "How many calls may ai-phone place?"
+        detail = ("The greeting plays when ai-phone answers. The instructions tell ai-phone's own model what to do "
+                  "when your AI isn't listening." if cur.allow_inbound else
+                  "Set a daily limit for outgoing calls. Use 0 for no limit.")
+        values = ask(ui, Page(CALLERS, question, detail, error=error), fields)
+        if cur.allow_inbound:
+            greeting, instructions = values[:2]
+        if cur.allow_outbound:
+            limit = values[-1]
         try:
             actions.save_callers(greeting, instructions, int(limit))
-            session.note("what callers hear")
+            session.note("call settings")
             return
         except ActionError as e:
             error = str(e)
@@ -861,7 +903,7 @@ def check_models(ui, actions, session: Session, page: Page) -> Check:
         return Check("Models", downloaded, True)
     size = busy(ui, session, page, "Checking the download size…", actions.download_size)
     later = ui.choose(Page(CHECK, "Download the models now?", f"About {gb(size)}, saved in the Hugging Face cache. "
-                           "ai-phone needs them to answer calls."),
+                           "ai-phone needs them to handle calls."),
                       [Option("Download now", gb(size)), Option("Later", "run: uv run ai-phone models pull")]) == 1
     if later:
         return Check("Models", "not downloaded yet · uv run ai-phone models pull", None)
@@ -910,7 +952,8 @@ def saved_files() -> str:
 def done_text(actions, session: Session) -> str:
     cur = actions.current()
     out = [f"Saved in {home_dir()}/   {saved_files()}", ""]
-    rows = [(line_id, ln.get("number") or ln.get("aor") or "", line_kind(ln) + calls_out(ln)) for line_id, ln in cur.lines.items()]
+    rows = [(line_id, ln.get("number") or ln.get("aor") or "",
+             line_kind(ln) + (calls_out(ln) if cur.allow_outbound else "")) for line_id, ln in cur.lines.items()]
     if rows:
         a, b = (max(len(r[i]) for r in rows) for i in (0, 1))
         out += [f"{'Lines' if k == 0 else '':9}{i.ljust(a)}   {where.ljust(b)}   {kind}" for k, (i, where, kind) in enumerate(rows)]
@@ -924,12 +967,24 @@ def done_text(actions, session: Session) -> str:
         brain_row = f"{cur.base_url} · {cur.model}"
     voice_row = (f"Phonon · {voices.describe(cur.voice, engine='phonon')}" if cur.tts_engine == "phonon" else
                  f"Kokoro · {voices.title(cur.voice)} · {voices.describe(cur.voice)} · {speed_text(cur.speed)}×")
-    out += [f"Brain    {brain_row}", f"Voice    {voice_row}",
-            "", "Start ai-phone", "  uv run ai-phone run", "", "Try it"]
-    out += try_it(cur.lines)
-    width = max(len(command) for command, _ in AI_COMMANDS)
+    mode = next(label for incoming, outgoing, label in CALL_MODES
+                if (incoming, outgoing) == (cur.allow_inbound, cur.allow_outbound))
+    lifecycle = ("Leave ai-phone running while you want to receive calls." if cur.allow_inbound else
+                 "Start ai-phone when you want to place a call; stop it with Ctrl-C afterward.")
+    out += [f"Calls    {mode}", f"Brain    {brain_row}", f"Voice    {voice_row}",
+            "", "Start ai-phone", "  uv run ai-phone run", f"  {lifecycle}",
+            "  If already running, stop and restart to apply these settings."]
+    if cur.allow_inbound:
+        out += ["", "Try it", *try_it(cur.lines)]
+    commands = list(AI_COMMANDS[:2]) if cur.allow_outbound else []
+    if cur.allow_inbound:
+        commands.append(AI_COMMANDS[2])
+    elif cur.allow_outbound:
+        commands.append(("uv run ai-phone listen --call <id> --json", "listen to your relay call"))
+    commands.append(AI_COMMANDS[3])
+    width = max(len(command) for command, _ in commands)
     out += ["", f"Give your AI the phone: from {tilde(Path(ai_phone.__file__).parents[2])}, it can run"]
-    out += [f"  {command.ljust(width)}   {what}" for command, what in AI_COMMANDS]
+    out += [f"  {command.ljust(width)}   {what}" for command, what in commands]
     return "\n".join(out)
 
 
@@ -970,4 +1025,4 @@ def line_kind(ln: dict) -> str:
     return kind if provider.get("state", "ready") == "ready" else f"{kind} · {provider['state']}"
 
 
-STEP = {BRAIN: brain, LINE: line, VOICE: voice, CALLERS: callers, CHECK: check, DONE: done}
+STEP = {MODE: call_mode, BRAIN: brain, LINE: line, VOICE: voice, CALLERS: callers, CHECK: check, DONE: done}

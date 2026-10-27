@@ -39,6 +39,8 @@ inbound:                       # incoming calls: every caller hears the greeting
   instructions: "Take a message: ask for the caller's name, number and what it is about."
 
 calls:
+  allow_inbound: true          # receive calls; ai-phone must stay running while you want to be reachable
+  allow_outbound: true         # place calls; at least one direction must be enabled
   daily_limit: 0               # outbound calls per local day; 0 = no limit
   relay_filler_after_ms: 1500  # relay mode: say "One moment." after this long without a reply from your AI
   relay_second_filler_sec: 10  # and "Still with you, one moment." at this many seconds

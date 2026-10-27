@@ -132,6 +132,8 @@ class CallsConfig:
     relay_filler_after_ms: int = 1500
     relay_second_filler_sec: int = 10
     relay_reply_timeout_sec: int = 25
+    allow_inbound: bool = True
+    allow_outbound: bool = True
 
 
 # What a subscription brain runs when the config names no model: Claude Code's fastest alias, and the fastest model
@@ -412,6 +414,8 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
     if cfg.sip.stun_server is not None:
         _require(bool(HOST_RE.fullmatch(cfg.sip.stun_server)), "config.sip.stun_server: expected host[:port]")
     c = cfg.calls
+    _require(c.allow_inbound or c.allow_outbound,
+             "config.calls: at least one of allow_inbound or allow_outbound must be true")
     _require(c.daily_limit >= 0, "config.calls.daily_limit: must be 0 (no limit) or more")
     _require(c.relay_filler_after_ms > 0, "config.calls.relay_filler_after_ms: must be more than 0")
     _require(c.relay_second_filler_sec * 1000 > c.relay_filler_after_ms,
@@ -443,7 +447,7 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
             _require(bool(E164_RE.fullmatch(v.number)), f"{p}.verified_caller_ids: {v.number!r} is not E.164")
         if ln.accept_invites_from == "trusted":
             _require(bool(ln.trusted_peers), f"{p}.trusted_peers: accept_invites_from: trusted needs at least one peer")
-        if ln.accept_invites_from == "any":
+        if cfg.calls.allow_inbound and ln.accept_invites_from == "any":
             warnings.append(f"{p}.accept_invites_from is 'any': every INVITE from anywhere on the internet will be answered")
         uses_tls = uses_tls or ln.transport == "tls"
         if ln.kind == "trunk":

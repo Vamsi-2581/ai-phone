@@ -2,14 +2,38 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from ai_phone.telephony import events as ev
 from ai_phone.telephony.pj import pj
 from ai_phone.telephony.policy import PeerSet, source_allowed
 
+log = logging.getLogger("ai-phone.telephony")
+
 
 def _post(loop: asyncio.AbstractEventLoop, q: asyncio.Queue, item) -> None:
     loop.call_soon_threadsafe(q.put_nowait, item)
+
+
+def _reject_incoming(call: "AiCall", source_ip: str, code: int) -> None:
+    """Main thread: reject after PJSUA2 has released the incoming request's clone.
+
+    PJSUA2 2.17 frees incoming_data unconditionally after onIncomingCall returns.
+    Rejecting synchronously can reset the call and free that clone first. The
+    native hangup takes PJSUA's lock, so this thread waits for callback cleanup;
+    the queued argument keeps the unclaimed Call alive until then.
+    """
+    if call.ended:
+        return  # the caller cancelled before this queued rejection ran
+    call_id, account = call.getId(), call.acc
+    op = pj.CallOpParam()
+    op.statusCode = code
+    try:
+        call.hangup(op)
+    except pj.Error:
+        log.debug("incoming call %s ended before it could be rejected", call_id)
+        return
+    account.events.put_nowait(ev.CallRejected(call_id, account.line_id, source_ip, code))
 
 
 class AiCall(pj.Call):
@@ -94,17 +118,13 @@ class LineAccount(pj.Account):
         t = self.telephony
         call = AiCall(self, prm.callId, "in")
         source_ip = str(prm.rdata.srcAddress).rsplit(":", 1)[0].strip("[]")
-        op = pj.CallOpParam()
-        if not source_allowed(self.spec.accept_invites_from, source_ip, self.peers):
-            op.statusCode = pj.PJSIP_SC_FORBIDDEN
-            call.hangup(op)
-            _post(self.loop, self.events, ev.CallRejected(prm.callId, self.line_id, source_ip, 403))
+        if not t.cfg.calls.allow_inbound or not source_allowed(self.spec.accept_invites_from, source_ip, self.peers):
+            self.loop.call_soon_threadsafe(_reject_incoming, call, source_ip, 403)
             return
         if not t.try_claim_call(call):  # one call at a time across every line, atomically against make_call
-            op.statusCode = pj.PJSIP_SC_BUSY_HERE
-            call.hangup(op)
-            _post(self.loop, self.events, ev.CallRejected(prm.callId, self.line_id, source_ip, 486))
+            self.loop.call_soon_threadsafe(_reject_incoming, call, source_ip, 486)
             return
+        op = pj.CallOpParam()
         op.statusCode = pj.PJSIP_SC_RINGING
         call.answer(op)
         _post(self.loop, self.events, ev.IncomingCall(call.getId(), self.line_id, str(call.getInfo().remoteUri), source_ip))

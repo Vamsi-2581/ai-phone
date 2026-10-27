@@ -56,9 +56,9 @@ def ctx(tel):
     return {"tel": tel, "specs": {"agents": spec}, "events": asyncio.Queue()}
 
 
-def daemon(tmp_path, monkeypatch, limit=0):
+def daemon(tmp_path, monkeypatch, limit=0, **calls):
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
-    return Daemon(Config(calls=CallsConfig(daily_limit=limit)), "t4", tmp_path, lan=True, fake=True)
+    return Daemon(Config(calls=CallsConfig(daily_limit=limit, **calls)), "t4", tmp_path, lan=True, fake=True)
 
 
 class Sink:
@@ -92,8 +92,24 @@ async def test_daily_limit(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_relay_call_returns_once_connected_and_the_call_goes_on(tmp_path, monkeypatch):
-    d, tel, out = daemon(tmp_path, monkeypatch), Tel(), Sink()
+@pytest.mark.parametrize("relay", [False, True])
+async def test_disabled_outbound_calls_are_refused_before_dialling_or_counting(tmp_path, monkeypatch, relay):
+    d, tel, out = daemon(tmp_path, monkeypatch, allow_outbound=False), Tel(), Sink()
+
+    def unexpected():
+        pytest.fail("a disabled outbound call must not reach the daily counter")
+
+    monkeypatch.setattr(d.counter, "allowed", unexpected)
+    monkeypatch.setattr(d.counter, "record", unexpected)
+    await d._control({"cmd": "call", "to": "sip:x@127.0.0.1", "line": "agents", "relay": relay}, out, ctx(tel))
+    assert out.msgs == [{"ok": False, "error": "outbound calls are disabled (calls.allow_outbound is false)", "code": 7}]
+    assert tel.calls == [] and d.calls.current is None and d._call_waiters == [] and d._outbound is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_inbound", [True, False])
+async def test_relay_call_returns_once_connected_and_the_call_goes_on(tmp_path, monkeypatch, allow_inbound):
+    d, tel, out = daemon(tmp_path, monkeypatch, allow_inbound=allow_inbound), Tel(), Sink()
     task = asyncio.create_task(d._control({"cmd": "call", "to": "sip:x@127.0.0.1", "line": "agents", "relay": True}, out, ctx(tel)))
     await asyncio.sleep(0.05)
     rec = d.calls.current
@@ -172,8 +188,40 @@ async def test_listen_waits_for_an_incoming_call_and_only_one_listener(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_incoming_calls_without_a_listener_are_phone_agent_calls(tmp_path, monkeypatch):
-    d, tel = daemon(tmp_path, monkeypatch), Tel()
+async def test_disabled_inbound_listen_never_reserves_the_listener(tmp_path, monkeypatch):
+    d, out = daemon(tmp_path, monkeypatch, allow_inbound=False), Sink()
+
+    def unexpected():
+        pytest.fail("inbound-disabled listen must not reserve a listener")
+
+    monkeypatch.setattr(d.calls, "start_listening", unexpected)
+    await d._control({"cmd": "listen", "timeout_sec": 3600}, out, ctx(Tel()))
+    assert out.msgs == [{"ok": False, "error": "inbound calls are disabled (calls.allow_inbound is false)", "code": 7}]
+    assert not d.calls.listening
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_call", [False, True])
+async def test_outbound_only_listen_can_read_speech_and_the_ended_result(tmp_path, monkeypatch, explicit_call):
+    d, out = daemon(tmp_path, monkeypatch, allow_inbound=False), Sink()
+    rec = d.calls.new("relay", "out", "agents", "x")
+    msg = {"cmd": "listen", "timeout_sec": 1}
+    if explicit_call:
+        msg["call_id"] = rec.id
+    rec.heard("Hello?")
+    await d._control(msg, out, ctx(Tel()))
+    assert out.msgs[-1] == {"ok": True, "kind": "heard", "text": "Hello?"}
+    rec.finish("completed", ended_by="them")
+    d.calls.end_current(rec)
+    await d._control(msg, out, ctx(Tel()))
+    assert out.msgs[-1]["kind"] == "ended" and out.msgs[-1]["result"]["call_id"] == rec.id
+    assert not d.calls.listening
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_outbound", [True, False])
+async def test_incoming_calls_without_a_listener_are_phone_agent_calls(tmp_path, monkeypatch, allow_outbound):
+    d, tel = daemon(tmp_path, monkeypatch, allow_outbound=allow_outbound), Tel()
     rec = d._on_incoming(ev.IncomingCall(3, "agents", "sip:a@10.0.0.2", "10.0.0.2"), tel)
     assert rec.mode == "agent" and rec.direction == "in" and rec.pj_call_id == 3 and tel.answered == [3]
     assert d.active_call["call"] == rec.id and d.active_call["mode"] == "agent"
@@ -219,8 +267,9 @@ async def test_listen_and_say_refuse_agent_calls_and_missing_calls(tmp_path, mon
 
 
 @pytest.mark.asyncio
-async def test_say_goes_to_the_calls_controller(tmp_path, monkeypatch):
-    d, out = daemon(tmp_path, monkeypatch), Sink()
+@pytest.mark.parametrize("allow_inbound", [True, False])
+async def test_say_goes_to_the_calls_controller(tmp_path, monkeypatch, allow_inbound):
+    d, out = daemon(tmp_path, monkeypatch, allow_inbound=allow_inbound), Sink()
     rec = d.calls.new("relay", "out", "agents", "x")
     rec.mark_connected()
 
@@ -238,11 +287,13 @@ async def test_say_goes_to_the_calls_controller(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_hangup_marks_the_record_and_returns_its_result(tmp_path, monkeypatch):
-    d, out, tel = daemon(tmp_path, monkeypatch), Sink(), Tel()
+@pytest.mark.parametrize("allow_inbound", [True, False])
+@pytest.mark.parametrize("mode", ["agent", "relay"])
+async def test_hangup_marks_the_record_and_returns_its_result(tmp_path, monkeypatch, allow_inbound, mode):
+    d, out, tel = daemon(tmp_path, monkeypatch, allow_inbound=allow_inbound), Sink(), Tel()
     await d._control({"cmd": "hangup"}, out, ctx(tel))
     assert out.msgs[-1]["code"] == 11
-    rec = d.calls.new("agent", "out", "agents", "x")
+    rec = d.calls.new(mode, "out", "agents", "x")
     rec.pj_call_id = 7
     task = asyncio.create_task(d._control({"cmd": "hangup"}, out, ctx(tel)))
     await asyncio.sleep(0.05)

@@ -13,14 +13,14 @@ from ai_phone.setup import look, tui
 from ai_phone.setup.tui import FRAMES, PageScreen, SetupApp, run_tui
 from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
 
-LINE = Page(2, "How should people reach your agent?", "detail")
+LINE = Page(3, "Which connection should ai-phone use?", "detail")
 OPTIONS = [Option("A phone number", "hint"), Option("A SIP address")]
 WELCOME = Page(0, "Give your AI a phone number", "Calls answered and placed by models running on this computer.",
                note="Picks a line, a brain and a voice, then checks it all works.",
                checks=[Check("SIP library", "built", True), Check("Memory", "16 GB", None),
                        Check("Models", "Parakeet 0.6B v2\nKokoro 82M\nPhonon 31M\nQwen3.5 4B", True),
                        Check("Config", "not saved yet", False)])
-TWILIO = Page(2, "Your Twilio credentials",
+TWILIO = Page(3, "Your Twilio credentials",
               "Saved to ~/.ai-phone/secrets.env, readable only by you. Never shown or sent anywhere else.")
 KEY_FIELDS = [Field("Account SID", secret=True, placeholder="AC…"),
               Field("Auth Token", secret=True, placeholder="32 characters")]
@@ -90,14 +90,41 @@ async def test_choose_renders_and_returns_the_pick():
     async with app.run_test(size=(104, 40)) as pilot:
         await wait_for(pilot, app, showing(app, "[3] Back"))
         text = screen_text(app)
-        for part in ("✓ Welcome", "● Line", "○ Voice", "S T E P   3   O F   7", "ai-phone setup",
-                     "How should people reach your agent?", "[1] A phone number", "hint", "[2] A SIP address",
+        for part in ("✓ Welcome", "● Line", "○ Voice", "S T E P   4   O F   8", "ai-phone setup",
+                     "Which connection should ai-phone use?", "[1] A phone number", "hint", "[2] A SIP address",
                      "esc back"):
             assert part in text
         await pilot.press("down", "enter")
         await wait_for(pilot, app, lambda: app.outcome is not None)
     assert got["answer"] == 1
     assert app.outcome == Outcome(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("width", [70, 104])
+async def test_call_directions_page_explains_runtime_and_all_choices_fit(width):
+    from ai_phone.setup import flow
+    from tests.unit.test_setup_flow import FakeActions
+
+    actions = FakeActions()
+
+    def choose_mode(ui):
+        ui.begin(flow.MODE)
+        flow.call_mode(ui, actions, flow.Session())
+        return Outcome(0)
+
+    app = SetupApp(choose_mode)
+    async with app.run_test(size=(width, 30)) as pilot:
+        await wait_for(pilot, app, showing(app, "[4] Back"))
+        text = screen_text(app)
+        for label in ("Receive and place calls", "Place calls only", "Receive calls only", "running"):
+            assert label in text
+        assert look.MENU_KEYS in text
+        assert not app.screen.max_scroll_y
+        assert max(len(row.rstrip()) for row in text.splitlines()) <= width
+        await pilot.press("2")
+        await wait_for(pilot, app, lambda: app.outcome is not None)
+    assert actions.args("save_call_directions") == [(False, True)]
 
 
 @pytest.mark.asyncio
@@ -118,20 +145,20 @@ async def test_digits_jump_and_escape_goes_back():
     backs = []
 
     def go_back(ui):
-        ui.begin(2)
+        ui.begin(3)
         for question in ("First", "Back option"):
             try:
-                ui.choose(Page(2, question), OPTIONS)
+                ui.choose(Page(3, question), OPTIONS)
             except Back as e:
                 backs.append(e.at_start)
-        ui.begin(2)
-        ui.choose(Page(2, "Earlier"), OPTIONS)
+        ui.begin(3)
+        ui.choose(Page(3, "Earlier"), OPTIONS)
         try:
-            ui.choose(Page(2, "Later"), OPTIONS)
+            ui.choose(Page(3, "Later"), OPTIONS)
         except Back as e:
             backs.append(e.at_start)
         try:
-            ui.ask(Page(2, "Your Telnyx credentials"), [Field("API key", secret=True)])
+            ui.ask(Page(3, "Your Telnyx credentials"), [Field("API key", secret=True)])
         except Back as e:
             backs.append(e.at_start)
         return Outcome(0)
@@ -240,7 +267,7 @@ async def test_form_hides_secrets_and_validates():
     fields = [Field("Account SID", secret=True, placeholder="AC…"), Field("Name", validate=name)]
 
     def flow(ui):
-        got["values"] = ui.ask(Page(2, "Your Twilio credentials", "Saved to ~/.ai-phone/secrets.env."), fields)
+        got["values"] = ui.ask(Page(3, "Your Twilio credentials", "Saved to ~/.ai-phone/secrets.env."), fields)
         return Outcome(0)
 
     app = SetupApp(flow)
@@ -314,7 +341,7 @@ async def test_busy_spins_then_returns():
         return 7
 
     def flow(ui):
-        got["result"] = ui.busy(Page(2, "Your Twilio credentials"), "Checking your Twilio account…", work)
+        got["result"] = ui.busy(Page(3, "Your Twilio credentials"), "Checking your Twilio account…", work)
         return Outcome(0)
 
     def spinner(app) -> str:
@@ -352,7 +379,7 @@ async def test_busy_after_a_form_keeps_the_form_on_screen():
             ui.busy(dataclasses.replace(TWILIO), "Checking your Twilio account…", check)  # an equal page will do
         except ValueError:
             got["retry"] = ui.ask(dataclasses.replace(TWILIO, error="Twilio did not accept that key."), KEY_FIELDS)
-        got["numbers"] = ui.busy(Page(2, "Which number?"), "Loading your numbers…", lambda: listed.wait(5))
+        got["numbers"] = ui.busy(Page(3, "Which number?"), "Loading your numbers…", lambda: listed.wait(5))
         return Outcome(0)
 
     app = SetupApp(flow)
@@ -409,7 +436,7 @@ async def test_progress_bar_moves():
         return "pulled"
 
     def flow(ui):
-        got["result"] = ui.progress(Page(1, "Where should your agent think?"), "Downloading models", work)
+        got["result"] = ui.progress(Page(2, "Where should your agent think?"), "Downloading models", work)
         return Outcome(0)
 
     def bar(app):
@@ -444,7 +471,7 @@ async def welcome_screen(width: int) -> str:
 async def test_welcome_shows_the_wordmark_when_wide_and_a_title_when_narrow():
     wide = await welcome_screen(104)
     assert "▀" in wide or "█" in wide
-    assert "● Welcome ←" in wide and "○ Done" in wide
+    assert all(step in wide for step in ("● Welcome ←", "○ Mode", "○ Settings", "○ Done"))
     for part in ("Give your AI a phone number", "Picks a line, a brain and a voice", "SIP library",
                  "Parakeet 0.6B v2", "Kokoro 82M", "Phonon 31M", "Qwen3.5 4B", "✓", "✗", "○"):
         assert part in wide
@@ -454,7 +481,7 @@ async def test_welcome_shows_the_wordmark_when_wide_and_a_title_when_narrow():
     lines = [line.strip() for line in narrow.splitlines()]
     assert "ai-phone" in lines
     assert not any(block in narrow for block in "▀▄█")
-    assert "● Welcome  1/7" in narrow and "○ Brain" not in narrow
+    assert "● Welcome  1/8" in narrow and "○ Brain" not in narrow
     for model in ("Parakeet 0.6B v2", "Kokoro 82M", "Phonon 31M", "Qwen3.5 4B"):
         assert model in narrow
 
@@ -465,7 +492,7 @@ async def test_resizing_the_terminal_refits_the_crumbs_and_the_wordmark():
     async with app.run_test(size=(104, 40)) as pilot:
         await wait_for(pilot, app, showing(app, "○ Brain"))
         await pilot.resize_terminal(70, 40)
-        await wait_for(pilot, app, lambda: "● Welcome  1/7" in screen_text(app))
+        await wait_for(pilot, app, lambda: "● Welcome  1/8" in screen_text(app))
         assert "█" not in screen_text(app) and "ai-phone" in [l.strip() for l in screen_text(app).splitlines()]
         await pilot.resize_terminal(104, 40)
         await wait_for(pilot, app, lambda: "○ Brain" in screen_text(app) and "█" in screen_text(app))
@@ -479,11 +506,14 @@ NARROW_DONE = "\n".join([
     "",
     "Lines    main    +15550100001           Twilio number",
     "         agent   sip:agent@192.0.2.10   SIP address",
+    "Calls    receive and place calls",
     "Brain    on this computer · Qwen3.5 4B",
     "Voice    Heart · American · female · 1.0×",
     "",
     "Start ai-phone",
     "  uv run ai-phone run",
+    "  Leave ai-phone running while you want to receive calls.",
+    "  If already running, stop and restart to apply these settings.",
     "",
     "Try it",
     "  call +15550100001 from any phone (your normal call rates)",
@@ -506,7 +536,7 @@ def clipped(text: str) -> list[str]:
     return bad
 
 
-FORM_PAGE = Page(2, "Your Twilio credentials", "Saved to ~/.ai-phone/secrets.env, readable only by you.")
+FORM_PAGE = Page(3, "Your Twilio credentials", "Saved to ~/.ai-phone/secrets.env, readable only by you.")
 # one page of each kind the wizard shows, with the text that says it is up: Welcome has no eyebrow and a wordmark,
 # a question has a menu, a form has input boxes
 PAGE_KINDS = {"welcome": (WELCOME, [Option("Continue"), Option("Cancel")], None, "[2] Cancel"),
@@ -600,7 +630,7 @@ async def test_resizing_into_a_short_terminal_tightens_the_spacing_and_back():
 async def test_a_narrow_terminal_wraps_the_done_body_instead_of_cutting_it():
     """The Done page's summary is wider than 70 columns and taller than 30 rows, so the page scrolls — but no row
     of it is cut off on the right, which is what a fixed width would have done."""
-    done = Page(6, "You're set up", "Everything is saved. Here's how to use it.", body=NARROW_DONE)
+    done = Page(7, "You're set up", "Everything is saved. Here's how to use it.", body=NARROW_DONE)
     app = SetupApp(lambda ui: Outcome(ui.choose(done, [Option("Finish")], back=False)))
     async with app.run_test(size=(70, 30)) as pilot:
         await wait_for(pilot, app, showing(app, "Everything is saved."))
@@ -618,14 +648,14 @@ async def test_a_narrow_terminal_wraps_the_done_body_instead_of_cutting_it():
 async def test_a_long_body_fits_without_scrolling():
     # the Done page: a summary of ~22 lines, one option and the hint must fit in 40 rows
     lines = [f"line {i:02d}  " + "·" * 60 for i in range(22)]
-    done = Page(6, "You're set up", "Everything is saved. Here's how to use it.", body="\n".join(lines))
+    done = Page(7, "You're set up", "Everything is saved. Here's how to use it.", body="\n".join(lines))
     app = SetupApp(lambda ui: Outcome(ui.choose(done, [Option("Finish")], back=False)))
     async with app.run_test(size=(104, 40)) as pilot:
         await wait_for(pilot, app, showing(app, "[1] Finish"))
         rows = screen_text(app).splitlines()
         assert app.screen.max_scroll_y == 0 and not app.screen.show_vertical_scrollbar
         assert any("↑↓ move   ⏎ select   1-9 jump   q quit" in row for row in rows)
-        assert "S T E P   7   O F   7" in rows[5]  # the eyebrow moves up
+        assert "S T E P   8   O F   8" in rows[5]  # the eyebrow moves up
         body = [(row.index(line), row) for line in lines for row in rows if line in row]
         assert len(body) == 22
         detail = next(r for r, row in enumerate(rows) if "Everything is saved." in row)
@@ -650,7 +680,7 @@ async def test_no_color(monkeypatch):
     assert not [seg for seg in drawn if seg.style and seg.style.color and seg.style.color.type == ColorType.TRUECOLOR]
 
     # with no colours to tell it apart, the cursor in a field is drawn in reverse video
-    app = SetupApp(lambda ui: Outcome(0, ui.ask(Page(2, "Your Telnyx credentials"), [Field("API key")])[0]))
+    app = SetupApp(lambda ui: Outcome(0, ui.ask(Page(3, "Your Telnyx credentials"), [Field("API key")])[0]))
     async with app.run_test(size=(104, 40)) as pilot:
         await wait_for(pilot, app, showing(app, "API key"))
         await pilot.press("k", "e", "y")
@@ -667,7 +697,7 @@ async def test_ctrl_c_on_a_question_cancels_and_exits(key):
 
     def flow(ui):
         try:
-            ui.ask(Page(2, "Your Telnyx credentials"), [Field("API key", secret=True)])
+            ui.ask(Page(3, "Your Telnyx credentials"), [Field("API key", secret=True)])
         except Cancel:
             seen.append("cancel")
             raise
@@ -695,9 +725,9 @@ async def test_ctrl_c_between_an_answer_and_the_next_question_still_cancels():
     seen = []
 
     def flow(ui):
-        ui.choose(Page(2, "First"), OPTIONS)
+        ui.choose(Page(3, "First"), OPTIONS)
         try:
-            ui.choose(Page(2, "Second"), OPTIONS)
+            ui.choose(Page(3, "Second"), OPTIONS)
         except Cancel:
             seen.append("cancel")
             raise
@@ -723,8 +753,8 @@ async def test_ctrl_c_just_before_work_starts_cancels_the_work(kind):
     ran = []
 
     def flow(ui):
-        ui.choose(Page(3, "Download the voice now?"), OPTIONS)
-        work_page = Page(3, "Downloading the voice")
+        ui.choose(Page(4, "Download the voice now?"), OPTIONS)
+        work_page = Page(4, "Downloading the voice")
         if kind == "busy":
             ui.busy(work_page, "Downloading…", lambda: ran.append("work"))
         else:
@@ -749,8 +779,8 @@ async def test_ctrl_c_while_working_lets_the_step_finish_then_stops():
     got = {}
 
     def flow(ui):
-        got["step"] = ui.busy(Page(2, "Buying +15550100001"), "Buying the number…", lambda: release.wait(5))
-        ui.choose(Page(2, "Which voice?"), OPTIONS)  # never shown: the person asked to quit
+        got["step"] = ui.busy(Page(3, "Buying +15550100001"), "Buying the number…", lambda: release.wait(5))
+        ui.choose(Page(3, "Which voice?"), OPTIONS)  # never shown: the person asked to quit
         return Outcome(0)
 
     app = SetupApp(flow)
@@ -776,7 +806,7 @@ async def test_ctrl_c_while_a_form_is_checked_says_so_under_the_fields():
     def flow(ui):
         ui.ask(TWILIO, KEY_FIELDS)
         ui.busy(TWILIO, "Checking your Twilio account…", lambda: release.wait(5))
-        ui.choose(Page(2, "Which number?"), OPTIONS)  # never shown
+        ui.choose(Page(3, "Which number?"), OPTIONS)  # never shown
         return Outcome(0)
 
     app = SetupApp(flow)
@@ -799,8 +829,8 @@ async def test_a_second_ctrl_c_while_working_leaves_at_once():
     release = threading.Event()
 
     def flow(ui):
-        ui.busy(Page(3, "Which voice?"), "Loading voices…", lambda: release.wait(5))
-        ui.choose(Page(3, "Which voice?"), OPTIONS)  # never shown: the person already asked to quit
+        ui.busy(Page(4, "Which voice?"), "Loading voices…", lambda: release.wait(5))
+        ui.choose(Page(4, "Which voice?"), OPTIONS)  # never shown: the person already asked to quit
         return Outcome(0)
 
     app = SetupApp(flow)
@@ -833,7 +863,7 @@ def test_run_tui_reports_a_crash_without_its_message(monkeypatch):
         raise RuntimeError("token AC123 rejected")
 
     def broken_screen(ui):  # a screen that cannot be drawn ends the app with an error
-        ui.choose(Page(1, "Where should your agent think?", checks=[Check("Memory", None, True)]), OPTIONS)
+        ui.choose(Page(2, "Where should your agent think?", checks=[Check("Memory", None, True)]), OPTIONS)
         return Outcome(0)
 
     monkeypatch.setattr(tui, "SetupApp", headless())
@@ -856,7 +886,7 @@ def test_quitting_a_download_ends_the_process_without_waiting_for_it(monkeypatch
         finished.set()
 
     def flow(ui):
-        ui.progress(Page(3, "Downloading the speech model"), "Downloading…", download)
+        ui.progress(Page(4, "Downloading the speech model"), "Downloading…", download)
         return Outcome(0)
 
     async def quit_while_downloading(pilot):
@@ -882,8 +912,8 @@ def test_quitting_other_work_returns_as_before(monkeypatch):
     exits = []
 
     def flow(ui):
-        ui.busy(Page(3, "Which voice?"), "Loading voices…", lambda: release.wait(5))
-        ui.choose(Page(3, "Which voice?"), OPTIONS)
+        ui.busy(Page(4, "Which voice?"), "Loading voices…", lambda: release.wait(5))
+        ui.choose(Page(4, "Which voice?"), OPTIONS)
         return Outcome(0)
 
     async def quit_while_loading(pilot):
@@ -905,9 +935,9 @@ async def test_a_repeated_digit_never_confirms_a_purchase():
     got = {}
 
     def flow(ui):
-        got["pick"] = ui.choose(Page(2, "Pick a number"), [Option("+15550100001", "$1.15/month"), Option("+15550100002")])
+        got["pick"] = ui.choose(Page(3, "Pick a number"), [Option("+15550100001", "$1.15/month"), Option("+15550100002")])
         try:
-            got["confirm"] = ui.choose(Page(2, "Buy +15550100001 for $1.15/month?"), [Option("Buy +15550100001")], default=1)
+            got["confirm"] = ui.choose(Page(3, "Buy +15550100001 for $1.15/month?"), [Option("Buy +15550100001")], default=1)
         except Back:
             got["confirm"] = "back"
         return Outcome(0)
@@ -943,7 +973,7 @@ async def test_stopping_before_a_status_line_exists_is_harmless():
     app = SetupApp(lambda ui: Outcome(ui.choose(LINE, OPTIONS)))
     async with app.run_test(size=(104, 40)) as pilot:
         await wait_for(pilot, app, showing(app, "[3] Back"))
-        waiting = PageScreen(Page(2, "Setting up +15550100001"), busy="Buying…")  # not mounted yet: no status line
+        waiting = PageScreen(Page(3, "Setting up +15550100001"), busy="Buying…")  # not mounted yet: no status line
         waiting.stopping()
         assert waiting.label == "Stopping after this step…"
         app.screen.stopping()  # a menu has no status line either
@@ -962,7 +992,7 @@ async def test_a_wide_body_wraps_on_a_narrow_terminal():
     from ai_phone.setup import flow
     from tests.unit.test_setup_flow import NUMBER_LINE, SIP_LINE, FakeActions
     summary = flow.done_text(FakeActions(exists=True, lines={"twilio": NUMBER_LINE, "agent": SIP_LINE}), flow.Session())
-    done = Page(6, "You're set up", "Everything is saved. Here's how to use it.", body=summary)
+    done = Page(7, "You're set up", "Everything is saved. Here's how to use it.", body=summary)
     app = SetupApp(lambda ui: Outcome(ui.choose(done, [Option("Finish")], back=False)))
     async with app.run_test(size=(70, 30)) as pilot:
         await wait_for(pilot, app, lambda: isinstance(app.screen, PageScreen) and app.screen.is_mounted
@@ -980,7 +1010,7 @@ def test_a_second_ctrl_c_ends_with_what_the_run_did(monkeypatch, capsys):
     release = threading.Event()
 
     def flow(ui):
-        ui.busy(Page(2, "Setting up +15550100001"), "Buying +15550100001 and connecting it…", lambda: release.wait(5))
+        ui.busy(Page(3, "Setting up +15550100001"), "Buying +15550100001 and connecting it…", lambda: release.wait(5))
         return Outcome(0)
 
     async def quit_twice(pilot):
@@ -996,7 +1026,7 @@ def test_a_second_ctrl_c_ends_with_what_the_run_did(monkeypatch, capsys):
     go = threading.Event()
 
     def download(ui):
-        ui.progress(Page(5, "Downloading the models"), "Downloading…", lambda report: go.wait(5))
+        ui.progress(Page(6, "Downloading the models"), "Downloading…", lambda report: go.wait(5))
         return Outcome(0)
 
     async def quit_download(pilot):
@@ -1036,7 +1066,7 @@ def test_run_setup_names_a_purchase_that_a_second_ctrl_c_left(monkeypatch, capsy
     async def buy_then_quit_twice(pilot):
         app = pilot.app
         # Add a line, A phone number, Twilio, the saved key, A new number
-        for question in ("Give your AI", "How should people reach", "Which carrier?", "Use the saved Twilio key?",
+        for question in ("Give your AI", "Which connection should ai-phone use", "Which carrier?", "Use the saved Twilio key?",
                          "A new number, or one"):
             await wait_for(pilot, app, showing(app, question))
             await pilot.press("enter")

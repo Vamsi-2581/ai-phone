@@ -32,7 +32,7 @@ FONT = {
     "E": ["#######", "#######", "##     ", "##     ", "##     ", "###### ", "###### ", "##     ", "##     ", "##     ", "#######", "#######"],
 }
 WORDMARK_MIN_WIDTH = 78  # narrower terminals get a plain title on Welcome
-CRUMBS_MIN_WIDTH = 92  # narrower terminals get "● Line  3/7"
+CRUMBS_MIN_WIDTH = 92  # narrower terminals show only the current step and its count
 
 MENU_KEYS = "↑↓ move   ⏎ select   1-9 jump   esc back   q quit"
 FORM_KEYS = "⏎ next field   esc back   ctrl+c quit"
@@ -109,7 +109,7 @@ def crumbs(active: int, width: int = 200) -> Text:
     t = Text(no_wrap=True)
     for i, name in enumerate(STEPS):
         if i:
-            t.append("  ─  ", Style(color=LINE))
+            t.append(" ─ ", Style(color=LINE))
         if i < active:
             t.append(f"✓ {name}", Style(color=GREEN))
         elif i == active:

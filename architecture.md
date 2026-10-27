@@ -156,6 +156,13 @@ Backoff on non-fatal failure: 5 s, 10 s, 20 s, 40 s, 60 s, then every 60 s, with
 4. Optional caller allowlist (M5): if configured and the From user is not listed, 403.
 5. Otherwise: create the `Call` object, answer **180 Ringing** immediately, then post `IncomingCall(call_id, from, source)` to the asyncio queue. The pipeline answers **200 OK** when it is ready to speak the greeting (normally within one loop iteration; the 180 covers the gap).
 
+The global `calls.allow_inbound` flag is checked before line policy or the call claim; false means 403. Final
+403/486 rejections are queued to the registered asyncio thread, retaining the unclaimed Call object until sent.
+PJSIP's call lock keeps the rejection behind the native incoming callback's cleanup. Rejecting synchronously
+inside that callback can abort PJSIP 2.17 on an offerless INVITE when cleanup tries to free an already-cleared
+cloned request. The callback never waits for the queued rejection, and a rejected call never rings or claims the
+active-call slot.
+
 Per-IP auth-failure lockout (M2): count 401/403 responses per source IP over a sliding 10 min window; after 5, drop SIP messages from that IP for 15 min **[P]**. Implemented in the same callback using a small in-memory table; persisted nowhere.
 
 #### 3.4.2 Outbound
@@ -420,7 +427,7 @@ Two resamples on the outbound path (24→16 in Python, 16→8 in PJSIP) and one 
 | `ai-phone hangup [--call ID] [--say TEXT] [--json]` | End the call in progress (either mode), speaking TEXT first if given; prints the call's result |
 | `ai-phone status [--last-call]` | Registration state per line, the call in progress, the brain in use; `--last-call` summarises the last call's turns |
 | `ai-phone lines …` | Buy or connect numbers; add, divert, verify and remove lines (§14a.4) |
-| `ai-phone setup [--plain]` | The setup wizard (§10.3): a brain, a line, a voice and what callers hear, then a check. Full-screen in a terminal; `--plain`, or no terminal, asks the same questions as numbered prompts |
+| `ai-phone setup [--plain]` | The setup wizard (§10.3): call directions, a brain, a line, a voice and call settings, then a check. Full-screen in a terminal; `--plain`, or no terminal, asks the same questions as numbered prompts |
 | `ai-phone models pull [--tier <model>]` | Download the models this config needs (setup time; with `lines` and `setup`, the only networked commands) |
 | `ai-phone latency` (M5) | The TUI latency view |
 
@@ -568,13 +575,18 @@ Each step asks only what applies to the earlier answers:
 
 | Step | Asks | Saves |
 |---|---|---|
-| Welcome | Shows checks of this computer: SIP library, memory and the recommended model, downloaded models, config. With a config already there: add a line, change the brain, change the voice, change what callers hear, or run every step | — |
+| Welcome | Shows checks of this computer: SIP library, memory and the recommended model, downloaded models, config. With a config already there: add a line, change the brain, voice, call directions or call settings, or run every step | — |
+| Mode | Receive and place calls, place calls only, or receive calls only. Explains that receiving needs the daemon to stay running; outgoing-only users start and stop it when needed | `calls.allow_inbound`, `calls.allow_outbound` |
 | Brain | On this computer (one model from the catalog in `models.py`; the list shows memory requirements and a RAM-based recommendation, and a model exceeding detected RAM is confirmed first), or your own OpenAI-compatible endpoint: URL, model and an optional key, then one short test request | `brain:`, `models.tier`; the key in `secrets.env` |
 | Line | A phone number, a free SIP address, your own SIP trunk, or skip. For a phone number: Twilio or Telnyx; the key is checked with a free read-only request that lists the account's numbers; then a new number, bought only after a confirmation that shows the number and its monthly price, or one already on the account, connected for free (§14a.3); then, if wanted, the codes to divert your own mobile to it | the line; carrier keys and SIP passwords in `secrets.env`; the carrier journal in `lines/` |
 | Voice | Phonon or Kokoro. Phonon has one bundled English voice at normal speed; Kokoro voices are grouped American/British and female/male with adjustable speed. Either can be previewed on this computer's speakers | `tts:` |
-| Callers | The greeting, the instructions for when no AI is listening, and the daily limit on outbound calls (20 unless the config has one) | `inbound:`, `calls.daily_limit` |
+| Settings | When receiving: the greeting and instructions for when no AI is listening. When placing calls: the daily limit (20 unless the config has one). Values for a disabled direction are preserved | `inbound:`, `calls.daily_limit` |
 | Check | Offers to download missing models, with the size (§10.4). Then checks that the config loads, each line (the running daemon's status, or a background start with stand-in models for up to 20 s that reports registration, then stops) and the voice (plays the outbound disclosure) | — |
-| Done | A summary: what was saved and where, how to start ai-phone, a free test call, and what to tell your AI. For a SIP address the test call is `pjsua --local-port 5070 sip:<user>@127.0.0.1`, since the daemon cannot call itself | — |
+| Done | A summary: call directions, what was saved and where, how to start and keep ai-phone available, and applicable AI commands. Incoming test examples appear only when receiving is enabled. For a SIP address the test call is `pjsua --local-port 5070 sip:<user>@127.0.0.1`, since the daemon cannot call itself | — |
+
+The Line step offers mobile forwarding only when receiving is enabled, and caller-ID verification only when
+placing calls is enabled. Connecting an existing carrier number still changes its routing; setup explains
+that incoming calls will be rejected in outbound-only mode.
 
 The chooser recommends Qwen3.5 2B for 8–15 GB of detected RAM, 4B for 16–31 GB, and 9B for 32 GB or more.
 It shows no recommendation when memory cannot be detected or is below 8 GB. A fresh setup selects the recommendation;
@@ -1041,18 +1053,31 @@ The three phrases are synthesised at daemon start, like the apology and the good
 
 ### 14b.8 Safety
 
-- **Emergency numbers are never dialled** (`call_guard.is_emergency`, the first check in the daemon's `call` handler, so every client is covered; exit 13). A target is refused when its digits equal 000, 100, 101, 102, 103, 108, 110, 112, 118, 119, 190, 911 or 999: alone, behind a 1–3 digit country code, or behind an international access prefix (00 or 011) and such a country code. A `sip:` target is checked by its user part when that part has no letters (only digits, spaces and `+ . _ - ( )`). Extensions that look like an emergency number (100, 1000, 4112) are refused too; call such extensions by a name with letters.
+- **Emergency numbers are never dialled** (`call_guard.is_emergency`, checked after the outbound enable flag and before any dial work, so every client is covered; exit 13). A target is refused when its digits equal 000, 100, 101, 102, 103, 108, 110, 112, 118, 119, 190, 911 or 999: alone, behind a 1–3 digit country code, or behind an international access prefix (00 or 011) and such a country code. A `sip:` target is checked by its user part when that part has no letters (only digits, spaces and `+ . _ - ( )`). Extensions that look like an emergency number (100, 1000, 4112) are refused too; call such extensions by a name with letters.
 - **Daily limit** (`calls.daily_limit`; 0 means no limit; exit 14). It is checked before dialling. Every dial attempt the SIP stack accepted counts, busy and unanswered calls included, per local day. The count lives in `~/.ai-phone/calls-today.json` (`{"date", "count"}`, written to a temporary file, synced and renamed), so a restart does not reset it. It is a file of its own because the daemon rewrites `state.json` whole on every registration change. A missing or malformed file, or one from another day, reads as 0. If the count cannot be written after the dial (a full disk, an unwritable `~/.ai-phone`), the call is hung up at once and refused with exit 7; its record ends `rejected` with `ended_by: error` and the detail "could not update the daily call counter: …", so no attempt escapes the limit. A `call` handler that fails for any other reason also hangs up a call that has not been answered, so the phone never goes on ringing with nobody behind it.
 - **Call length** stays capped by `conversation.max_call_sec` (600 s) in both modes; the silence, RTP and brain-error rules are unchanged.
 - **Where transcripts go.** Transcripts leave ai-phone only through the command that asked for them (each turn also stays in `turns.jsonl`, as before), and, with a brain that is not on this machine (`brain.kind: openai_compatible`, `claude` or `chatgpt`, §14a.7), through that endpoint — or through the person's own logged-in CLI, to Anthropic or OpenAI — during the call: what callers say, the call's system prompt and the conversation so far go there on every turn in phone agent mode. If the calling AI runs on a cloud model, that service sees them. The README says so next to the examples.
 
 ### 14b.9 Configuration
 
+`calls.allow_inbound` and `calls.allow_outbound` independently enable receiving and placing calls. Both default to
+true for existing configurations, and at least one must be true. Disabled incoming calls receive SIP 403 before
+ringing or claiming the call. Disabled outgoing commands return exit 7 before dialing, creating a call record or
+using the daily counter. Idle `listen` is also refused when receiving is disabled, but listening, speaking and
+hanging up on an existing outbound relay call (including reading its ended result) still work.
+
+The daemon always starts explicitly with `ai-phone run`. It must stay running while receiving calls is wanted;
+outbound-only users may start it when needed and stop it after their calls. No background service or automatic
+per-call startup is installed. Trunk registration still runs in outbound-only mode. Configuration changes take
+effect after restarting the daemon.
+
 ```yaml
 inbound:                       # incoming calls: every caller hears the greeting; the instructions apply when no AI listens
   greeting: "Hi, you've reached an AI assistant. How can I help?"   # 1 to 500 characters; synthesised at start
   instructions: "…"            # at most 4000 characters; the default asks who is calling and offers to take a message
 calls:
+  allow_inbound: true          # receive calls while the daemon is running
+  allow_outbound: true         # place calls; at least one direction must be enabled
   daily_limit: 0               # outbound calls per local day; 0 = no limit
   relay_filler_after_ms: 1500  # more than 0
   relay_second_filler_sec: 10  # must come after relay_filler_after_ms

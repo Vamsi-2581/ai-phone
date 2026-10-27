@@ -11,7 +11,7 @@ from ai_phone.setup.plain import BLANK_LIMIT, NO_ANSWER, PlainUI
 from ai_phone.setup.ui import Back, Cancel, Check, Field, Option, Outcome, Page
 from tests.unit.test_setup_flow import FakeActions, ScriptedUI
 
-LINE_PAGE = Page(2, "How should people reach your agent?", "You can add more lines later by running setup again.",
+LINE_PAGE = Page(3, "Which connection should ai-phone use?", "You can add more lines later by running setup again.",
                  checks=[Check("Twilio key", "works · 2 numbers on this account", True)])
 LINE_OPTIONS = [Option("A phone number", "Twilio or Telnyx · a new number, or one already on that account"),
                 Option("A SIP address", "free · softphones and other agents")]
@@ -44,8 +44,8 @@ def test_choose_prints_the_page_and_enter_takes_the_default(typed, capsys):
     assert PlainUI().choose(LINE_PAGE, LINE_OPTIONS, default=1) == 1
     assert capsys.readouterr().out.splitlines() == [
         "",
-        "S T E P  3  O F  7  ·  L I N E",
-        "How should people reach your agent?",
+        "S T E P  4  O F  8  ·  L I N E",
+        "Which connection should ai-phone use?",
         "You can add more lines later by running setup again.",
         "  ✓ Twilio key   works · 2 numbers on this account",
         "  1) A phone number   Twilio or Telnyx · a new number, or one already on that account",
@@ -83,12 +83,12 @@ def test_welcome_page_has_a_title_note_and_no_back(typed, capsys):
 
 def test_b_goes_back_and_knows_whether_it_is_the_first_question(typed):
     ui = PlainUI()
-    ui.begin(2)
+    ui.begin(3)
     typed.answers.append("b")
     with pytest.raises(Back) as first:
         ui.choose(LINE_PAGE, LINE_OPTIONS)
     assert first.value.at_start
-    ui.begin(2)
+    ui.begin(3)
     typed.answers += ["1", "B"]
     ui.choose(LINE_PAGE, LINE_OPTIONS)
     with pytest.raises(Back) as later:
@@ -99,7 +99,7 @@ def test_b_goes_back_and_knows_whether_it_is_the_first_question(typed):
 def test_enter_on_a_menu_whose_default_is_back_goes_back(typed, capsys):
     typed.answers += ["", "1"]
     ui = PlainUI()
-    confirm = Page(2, "Buy +15550100001 for $1.15/month?")
+    confirm = Page(3, "Buy +15550100001 for $1.15/month?")
     with pytest.raises(Back):
         ui.choose(confirm, [Option("Buy +15550100001", "$1.15/month")], default=1)
     assert ui.choose(confirm, [Option("Buy +15550100001", "$1.15/month")], default=1) == 0
@@ -139,7 +139,7 @@ def test_ask_takes_defaults_and_asks_again_until_valid(typed, capsys):
     must_be_lower = lambda v: None if v.islower() else "Use lowercase letters, digits and dashes."  # noqa: E731
     fields = [Field("Name", "agent", validate=must_be_lower), Field("Desk", validate=must_be_lower),
               Field("This computer's address", "", placeholder="192.0.2.1"), Field("Outbound calls per day", "20")]
-    assert PlainUI().ask(Page(2, "Name your SIP address"), fields) == ["agent", "desk", "192.0.2.10", "5"]
+    assert PlainUI().ask(Page(3, "Name your SIP address"), fields) == ["agent", "desk", "192.0.2.10", "5"]
     assert typed.prompts == ["Name [agent]: ", "Desk: ", "Desk: ", "This computer's address (192.0.2.1): ",
                              "Outbound calls per day [20]: "]
     assert capsys.readouterr().out.count("! Use lowercase letters, digits and dashes.\n") == 1
@@ -175,7 +175,7 @@ def test_a_blank_answer_a_field_accepts_is_not_counted_against_it(typed):
 def test_a_secret_is_read_hidden_and_never_printed(typed, capsys):
     typed.answers += ["", "sk-live-SECRET", "  pw SECRET  "]
     required = lambda v: None if v.strip() else "Enter a value."  # noqa: E731
-    page = Page(1, "Your endpoint", "Any server that speaks the OpenAI chat API.")
+    page = Page(2, "Your endpoint", "Any server that speaks the OpenAI chat API.")
     ui = PlainUI()
     assert ui.ask(page, [Field("API key", secret=True, validate=required)]) == ["sk-live-SECRET"]
     # a secret is kept exactly as typed: a password may start or end with a space
@@ -187,7 +187,7 @@ def test_a_secret_is_read_hidden_and_never_printed(typed, capsys):
 
 def test_errors_and_bodies_are_printed(typed, capsys):
     typed.answers.append("")
-    page = Page(2, "Dial this on your mobile", "Open the phone app, type the code and press call.",
+    page = Page(3, "Dial this on your mobile", "Open the phone app, type the code and press call.",
                 error="could not reach 127.0.0.1: ConnectError", body="Turn on     **67*+15550100001#\nCheck       *#67#")
     PlainUI().choose(page, [Option("Done")], back=False)
     out = capsys.readouterr().out.splitlines()
@@ -219,6 +219,7 @@ def test_progress_prints_at_most_once_per_five_percent(capsys):
 def sip_setup_answers():
     return [
         "",   # Welcome: Continue
+        "",   # Mode: Receive and place calls
         "",   # Brain: On this computer
         "",   # model: Qwen3.5 4B
         "2",  # Line: A SIP address
@@ -240,7 +241,7 @@ def test_run_setup_plain_end_to_end(typed, capsys, monkeypatch, tmp_path):
     typed.answers += sip_setup_answers()
     assert run_setup(plain=True) == 0
     assert made == [tmp_path / "config.yaml"]
-    assert made_actions.changes() == ["save_brain_local", "add_sip_line", "save_voice", "save_callers"]
+    assert made_actions.changes() == ["save_call_directions", "save_brain_local", "add_sip_line", "save_voice", "save_callers"]
     out = capsys.readouterr().out
     assert out.count("uv run ai-phone run") == 1  # the summary is the Done page's body, printed once
     assert "  pjsua --local-port 5070 sip:agent@127.0.0.1" in out
@@ -307,15 +308,16 @@ def test_run_setup_in_a_terminal_runs_the_full_screen_app(capsys, monkeypatch, t
     seen = {}
 
     def run_tui(flow_fn, summary=None):
-        seen["flow"] = flow_fn(ScriptedUI([("Give your AI", "Continue"), ("Where should your agent think?", "On this computer"),
-                                           ("Which model?", "<default>"), ("How should people reach", "<quit>")]))
+        seen["flow"] = flow_fn(ScriptedUI([("Give your AI", "Continue"), ("How should ai-phone work?", "Receive and place calls"),
+                                           ("Where should your agent think?", "On this computer"),
+                                           ("Which model?", "<default>"), ("Which connection should ai-phone use", "<quit>")]))
         seen["summary"] = summary()  # what a run the app had to leave early says: the same session
         return Outcome(0, "Saved\n  summary")
 
     monkeypatch.setitem(sys.modules, "ai_phone.setup.tui", types.SimpleNamespace(run_tui=run_tui))
     assert run_setup() == 0
-    assert seen["flow"].code == 1 and actions.changes() == ["save_brain_local"]
-    assert seen["summary"] == "Setup cancelled. Saved in this run: the brain. Nothing else was changed."
+    assert seen["flow"].code == 1 and actions.changes() == ["save_call_directions", "save_brain_local"]
+    assert seen["summary"] == "Setup cancelled. Saved in this run: call directions, the brain. Nothing else was changed."
     assert capsys.readouterr().out == "Saved\n  summary\n"
 
 
@@ -324,9 +326,9 @@ def test_ctrl_c_in_plain_mode_ends_with_the_summary(typed, capsys, monkeypatch, 
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
     monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
     actions = FakeActions(add_sip_line=KeyboardInterrupt())
-    typed.answers += ["", "", "", "2", "", ""]
+    typed.answers += ["", "", "", "", "2", "", ""]
     assert run_setup(plain=True) == 1
-    assert capsys.readouterr().out.endswith("\nSetup cancelled. Saved in this run: the brain. Nothing else was changed.\n")
+    assert capsys.readouterr().out.endswith("\nSetup cancelled. Saved in this run: call directions, the brain. Nothing else was changed.\n")
 
 
 def test_quitting_after_a_purchase_in_plain_mode_names_it(typed, capsys, monkeypatch, tmp_path):
@@ -354,12 +356,12 @@ def test_ctrl_c_during_a_download_in_plain_mode_exits_at_once(typed, capsys, mon
         raise SystemExit(code)
 
     monkeypatch.setattr(os, "_exit", fake_exit)
-    typed.answers += ["4", "", "", "", ""]  # Change what callers hear, three defaults, Download now
+    typed.answers += ["5", "", "", "", ""]  # Change call settings, three defaults, Download now
     with pytest.raises(SystemExit):
         run_setup(plain=True)
     assert exits == [1]
     assert capsys.readouterr().out.endswith("Downloading…\n\nSetup cancelled. The download stops now and picks up where it "
-                                            "left off next time. Saved in this run: what callers hear.\n")
+                                            "left off next time. Saved in this run: call settings.\n")
 
 
 def test_a_subscription_brain_in_plain_mode(typed, capsys, monkeypatch, tmp_path):
@@ -369,6 +371,7 @@ def test_a_subscription_brain_in_plain_mode(typed, capsys, monkeypatch, tmp_path
     monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
     typed.answers += [
         "",    # Welcome: Continue
+        "",    # Mode: Receive and place calls
         "2",   # Brain: My Claude subscription
         "",    # model: Haiku
         "2", "", "",          # a SIP address, with its defaults
@@ -379,7 +382,7 @@ def test_a_subscription_brain_in_plain_mode(typed, capsys, monkeypatch, tmp_path
         "",    # Done: Finish
     ]
     assert run_setup(plain=True) == 0
-    assert actions.changes() == ["save_brain_subscription", "add_sip_line", "save_voice", "save_callers"]
+    assert actions.changes() == ["save_call_directions", "save_brain_subscription", "add_sip_line", "save_voice", "save_callers"]
     assert actions.args("save_brain_subscription") == [("claude", "haiku")]
     out = capsys.readouterr().out
     assert "2) My Claude subscription" in out and "uses the Claude Code login · no API key" in out
@@ -394,9 +397,9 @@ def test_a_cli_to_install_in_plain_mode(typed, capsys, monkeypatch, tmp_path):
     monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
     actions = FakeActions(cli_installed=False)
     monkeypatch.setattr("ai_phone.setup.actions.Actions", lambda path: actions)
-    typed.answers += ["", "3", "b", "q"]  # Continue, My ChatGPT subscription, Back from the install page, quit
+    typed.answers += ["", "", "3", "b", "q"]  # Continue, receive and place calls, My ChatGPT subscription, Back from the install page, quit
     assert run_setup(plain=True) == 1
     out = capsys.readouterr().out
     assert "Codex is not installed" in out and "npm install -g @openai/codex" in out and "codex login" in out
     assert "  1) Check again" in out and "  b) Back" in out
-    assert actions.changes() == [] and not typed.answers
+    assert actions.changes() == ["save_call_directions"] and not typed.answers

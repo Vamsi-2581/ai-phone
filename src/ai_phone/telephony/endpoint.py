@@ -357,6 +357,8 @@ class Telephony:
             self.current_call.hangup(op)
 
     def make_call(self, line_id: str, target: str, timeout_sec: float = 30) -> int:
+        if not self.cfg.calls.allow_outbound:
+            raise DialError("outbound calls are disabled (calls.allow_outbound is false)")
         acc = self.accounts[line_id]
         spec = acc.spec
         if not acc.registered:

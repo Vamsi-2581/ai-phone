@@ -647,15 +647,55 @@ def test_phonon_preview_routes_to_its_player(home):
 
 
 def test_save_callers_merges_into_the_sections(home):
-    a = make(home, "calls: {relay_filler_after_ms: 1000}\ninbound: {greeting: Old}\n")
+    a = make(home, "calls: {relay_filler_after_ms: 1000, allow_inbound: true, allow_outbound: true}\ninbound: {greeting: Old}\n")
     a.save_callers("Hello there.", "Take a message.", 7)
-    assert raw(home)["calls"] == {"relay_filler_after_ms": 1000, "daily_limit": 7}
+    assert raw(home)["calls"] == {"relay_filler_after_ms": 1000, "daily_limit": 7,
+                                  "allow_inbound": True, "allow_outbound": True}
     assert raw(home)["inbound"] == {"greeting": "Hello there.", "instructions": "Take a message."}
     assert a.current().daily_limit == 7
     before = (home / "config.yaml").read_text()
     with pytest.raises(ActionError, match="greeting"):
         a.save_callers("x" * 501, "Take a message.", 7)
     assert (home / "config.yaml").read_text() == before
+
+
+@pytest.mark.parametrize("inbound,outbound", [(False, True), (True, False)])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_save_call_settings_preserves_inactive_values_and_absent_fields(home, inbound, outbound, explicit):
+    a = make(home, "calls: {daily_limit: 0}\ninbound: {greeting: Old, instructions: Keep this.}\n" if explicit else None)
+    a.save_call_directions(inbound, outbound)
+    before = raw(home)
+    # A missing daily_limit is displayed as 20 in setup but still defaults to 0 in the runtime.
+    a.save_callers("New greeting.", "New instructions.", 20)
+    after = raw(home)
+    if inbound:
+        assert after["calls"] == before["calls"]
+        assert after["inbound"] == {"greeting": "New greeting.", "instructions": "New instructions."}
+    else:
+        assert after.get("inbound") == before.get("inbound")
+        assert after["calls"]["daily_limit"] == 20
+
+
+@pytest.mark.parametrize("inbound,outbound", [(True, True), (False, True), (True, False)])
+def test_save_call_directions_preserves_other_settings(home, inbound, outbound):
+    a = make(home, "calls: {daily_limit: 7, relay_filler_after_ms: 1000}\n"
+                   "inbound: {greeting: Hello., instructions: Take a message.}\nmodels: {tier: qwen2b}\n")
+    before = raw(home)
+    a.save_call_directions(inbound, outbound)
+    expected = {**before, "calls": {**before["calls"], "allow_inbound": inbound, "allow_outbound": outbound}}
+    assert raw(home) == expected
+    assert (a.current().allow_inbound, a.current().allow_outbound) == (inbound, outbound)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_save_call_directions_rolls_back_invalid_combination(home, existing):
+    a = make(home, "calls: {daily_limit: 7}\n" if existing else None)
+    before = raw(home) if existing else None
+    with pytest.raises(ActionError, match="at least one"):
+        a.save_call_directions(False, False)
+    assert a.config_path.exists() == existing
+    if existing:
+        assert raw(home) == before
 
 
 # ---- models ----------------------------------------------------------------------------------

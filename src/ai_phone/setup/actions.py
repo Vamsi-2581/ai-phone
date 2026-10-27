@@ -83,6 +83,8 @@ class Current:
     instructions: str
     daily_limit: int            # calls.daily_limit, or 20 when the config has none
     tts_engine: str = "kokoro"
+    allow_inbound: bool = True
+    allow_outbound: bool = True
 
 
 @dataclass
@@ -166,7 +168,8 @@ class Actions:
                        base_url=cfg.brain.base_url, model=cfg.brain.model, brain_key_saved=bool(key_env and _saved().get(key_env)),
                        brain_cli=cfg.brain.cli,
                        voice=cfg.tts.voice, speed=cfg.tts.speed, greeting=cfg.inbound.greeting,
-                       instructions=cfg.inbound.instructions, daily_limit=limit, tts_engine=cfg.tts.engine)
+                       instructions=cfg.inbound.instructions, daily_limit=limit, tts_engine=cfg.tts.engine,
+                       allow_inbound=cfg.calls.allow_inbound, allow_outbound=cfg.calls.allow_outbound)
 
     def _read(self) -> dict:
         """The raw config for a change. A file that is not a YAML mapping is never overwritten."""
@@ -193,6 +196,13 @@ class Actions:
                 else:
                     self.config_path.unlink()
                 raise ActionError(str(e)) from None
+
+    # ---- call directions -------------------------------------------------------------------------
+
+    def save_call_directions(self, inbound: bool, outbound: bool) -> None:
+        def change(raw: dict) -> None:
+            raw["calls"] = {**_section(raw, "calls"), "allow_inbound": inbound, "allow_outbound": outbound}
+        self._edit(change)
 
     # ---- brain -----------------------------------------------------------------------------------
 
@@ -601,8 +611,11 @@ class Actions:
 
     def save_callers(self, greeting: str, instructions: str, daily_limit: int) -> None:
         def change(raw: dict) -> None:
-            raw["inbound"] = {**_section(raw, "inbound"), "greeting": greeting, "instructions": instructions}
-            raw["calls"] = {**_section(raw, "calls"), "daily_limit": daily_limit}
+            calls = _section(raw, "calls")
+            if calls.get("allow_inbound", True):
+                raw["inbound"] = {**_section(raw, "inbound"), "greeting": greeting, "instructions": instructions}
+            if calls.get("allow_outbound", True):
+                raw["calls"] = {**calls, "daily_limit": daily_limit}
         self._edit(change)
 
     # ---- check -----------------------------------------------------------------------------------

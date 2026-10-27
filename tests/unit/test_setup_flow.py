@@ -15,7 +15,7 @@ from ai_phone.providers.base import Number, VerificationStep
 from ai_phone.services.backends.cli_brain import CLAUDE_MODELS, CliModel
 from ai_phone.setup import flow
 from ai_phone.setup.actions import ActionError, Current, LineResult, Machine
-from ai_phone.setup.flow import BRAIN, CALLERS, CHECK, DONE, LINE, VOICE, WELCOME
+from ai_phone.setup.flow import BRAIN, CALLERS, CHECK, DONE, LINE, MODE, VOICE, WELCOME
 from ai_phone.setup.ui import BaseUI, Cancel, Check, Outcome, Page
 
 GREETING, INSTRUCTIONS = InboundConfig().greeting, InboundConfig().instructions
@@ -122,7 +122,8 @@ class ScriptedUI(BaseUI):
 
 
 class FakeActions:
-    def __init__(self, *, exists=False, memory=24, missing=(), downloaded=None, sip_library=True, lines=None, **results):
+    def __init__(self, *, exists=False, memory=24, missing=(), downloaded=None, sip_library=True, lines=None,
+                 allow_inbound=True, allow_outbound=True, **results):
         self.calls: list[tuple[str, tuple]] = []
         if downloaded is None:
             downloaded = [r for r in (models.STT, models.TTS, models.PHONON, models.LLM["t4"]) if r not in missing]
@@ -130,7 +131,8 @@ class FakeActions:
                          models_downloaded=downloaded)
         self.cur = Current(exists=exists, lines=dict(lines or {}), brain_kind="local", tier="t4",
                            base_url="http://127.0.0.1:1234/v1", model="local", brain_key_saved=False, brain_cli=None,
-                           voice="af_heart", speed=1.0, greeting=GREETING, instructions=INSTRUCTIONS, daily_limit=20)
+                           voice="af_heart", speed=1.0, greeting=GREETING, instructions=INSTRUCTIONS, daily_limit=20,
+                           allow_inbound=allow_inbound, allow_outbound=allow_outbound)
         self.results = {"saved_keys": None, "owned_numbers": OWNED, "search_numbers": FOUND, "lan_address": "192.0.2.10",
                         "voices": VOICES, "phonon_voices": ["default"], "check_config": None, "download_size": 4_300_000_000, "test_endpoint": "OK"}
         self.results.update(results)
@@ -275,8 +277,14 @@ class FakeActions:
         self._call("save_voice", voice, speed, engine)
         self.cur.voice, self.cur.speed, self.cur.tts_engine = voice, speed, engine
 
+    def save_call_directions(self, inbound, outbound):
+        self._call("save_call_directions", inbound, outbound)
+        self.cur.allow_inbound, self.cur.allow_outbound = inbound, outbound
+        self.cur.exists = True
+
     def save_callers(self, greeting, instructions, daily_limit):
         self._call("save_callers", greeting, instructions, daily_limit)
+        self.cur.greeting, self.cur.instructions, self.cur.daily_limit = greeting, instructions, daily_limit
 
 
 def page_text(page: Page) -> str:
@@ -298,15 +306,17 @@ def default_home(monkeypatch):
 
 
 WELCOME_NEW = ("Give your AI a phone number", "Continue")
+MODE_BOTH = ("How should ai-phone work?", "Receive and place calls")
 FINISH = ("You're set up", "Finish")
 
 
 def test_new_setup_local_brain_sip_line_default_voice():
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
-        ("How should people reach your agent?", "A SIP address"),
+        ("Which connection should ai-phone use?", "A SIP address"),
         ("Name your SIP address", ["agent", "192.0.2.10"]),
         ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "American · female"),
@@ -320,20 +330,20 @@ def test_new_setup_local_brain_sip_line_default_voice():
     actions = FakeActions()
     outcome = drive(ui, actions)
     assert outcome.code == 0 and ui.closed and not ui.answers
-    assert ui.steps == [WELCOME, BRAIN, LINE, VOICE, CALLERS, CHECK, DONE]
+    assert ui.steps == [WELCOME, MODE, BRAIN, LINE, VOICE, CALLERS, CHECK, DONE]
     _question, options, default, _back = ui.menu("Which model?")
     assert options[default].label == "Qwen3.5 4B"
     assert ui.questions("Which model?")[0].detail == \
         "This computer has 24 GB of memory. Models that need more may swap and answer slowly."
-    assert [o.label for o in ui.menu("How should people reach")[1]][3] == "Skip"
-    assert ui.menu("How should people reach")[1][3].hint == "add one later"
-    assert ui.menu("How should people reach")[1][0].hint == "Twilio or Telnyx · a new number, or one already on that account"
+    assert [o.label for o in ui.menu("Which connection should ai-phone use")[1]][3] == "Skip"
+    assert ui.menu("Which connection should ai-phone use")[1][3].hint == "add one later"
+    assert ui.menu("Which connection should ai-phone use")[1][0].hint == "Twilio or Telnyx · a new number, or one already on that account"
     group = ui.menu("American · female")
     assert [o.label for o in group[1]] == ["Bella", "Heart"] and group[2] == 1 and group[1][1].hint == "current"
     assert ui.questions("Heart")[0].detail == "American · female"
     speed = next(f for f in ui.fields if f.label == "Speed")
     assert speed.default == "1.0"
-    assert actions.changes() == ["save_brain_local", "add_sip_line", "save_voice", "save_callers"]
+    assert actions.changes() == ["save_call_directions", "save_brain_local", "add_sip_line", "save_voice", "save_callers"]
     assert actions.args("save_brain_local") == [("t4",)]
     assert actions.args("add_sip_line") == [("agent", "192.0.2.10")]
     assert actions.args("save_voice") == [("af_heart", 1.0, "kokoro")]
@@ -372,16 +382,122 @@ def test_welcome_shows_the_machine_checks():
         Check("Config", "found · ~/.ai-phone/ (setup changes only what you pick)", True),
     ]
     assert [o.label for o in ui.menus[0][1]] == ["Add a line", "Change the brain", "Change the voice",
-                                                "Change what callers hear", "Run all steps", "Cancel"]
+                                                "Change call directions", "Change call settings", "Run all steps", "Cancel"]
+
+
+@pytest.mark.parametrize("label,inbound,outbound", [
+    ("Receive and place calls", True, True),
+    ("Place calls only", False, True),
+    ("Receive calls only", True, False),
+])
+def test_first_run_saves_call_directions_before_the_brain(label, inbound, outbound):
+    ui = ScriptedUI([
+        WELCOME_NEW,
+        ("How should ai-phone work?", label),
+        ("Where should your agent think?", "<quit>"),
+    ])
+    actions = FakeActions()
+    outcome = drive(ui, actions)
+    assert outcome.code == 1
+    assert ui.steps == [WELCOME, MODE, BRAIN]
+    assert actions.changes() == ["save_call_directions"]
+    assert actions.args("save_call_directions") == [(inbound, outbound)]
+    _, options, default, _ = ui.menu("How should ai-phone work?")
+    assert [o.label for o in options] == ["Receive and place calls", "Place calls only", "Receive calls only"]
+    assert default == 0
+    assert "running" in page_text(ui.questions("How should ai-phone work?")[0]).lower()
+
+
+@pytest.mark.parametrize("label,inbound,outbound,question,answers,field_labels,expected", [
+    ("Receive and place calls", True, True, "What should callers hear?",
+     ["New greeting.", "Take a message.", "7"], ["Greeting", "Instructions", "Outbound calls per day"],
+     ("New greeting.", "Take a message.", 7)),
+    ("Place calls only", False, True, "How many calls may ai-phone place?",
+     ["7"], ["Outbound calls per day"], ("Saved greeting.", "Saved instructions.", 7)),
+    ("Receive calls only", True, False, "What should callers hear?",
+     ["New greeting.", "Take a message."], ["Greeting", "Instructions"],
+     ("New greeting.", "Take a message.", 13)),
+])
+def test_changing_directions_asks_only_active_settings_and_preserves_others(
+        label, inbound, outbound, question, answers, field_labels, expected):
+    actions = FakeActions(exists=True, lines={"agent": SIP_LINE}, allow_inbound=inbound, allow_outbound=outbound)
+    actions.cur.greeting, actions.cur.instructions, actions.cur.daily_limit = "Saved greeting.", "Saved instructions.", 13
+    ui = ScriptedUI([
+        ("Give your AI", "Change call directions"),
+        ("How should ai-phone work?", "<default>"),
+        (question, answers),
+        ("Everything works", "Continue"),
+        FINISH,
+    ])
+    assert drive(ui, actions).code == 0
+    assert ui.steps == [WELCOME, MODE, CALLERS, CHECK, DONE]
+    _, options, default, _ = ui.menu("How should ai-phone work?")
+    assert options[default].label == label
+    assert [f.label for f in ui.fields] == field_labels
+    assert actions.changes() == ["save_call_directions", "save_callers"]
+    assert actions.args("save_call_directions") == [(inbound, outbound)]
+    assert actions.args("save_callers") == [expected]
+
+
+def test_a_call_direction_save_error_retries_without_running_later_steps():
+    ui = ScriptedUI([
+        ("Give your AI", "Change call directions"),
+        ("How should ai-phone work?", "Place calls only"),
+        ("How should ai-phone work?", "Place calls only"),
+        ("How many calls may ai-phone place?", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, save_call_directions=Seq(ActionError("config could not be saved"), None))
+    assert drive(ui, actions).code == 1
+    first, retry = ui.questions("How should ai-phone work?")
+    assert not first.error and retry.error == "config could not be saved"
+    assert actions.args("save_call_directions") == [(False, True), (False, True)]
+    assert not actions.args("save_callers")
+
+
+def test_back_from_brain_returns_to_the_saved_call_directions():
+    ui = ScriptedUI([
+        WELCOME_NEW, MODE_BOTH,
+        ("Where should your agent think?", "<back>"),
+        ("How should ai-phone work?", "Place calls only"),
+        ("Where should your agent think?", "<quit>"),
+    ])
+    actions = FakeActions()
+    assert drive(ui, actions).code == 1
+    assert ui.steps == [WELCOME, MODE, BRAIN, MODE, BRAIN]
+    assert actions.args("save_call_directions") == [(True, True), (False, True)]
+    assert actions.changes() == ["save_call_directions", "save_call_directions"]
+
+
+@pytest.mark.parametrize("inbound,outbound", [(False, True), (True, False)])
+def test_number_setup_skips_actions_for_disabled_call_directions(inbound, outbound):
+    ui = ScriptedUI([
+        ("Give your AI", "Add a line"),
+        ("Which connection", "A phone number"),
+        ("Which carrier?", "Telnyx"),
+        ("Use the saved Telnyx key?", "Use the saved key"),
+        ("A new number, or one already on", "One already on my Telnyx account"),
+        ("Which number?", "+15550100007"),
+        ("Connect +15550100007 to ai-phone?", "Connect +15550100007"),
+        *([("Also forward your own mobile to it?", "No")] if inbound else []),
+        *([CALLER_ID_NO] if outbound else []),
+        ("Everything works", "<quit>"),
+    ])
+    actions = FakeActions(exists=True, saved_keys={"TELNYX_API_KEY": "saved-test-key"},
+                          allow_inbound=inbound, allow_outbound=outbound)
+    assert drive(ui, actions).code == 1
+    assert bool(ui.questions("Also forward your own mobile")) is inbound
+    assert bool(ui.questions("Show your own number when the agent calls out?")) is outbound
+    assert actions.changes() == ["attach_number"]
 
 
 def test_endpoint_brain_retries_after_a_failed_test():
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "My own endpoint"),
         ("Your endpoint", ["http://127.0.0.1:8080/v1", "qwen", "sk-test"]),
         ("Your endpoint", ["", "", "sk-test"]),
-        ("How should people reach your agent?", "<quit>"),
+        ("Which connection should ai-phone use?", "<quit>"),
     ])
     actions = FakeActions(test_endpoint=Seq(ActionError("could not reach 127.0.0.1: ConnectError"), "OK"))
     assert drive(ui, actions).code == 1
@@ -447,7 +563,7 @@ def test_a_config_that_does_not_load_is_shown_where_the_answer_is_saved():
 
 
 def add_a_line(carrier="Twilio"):
-    return [("Give your AI", "Add a line"), ("How should people reach your agent?", "A phone number"),
+    return [("Give your AI", "Add a line"), ("Which connection should ai-phone use?", "A phone number"),
             ("Which carrier?", carrier)]
 
 
@@ -461,7 +577,7 @@ def test_twilio_new_number_buys_only_after_confirmation():
     ui = ScriptedUI([
         *add_a_line(), *choose_a_number,
         ("Buy +15550100001 for $1.15/month?", "<default>"),  # Enter goes back: it never buys
-        ("How should people reach your agent?", "A phone number"), ("Which carrier?", "Twilio"), *choose_a_number,
+        ("Which connection should ai-phone use?", "A phone number"), ("Which carrier?", "Twilio"), *choose_a_number,
         ("Buy +15550100001 for $1.15/month?", "Buy +15550100001"),
         ("Also forward your own mobile to it?", "No"),
         CALLER_ID_NO,
@@ -759,7 +875,7 @@ def test_the_caller_id_step_is_only_for_a_carrier_number_that_is_ready():
     assert not ui.questions("Show your own number") and not pending.args("start_caller_id")
 
     ui = ScriptedUI([
-        ("Give your AI", "Add a line"), ("How should people reach your agent?", "A SIP address"),
+        ("Give your AI", "Add a line"), ("Which connection should ai-phone use?", "A SIP address"),
         ("Name your SIP address", ["agent", "192.0.2.10"]),
         ("Everything works", "<quit>"),
     ])
@@ -973,7 +1089,7 @@ def test_failed_number_says_something_went_wrong():
 def test_own_trunk():
     ui = ScriptedUI([
         ("Give your AI", "Add a line"),
-        ("How should people reach your agent?", "My own SIP trunk"),
+        ("Which connection should ai-phone use?", "My own SIP trunk"),
         ("Your SIP trunk", ["sip.example.com", "alex1234", "pwSECRET", "+15550100000"]),
         ("Which transport?", "TLS"),
         ("Your SIP trunk", ["", "", "pwSECRET2", ""]),
@@ -997,7 +1113,7 @@ def test_own_trunk():
 def test_own_trunk_keeps_sips_and_the_password_as_typed():
     ui = ScriptedUI([
         ("Give your AI", "Add a line"),
-        ("How should people reach your agent?", "My own SIP trunk"),
+        ("Which connection should ai-phone use?", "My own SIP trunk"),
         ("Your SIP trunk", ["  sips:sip.example.com ", " alex1234 ", "  pw SECRET  ", " +15550100000 "]),
         ("Which transport?", "TLS"),
         ("Everything works", "<quit>"),
@@ -1011,7 +1127,7 @@ def test_sip_address_name_taken_is_asked_again():
     taken = "sip:agent@192.0.2.10 is already line agent; pick another name"
     ui = ScriptedUI([
         ("Give your AI", "Add a line"),
-        ("How should people reach your agent?", "A SIP address"),
+        ("Which connection should ai-phone use?", "A SIP address"),
         ("Name your SIP address", ["", ""]),
         ("Name your SIP address", ["desk", ""]),
         ("Everything works", "<quit>"),
@@ -1027,7 +1143,7 @@ def test_sip_address_name_taken_is_asked_again():
 def test_sip_address_offers_a_free_name():
     ui = ScriptedUI([
         ("Give your AI", "Add a line"),
-        ("How should people reach your agent?", "A SIP address"),
+        ("Which connection should ai-phone use?", "A SIP address"),
         ("Name your SIP address", ["", ""]),
         ("Everything works", "<quit>"),
     ])
@@ -1070,9 +1186,10 @@ def test_price_size_and_plural_helpers():
 def test_the_brain_step_offers_the_whole_model_catalog():
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
-        ("How should people reach your agent?", "<quit>"),
+        ("Which connection should ai-phone use?", "<quit>"),
     ])
     actions = FakeActions(memory=24)
     drive(ui, actions)
@@ -1095,12 +1212,13 @@ def test_the_brain_step_offers_the_whole_model_catalog():
 def test_a_model_this_computer_cannot_hold_is_confirmed_first():
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "On this computer"),
         ("Which model?", "Gemma 3 12B"),
         ("Use Gemma 3 12B anyway?", "<default>"),  # Enter is Back: nothing is saved
         ("Which model?", "Gemma 3 12B"),
         ("Use Gemma 3 12B anyway?", "Use it anyway"),
-        ("How should people reach your agent?", "<quit>"),
+        ("Which connection should ai-phone use?", "<quit>"),
     ])
     actions = FakeActions(memory=24)
     drive(ui, actions)
@@ -1118,7 +1236,7 @@ def test_a_model_this_computer_cannot_hold_is_confirmed_first():
     (24, "Qwen3.5 4B", "Qwen3.5 4B"), (32, "Qwen3.5 9B", "Qwen3.5 9B"),
 ])
 def test_first_setup_recommends_only_a_model_that_fits_detected_ram(memory, recommended, default):
-    ui = ScriptedUI([WELCOME_NEW, ("Where should your agent think?", "On this computer"),
+    ui = ScriptedUI([WELCOME_NEW, MODE_BOTH, ("Where should your agent think?", "On this computer"),
                      ("Which model?", "<quit>")])
     drive(ui, FakeActions(memory=memory))
     _, options, picked, _ = ui.menu("Which model?")
@@ -1133,9 +1251,10 @@ def test_first_setup_recommends_only_a_model_that_fits_detected_ram(memory, reco
 def test_a_model_that_fits_is_saved_without_a_confirmation():
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "On this computer"),
         ("Which model?", "Mistral 7B"),
-        ("How should people reach your agent?", "<quit>"),
+        ("Which connection should ai-phone use?", "<quit>"),
     ])
     actions = FakeActions(memory=24)
     drive(ui, actions)
@@ -1160,18 +1279,19 @@ def test_a_repo_named_by_hand_in_the_config_keeps_the_recommended_default():
 def test_back_at_the_first_question_goes_to_the_previous_step():
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "On this computer"),
         ("Which model?", "Qwen3.5 9B"),
-        ("How should people reach your agent?", "<back>"),
+        ("Which connection should ai-phone use?", "<back>"),
         ("Where should your agent think?", "On this computer"),
         ("Which model?", "Qwen3.5 4B"),
-        ("How should people reach your agent?", "Skip"),
+        ("Which connection should ai-phone use?", "Skip"),
         ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "<quit>"),
     ])
     actions = FakeActions(memory=32)
     assert drive(ui, actions).code == 1
-    assert ui.steps == [WELCOME, BRAIN, LINE, BRAIN, LINE, VOICE]
+    assert ui.steps == [WELCOME, MODE, BRAIN, LINE, BRAIN, LINE, VOICE]
     assert actions.args("save_brain_local") == [("t9",), ("t4",)]
     model_menus = [menu for menu in ui.menus if menu[0] == "Which model?"]
     assert model_menus[-1][2] == 1  # the model menu now defaults to what was saved
@@ -1180,32 +1300,35 @@ def test_back_at_the_first_question_goes_to_the_previous_step():
 def test_back_later_in_a_step_restarts_it():
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "My own endpoint"),
         ("Your endpoint", "<back>"),
         ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
-        ("How should people reach your agent?", "<quit>"),
+        ("Which connection should ai-phone use?", "<quit>"),
     ])
     actions = FakeActions()
     drive(ui, actions)
-    assert ui.steps == [WELCOME, BRAIN, BRAIN, LINE]
-    assert actions.changes() == ["save_brain_local"]
+    assert ui.steps == [WELCOME, MODE, BRAIN, BRAIN, LINE]
+    assert actions.changes() == ["save_call_directions", "save_brain_local"]
 
 
 def test_back_from_the_first_step_returns_to_welcome():
     ui = ScriptedUI([
         WELCOME_NEW,
-        ("Where should your agent think?", "<back>"),
+        ("How should ai-phone work?", "<back>"),
         WELCOME_NEW,
-        ("Where should your agent think?", "<quit>"),
+        ("How should ai-phone work?", "<quit>"),
     ])
-    assert drive(ui, FakeActions()).code == 1
-    assert ui.steps == [WELCOME, BRAIN, WELCOME, BRAIN]
+    actions = FakeActions()
+    assert drive(ui, actions).code == 1
+    assert ui.steps == [WELCOME, MODE, WELCOME, MODE]
+    assert not actions.changes()
 
 
 def test_back_from_the_only_step_of_a_change_returns_to_welcome():
     ui = ScriptedUI([
-        ("Give your AI", "Change what callers hear"),
+        ("Give your AI", "Change call settings"),
         ("What should callers hear?", "<back>"),
         ("Give your AI", "Cancel"),
     ])
@@ -1218,9 +1341,10 @@ def test_back_from_the_only_step_of_a_change_returns_to_welcome():
 def test_cancel_keeps_finished_steps_only():
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
-        ("How should people reach your agent?", "A SIP address"),
+        ("Which connection should ai-phone use?", "A SIP address"),
         ("Name your SIP address", ["", ""]),
         ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "<quit>"),
@@ -1228,9 +1352,9 @@ def test_cancel_keeps_finished_steps_only():
     actions = FakeActions()
     outcome = drive(ui, actions)
     assert outcome.code == 1 and ui.closed
-    assert outcome.summary == ("Setup cancelled. Saved in this run: the brain, line agent (sip:agent@192.0.2.10). "
+    assert outcome.summary == ("Setup cancelled. Saved in this run: call directions, the brain, line agent (sip:agent@192.0.2.10). "
                                "Nothing else was changed.")
-    assert actions.changes() == ["save_brain_local", "add_sip_line"]
+    assert actions.changes() == ["save_call_directions", "save_brain_local", "add_sip_line"]
 
 
 def buy_then(*after):
@@ -1297,9 +1421,10 @@ def test_ctrl_c_during_a_purchase_says_it_may_be_half_done():
     assert ui.closed and not ui.answers and not session.left_download
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
-        ("How should people reach your agent?", "A SIP address"),
+        ("Which connection should ai-phone use?", "A SIP address"),
         ("Name your SIP address", ["", ""]),
         ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "American · female"),
@@ -1307,21 +1432,21 @@ def test_ctrl_c_during_a_purchase_says_it_may_be_half_done():
         ("Heart", "Hear it"),
     ])
     outcome = flow.run(ui, FakeActions(play_sample=KeyboardInterrupt()))
-    assert outcome == Outcome(1, "Setup stopped during: Playing…\nSaved in this run: the brain, line agent "
+    assert outcome == Outcome(1, "Setup stopped during: Playing…\nSaved in this run: call directions, the brain, line agent "
                                  "(sip:agent@192.0.2.10). Nothing else was changed.")
 
 
 def test_ctrl_c_during_a_download_says_it_resumes():
     session = flow.Session()
     ui = ScriptedUI([
-        ("Give your AI", "Change what callers hear"),
+        ("Give your AI", "Change call settings"),
         ("What should callers hear?", ["", "", ""]),
         ("Download the models now?", "Download now"),
     ])
     actions = FakeActions(exists=True, missing=["mlx-community/Qwen3.5-4B-MLX-4bit"], pull_models=KeyboardInterrupt())
     outcome = flow.run(ui, actions, session)
     assert outcome == Outcome(1, "Setup cancelled. The download stops now and picks up where it left off next time. "
-                                 "Saved in this run: what callers hear.")
+                                 "Saved in this run: call settings.")
     assert session.left_download and flow.cancel_text(session) == outcome.summary
     ui = ScriptedUI([("Give your AI", "Change the voice"), ("Which speech model?", "Kokoro"), ("How should your agent sound?", "Download it now")])
     session = flow.Session()
@@ -1333,7 +1458,7 @@ def test_ctrl_c_during_a_download_says_it_resumes():
 def test_a_finished_or_failed_step_is_no_longer_the_one_running():
     session = flow.Session()
     ui = ScriptedUI([
-        ("Give your AI", "Change what callers hear"),
+        ("Give your AI", "Change call settings"),
         ("What should callers hear?", ["", "", ""]),
         ("Download the models now?", "Download now"),
         ("A few things need attention", "Continue"),
@@ -1342,19 +1467,19 @@ def test_a_finished_or_failed_step_is_no_longer_the_one_running():
     actions = FakeActions(exists=True, missing=["m"], lines={"agent": SIP_LINE}, pull_models=ActionError("could not download m"))
     assert flow.run(ui, actions, session).code == 0
     assert session.working is None and not session.left_download
-    assert session.saved == ["what callers hear"]
-    ui = ScriptedUI([("Give your AI", "Change what callers hear"), ("What should callers hear?", ["", "", ""]),
+    assert session.saved == ["call settings"]
+    ui = ScriptedUI([("Give your AI", "Change call settings"), ("What should callers hear?", ["", "", ""]),
                      ("Download the models now?", "Download now"), ("Everything works", "<quit>")])
     session = flow.Session()
     flow.run(ui, FakeActions(exists=True, missing=["m"], lines={"agent": SIP_LINE}), session)
-    assert session.saved == ["what callers hear", "the downloaded models"]
-    assert flow.cancel_text(session) == ("Setup cancelled. Saved in this run: what callers hear, the downloaded models. "
+    assert session.saved == ["call settings", "the downloaded models"]
+    assert flow.cancel_text(session) == ("Setup cancelled. Saved in this run: call settings, the downloaded models. "
                                          "Nothing else was changed.")
 
 
 def test_leaving_on_the_done_page_still_finishes():
     ui = ScriptedUI([
-        ("Give your AI", "Change what callers hear"),
+        ("Give your AI", "Change call settings"),
         ("What should callers hear?", ["", "", "0"]),
         ("A few things need attention", "Continue"),
         ("You're set up", "<quit>"),
@@ -1369,7 +1494,7 @@ def test_leaving_on_the_done_page_still_finishes():
 
 def test_callers_that_do_not_validate_are_asked_again():
     ui = ScriptedUI([
-        ("Give your AI", "Change what callers hear"),
+        ("Give your AI", "Change call settings"),
         ("What should callers hear?", ["x" * 501, "", ""]),
         ("What should callers hear?", ["Hello there.", "Take a message.", "5"]),
         ("A few things need attention", "<quit>"),
@@ -1419,9 +1544,10 @@ def test_existing_config_change_the_voice_only():
 def test_new_setup_recommends_phonon_previews_then_downloads_the_remaining_models():
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "On this computer"),
         ("Which model?", "<default>"),
-        ("How should people reach your agent?", "A SIP address"),
+        ("Which connection should ai-phone use?", "A SIP address"),
         ("Name your SIP address", ["agent", "192.0.2.10"]),
         ("Which speech model?", "<default>"),
         ("Phonon voice", "Hear it"),
@@ -1593,9 +1719,9 @@ def test_a_voice_that_cannot_be_saved_is_asked_again():
 
 def test_unexpected_errors_stop_setup_without_a_traceback():
     broken = "config.yaml is not valid YAML; fix it or move it away, then run setup again"
-    ui = ScriptedUI([("Give your AI", "Change what callers hear"), ("What should callers hear?", ["", "", ""])])
+    ui = ScriptedUI([("Give your AI", "Change call settings"), ("What should callers hear?", ["", "", ""])])
     outcome = flow.run(ui, FakeActions(exists=True, check_config=ActionError(broken)))
-    assert (outcome.code, outcome.summary) == (3, f"Setup stopped: {broken}\nSaved in this run: what callers hear. "
+    assert (outcome.code, outcome.summary) == (3, f"Setup stopped: {broken}\nSaved in this run: call settings. "
                                                   "Nothing else was changed.") and ui.closed
     ui = ScriptedUI([("Give your AI", "Change the voice"), ("Which speech model?", "Kokoro")])
     outcome = flow.run(ui, FakeActions(exists=True, voices=KeyError("af_secret_detail")))
@@ -1604,7 +1730,7 @@ def test_unexpected_errors_stop_setup_without_a_traceback():
 
 def test_check_offers_the_download_and_reports():
     ui = ScriptedUI([
-        ("Give your AI", "Change what callers hear"),
+        ("Give your AI", "Change call settings"),
         ("What should callers hear?", ["", "", ""]),
         ("Download the models now?", "Download now"),
         ("Everything works", "Check again"),
@@ -1621,7 +1747,7 @@ def test_check_offers_the_download_and_reports():
     assert ui.pages[0].checks[2] == Check("Models", "Parakeet 0.6B v2\nKokoro 82M\nPhonon 31M\n"
                                          "Missing: Qwen3.5 4B · setup can download them", None)
     offer = ui.questions("Download the models now?")[0]
-    assert offer.detail == "About 4.3 GB, saved in the Hugging Face cache. ai-phone needs them to answer calls."
+    assert offer.detail == "About 4.3 GB, saved in the Hugging Face cache. ai-phone needs them to handle calls."
     assert [(o.label, o.hint) for o in ui.menu("Download the models now?")[1]] == [
         ("Download now", "4.3 GB"), ("Later", "run: uv run ai-phone models pull")]
     assert "Checking the download size…" in ui.labels
@@ -1637,7 +1763,7 @@ def test_check_offers_the_download_and_reports():
 
 def test_endpoint_brain_check_lines_and_voice_rows():
     ui = ScriptedUI([
-        ("Give your AI", "Change what callers hear"),
+        ("Give your AI", "Change call settings"),
         ("What should callers hear?", ["", "", ""]),
         ("A few things need attention", "Continue"),
         FINISH,
@@ -1657,7 +1783,7 @@ def test_endpoint_brain_check_lines_and_voice_rows():
 
 def test_check_skips_lines_when_the_config_does_not_load():
     ui = ScriptedUI([
-        ("Give your AI", "Change what callers hear"),
+        ("Give your AI", "Change call settings"),
         ("What should callers hear?", ["", "", ""]),
         ("A few things need attention", "<quit>"),
     ])
@@ -1672,7 +1798,7 @@ def test_check_skips_lines_when_the_config_does_not_load():
 
 def test_check_shows_a_skipped_row_without_the_sip_library():
     ui = ScriptedUI([
-        ("Give your AI", "Change what callers hear"),
+        ("Give your AI", "Change call settings"),
         ("What should callers hear?", ["", "", ""]),
         ("A few things need attention", "<quit>"),
     ])
@@ -1705,11 +1831,14 @@ def test_done_text_fits_the_page(monkeypatch, tmp_path):
         "         telnyx   +15550100003           Telnyx number · pending",
         "         desk     sip:desk@192.0.2.10    SIP address",
         "         odd      +15550100004           SIP trunk",
+        "Calls    receive and place calls",
         "Brain    on this computer · Qwen3.5 4B",
         "Voice    Kokoro · Heart · American · female · 1.0×",
         "",
         "Start ai-phone",
         "  uv run ai-phone run",
+        "  Leave ai-phone running while you want to receive calls.",
+        "  If already running, stop and restart to apply these settings.",
         "",
         "Try it",
         "  call +15550100001 from any phone (your normal call rates)",
@@ -1722,6 +1851,29 @@ def test_done_text_fits_the_page(monkeypatch, tmp_path):
         "  uv run ai-phone hangup                                  end the call",
     ]
     assert max(len(ln) for ln in text.splitlines() if not ln.startswith("Give your AI the phone")) <= 88
+
+
+@pytest.mark.parametrize("inbound,outbound,label", [
+    (True, True, "receive and place calls"),
+    (False, True, "place calls only"),
+    (True, False, "receive calls only"),
+])
+def test_done_instructions_match_the_enabled_call_directions(inbound, outbound, label):
+    actions = FakeActions(exists=True, lines={"agent": SIP_LINE, "twilio": {**NUMBER_LINE, "caller_id": "+15550100009"}},
+                          allow_inbound=inbound, allow_outbound=outbound)
+    text = flow.done_text(actions, flow.Session())
+    assert f"Calls    {label}" in text
+    assert ("uv run ai-phone call " in text) is outbound
+    assert ("uv run ai-phone listen --json" in text) is inbound
+    assert ("calls out as +15550100009" in text) is outbound
+    assert ("Try it" in text) is inbound
+    assert ("pjsua --local-port" in text) is inbound
+    if inbound:
+        assert "Leave ai-phone running while you want to receive calls." in text
+    else:
+        assert "Start ai-phone when you want to place a call; stop it with Ctrl-C afterward." in text
+        assert "uv run ai-phone listen --call <id> --json" in text
+    assert "uv run ai-phone hangup" in text
 
 
 def test_the_done_page_names_secrets_env_only_when_there_is_one(monkeypatch, tmp_path):
@@ -1783,9 +1935,10 @@ def test_the_done_page_survives_a_hand_edited_provider():
 def test_new_setup_with_a_claude_subscription():
     ui = ScriptedUI([
         WELCOME_NEW,
+        MODE_BOTH,
         ("Where should your agent think?", "My Claude subscription"),
         ("Which model?", "<default>"),
-        ("How should people reach your agent?", "A SIP address"),
+        ("Which connection should ai-phone use?", "A SIP address"),
         ("Name your SIP address", ["agent", "192.0.2.10"]),
         ("Which speech model?", "Kokoro"),
         ("How should your agent sound?", "American · female"),
@@ -1808,7 +1961,7 @@ def test_new_setup_with_a_claude_subscription():
     assert [o.label for o in model[1]] == ["Haiku", "Sonnet", "Opus"] and model[2] == 0
     assert model[1][0].hint == "fastest to answer · the one for a phone call"
     assert "The words of every call go to Claude through Claude Code" in ui.questions("Which model?")[0].detail
-    assert actions.changes() == ["save_brain_subscription", "add_sip_line", "save_voice", "save_callers"]
+    assert actions.changes() == ["save_call_directions", "save_brain_subscription", "add_sip_line", "save_voice", "save_callers"]
     assert actions.args("save_brain_subscription") == [("claude", "haiku")]
     # one request of the plan for the whole run: the model that was picked, which the Check page then finds proved
     assert actions.args("test_subscription") == [("claude", "haiku"), ("claude", None)]
@@ -1986,7 +2139,7 @@ def test_a_cli_logged_in_with_an_api_key_says_what_to_do_about_it():
 
 def test_a_login_that_stops_working_is_a_failed_check_row():
     ui = ScriptedUI([
-        ("Give your AI", "Change what callers hear"),
+        ("Give your AI", "Change call settings"),
         ("What should callers hear?", ["", "", ""]),
         ("A few things need attention", "Continue"),
         FINISH,

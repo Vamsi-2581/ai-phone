@@ -39,7 +39,7 @@ heavily, and runtime and caller-duration conditions changed. See the [Phonon int
 ```bash
 git clone https://github.com/oxnw/ai-phone.git && cd ai-phone
 ./scripts/install.sh        # the SIP library and the Python environment (needs Homebrew and uv)
-uv run ai-phone setup       # pick a line, a brain and a voice; downloads the models; checks it all works
+uv run ai-phone setup       # choose call directions, a brain, a line and a voice; downloads and checks models
 uv run ai-phone run         # start ai-phone
 ```
 
@@ -47,6 +47,14 @@ uv run ai-phone run         # start ai-phone
 readable only by you) and changes only what you pick when you run it again. `uv run ai-phone setup --plain` asks the
 same questions as plain prompts. The models go to the Hugging Face cache; `uv run ai-phone models pull` fetches them
 without the wizard. The commands below are written as `ai-phone …`; from the repo folder that is `uv run ai-phone …`.
+
+Setup first asks whether to **receive and place calls**, **place calls only**, or **receive calls only**.
+Receiving calls needs `ai-phone run` to stay running while you want to be reachable. For outgoing calls only,
+start it when you need to call, use the call commands from another terminal, then stop it with Ctrl-C afterward.
+Setup does not install a background service. These choices set independent `calls.allow_inbound` and
+`calls.allow_outbound` booleans; both default to true for existing configs. Incoming calls are rejected when
+receiving is off, and outgoing commands are refused when placing calls is off. Change them by running setup again
+and choosing **Change call directions**, then restart a running daemon to apply the change.
 
 The Voice step offers Phonon 31M English (streaming, one bundled voice at normal speed) and Kokoro
 (American and British voices, adjustable speed). Both run directly through MLX in the daemon's TTS worker.
