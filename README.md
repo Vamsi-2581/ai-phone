@@ -1,225 +1,157 @@
-# ai-phone
+<p align="center">
+  <img src="docs/assets/header.svg" alt="ai-phone — Give your AI a phone." width="100%">
+</p>
 
-A phone line answered by an AI that runs on your own machine. Give an agent a real number (a new one
-bought with your own Telnyx or Twilio key, or one already on that account), divert your own phone to it,
-or reach it at a SIP address; speech-to-text, the language model and text-to-speech run locally by
-default, and during a call the daemon talks to nothing but SIP/RTP (and one brain only if you chose
-one that is not on this Mac: your own endpoint, or the Claude or ChatGPT plan you already pay for).
+<p align="center">
+  <strong>A real phone number. A local voice. A command line your agent can use.</strong>
+</p>
 
-Currently supported on **macOS with Apple Silicon**.
+<p align="center">
+  <a href="#get-a-dial-tone">Quickstart</a> ·
+  <a href="#hand-over-the-controls">Agent commands</a> ·
+  <a href="#pick-the-brain-pick-the-voice">Models</a> ·
+  <a href="#how-fast-does-it-talk-back">Measurements</a> ·
+  <a href="docs/usage.md">Full guide</a>
+</p>
 
-**Status: Milestone 1 (latency proof) passed; Milestone 4 (get started: install script and setup wizard) complete, verified from a fresh clone; Milestones 2 (lines) and 3 (agent tool) code complete, their live gates pending.**
-English only, one call at a time. See `architecture-essentials.md` for how it works.
+Give an AI a number people can call. Let it take a message, make a call for you, or hand the conversation
+to another agent with `listen` and `say`. Speech recognition, the language model and the voice run on
+your computer by default.
 
-## Historical Milestone 1 numbers (2026-09-03, Apple M5 Pro, 24 GB, 4B tier)
+**Currently: macOS on Apple Silicon · English · one call at a time.**
 
-| Measure | p50 | p95 |
-|---|---|---|
-| First audible response | **874 ms** | 1438 ms |
-| Barge-in stop after the caller starts talking (5 interruptions) | 219 ms | 259 ms |
-| Endpoint wait / STT / LLM to first clause / TTS first chunk / egress | 297 / 96 / 312 / 164 / 9 ms | |
+## Yes, it can make the call
 
-"First audible" is measured from the last voice-active chunk of the caller to the first
-non-silent RTP frame handed to the SIP stack; it includes the 300 ms endpoint wait. Add the phone's
-own jitter buffer (60–100 ms) for mouth-to-ear. Measured while the host was also swapping about
-10 GB of other applications, over 20 LAN calls using 8 kHz PCMU. Callers who talk over the greeting
-are heard in full.
-
-A Kokoro rerun on **2026-10-26**, using the same Mac and model tier over 20 loopback PCMU
-calls, measured **1074 ms p50 / 1719 ms p95**. All 20 turns completed, but this run missed the
-1000 ms p50 gate. The host still held about 20 GB in swap and paged during the run; current
-default phone instructions also differ from M1. The historical result is retained separately.
-See the [rerun measurements and conditions](docs/latency-2026-10-26.md).
-
-With Phonon integrated on **2026-10-27**, all 20 local calls completed at **1500 ms p50 / 1939 ms p95**;
-the TTS stage measured **52 / 84 ms**. All five interruption calls cancelled and resumed speech, but one
-stopped in 396 ms, above the 300 ms limit. Both timing gates remain unmet in this run. The host paged
-heavily, and runtime and caller-duration conditions changed. See the [Phonon integration results](docs/phonon-2026-10-27.md).
-
-## Try it (macOS, Apple Silicon)
+Once setup is done, give it a job:
 
 ```bash
-git clone https://github.com/oxnw/ai-phone.git && cd ai-phone
-./scripts/install.sh        # the SIP library and the Python environment (needs Homebrew and uv)
-uv run ai-phone setup       # choose call directions, a brain, a line and a voice; downloads and checks models
-uv run ai-phone run         # start ai-phone
+uv run ai-phone call +15555550100 --json \
+  --prompt "Ask whether they have a table for two at eight tonight."
 ```
 
-`setup` saves everything under `~/.ai-phone/` (`config.yaml`, and keys and passwords in `secrets.env`, both
-readable only by you) and changes only what you pick when you run it again. `uv run ai-phone setup --plain` asks the
-same questions as plain prompts. The models go to the Hugging Face cache; `uv run ai-phone models pull` fetches them
-without the wizard. The commands below are written as `ai-phone …`; from the repo folder that is `uv run ai-phone …`.
+The phone agent holds the conversation and returns the transcript when the call ends.
+Replace the example number with the number you want to call. Every outgoing call starts by saying
+it's an AI assistant.
 
-Setup first asks whether to **receive and place calls**, **place calls only**, or **receive calls only**.
-Receiving calls needs `ai-phone run` to stay running while you want to be reachable. For outgoing calls only,
-start it when you need to call, use the call commands from another terminal, then stop it with Ctrl-C afterward.
-Setup does not install a background service. These choices set independent `calls.allow_inbound` and
-`calls.allow_outbound` booleans; both default to true for existing configs. Incoming calls are rejected when
-receiving is off, and outgoing commands are refused when placing calls is off. Change them by running setup again
-and choosing **Change call directions**, then restart a running daemon to apply the change.
+Or let the phone ring. Incoming calls get your greeting and instructions: take a message or answer a
+question. If another agent is already waiting with `listen`, it can handle the conversation instead.
 
-To change the number people see when your agent calls, run setup again and choose **Change caller ID**.
-Pick a line, then its purchased number or one of your verified numbers. You can also verify another number you
-own through Twilio or Telnyx. Switching back to the line's number keeps your verified numbers for later;
-restart a running daemon to apply the selection.
-
-The Voice step offers Phonon 31M English (streaming, one bundled voice at normal speed) and Kokoro
-(American and British voices, adjustable speed). Both run directly through MLX in the daemon's TTS worker.
-Existing configurations keep Kokoro. To select Phonon by hand, set
-`tts: {engine: phonon, voice: default, speed: 1.0}`, run `uv run ai-phone models pull`, then restart the daemon.
-Only the selected speech model is required; voices and weights are loaded from disk before calls begin.
-
-No carrier yet? Pick "A SIP address" in setup and talk to your agent from this Mac with
-`pjsua --local-port 5070 sip:agent@127.0.0.1` (free).
-
-Real numbers, diverts and SIP addresses are Milestone 2, below.
-
-## Three ways to call it (Milestone 2)
-
-```bash
-# 1. Its own number (a Telnyx or Twilio account and API key; about £1/month for the number)
-export TELNYX_API_KEY=…
-ai-phone lines add telnyx --key-env TELNYX_API_KEY --country GB --area 020
-ai-phone lines add twilio --key-env TWILIO_ACCOUNT_SID --secret-env TWILIO_AUTH_TOKEN --existing +15550100000   # a number you already have: nothing is bought, and removing the line keeps it
-ai-phone run
-
-# 2. Your own mobile number. It stays on your SIM, so this is two halves:
-#    calls OUT show your number once you have verified it (one SMS code) …
-ai-phone lines verify-caller-id telnyx +447700900123 --key-env TELNYX_API_KEY
-#    … and calls IN reach the agent through your carrier's divert (one dial code, printed here)
-ai-phone lines forward telnyx --when no-answer --from +447700900123
-#   dial the printed **61* code on your phone; ##002# cancels every divert
-
-# 3. A SIP address, no carrier (agents calling agents)
-ai-phone lines add sip --id agents --user agents --host home.example.org --trusted 203.0.113.7
-ai-phone call sip:agents@friend.example.org --line agents
-
-# Outbound from the agent's number (or from your verified mobile number). With no --line, a number goes out on the
-# first registered trunk and a sip: address on the first sip line; with two trunks configured, name the one you mean.
-ai-phone call +447700900123
-ai-phone status
-
-# The brain on this Mac: one of t4, t9, qwen2b, llama3b, gemma4b, mistral7b, gemma12b (the catalog in models.py),
-# auto to pick by memory, or any mlx-lm 4-bit repo id
-#   models: {tier: gemma4b}
-# Or a brain that is not on this Mac (see "Any brain" below)
-#   brain: {kind: claude, model: haiku}                 # your Claude plan, through the Claude Code login
-#   brain: {kind: chatgpt, model: gpt-5.6-luna}         # your ChatGPT plan, through the Codex login
-#   brain: {kind: openai_compatible, base_url: "http://127.0.0.1:1234/v1", model: "…"}
-# And the voice
-#   tts: {engine: phonon, voice: default, speed: 1.0}
-#   tts: {engine: kokoro, voice: bf_emma, speed: 1.0}   (af_/am_ American, bf_/bm_ British)
-```
-
-`--key-env` and `--secret-env` name variables in your environment or in `~/.ai-phone/secrets.env` (where setup saves them).
-
-During a call the daemon opens no network connection except SIP/RTP to the peer and, only if you configured one, HTTP(S) to that brain endpoint. Buying or connecting a number talks to the carrier once, from the `lines` command or `setup`, and the daemon never loads the carrier code. Provisioning is journaled: `ai-phone lines resume` picks up where a crash left off, `ai-phone lines remove` deletes what ai-phone created at the carrier (a number you brought is disconnected and stays on your account) and lists exactly what is left for you to remove in the portal if a deletion fails — or, if the journal recording what was created has gone missing, refuses rather than delete the local record of a number that is still billing. Configuration applies at restart. The NAT and transport checks run before calling it done are in [docs/nat-checklist.md](docs/nat-checklist.md); the 24 h registration soak is `scripts/soak.sh`.
-
-What an incoming call hears is set by one `inbound:` section of the config: a greeting that plays on every incoming
-call, and the instructions ai-phone's own model follows when no AI is waiting in `ai-phone listen` (the example config
-takes a message).
-
-## Any brain
-
-The agent's words can come from a model on this Mac, from a plan you already pay for, or from any
-OpenAI-compatible server. Speech-to-text and the voice always run here, whichever you pick. `ai-phone setup`
-asks, and the daemon says at start where the words of a call go.
-
-| Brain | First word (measured here) | What leaves this Mac | What it needs |
-|---|---|---|---|
-| **On this Mac** (default) | 1500 ms p50 in the [2026-10-27 local call run](docs/phonon-2026-10-27.md) | nothing: no socket is opened | downloaded local speech and language models |
-| **Your Claude subscription** | 2.4–5.5 s on a call's first turn, about 1 s after | what callers say, the call's instructions and the conversation go to Anthropic (not audio) | `claude` installed and logged in; your plan's own limits apply |
-| **Your ChatGPT subscription** | 3.9–4.4 s on a call's first turn, 1.1–1.9 s after | the same, to OpenAI | `codex` installed and logged in; your plan's own limits apply |
-| **Your own endpoint** | whatever that server does | the same, to that server | an OpenAI-compatible URL, `https` unless it is on this Mac; a key if it wants one |
-
-A subscription brain uses no API key: ai-phone drives the CLI you are already logged into (`claude -p`, or
-`codex app-server`) in an empty private directory, with no tools and none of your own project settings, and
-streams its words to the caller. It asks each CLI what its login is before it uses it, and runs only on a
-subscription login: a key is billed per request, and on the Claude side `ANTHROPIC_API_KEY` beats the login
-you have, so neither it nor anything else that would re-route a CLI (`OPENAI_*`, a `*_BASE_URL`) is passed on
-to one, and a login ai-phone does not recognise is refused by name rather than used.
-What callers say is model input, so neither session gets tools: Claude Code is run with none and asked what it
-came up with, and Codex is given a `CODEX_HOME` of ai-phone's own, so none of your MCP servers, hooks, plugins
-or `AGENTS.md` is in a call, with every tool feature turned off and a read-only sandbox that approves nothing.
-If a session reaches for a tool anyway, the turn ends there and the session goes, so nothing a tool produced
-can reach the caller.
-Install them with `npm install -g @anthropic-ai/claude-code` (then `claude`
-and `/login`) or `npm install -g @openai/codex` (then `codex login`). A plan is a second or two slower to the
-first word than the model on this Mac, and it is not private; what it buys is a much stronger brain on the
-phone than 24 GB of memory can hold. The session belongs to one call: it is started while the greeting plays
-and let go when the call ends. Proving the login costs one tiny turn of your plan every time ai-phone starts
-(and again if the brain worker has to be restarted mid-run), on top of the calls themselves.
-
-## Use it from your AI (Milestone 3)
-
-Tell your agent it has the `ai-phone` command. It has two ways to make a call.
-
-**Phone agent mode**: ai-phone's own model holds the conversation; your agent gets the transcript at the end:
-
-```bash
-ai-phone call +15551234567 --json \
-  --prompt "Ask whether they have a table for two at 8 tonight, under the name Sam."
-```
-
-A phone agent `call` blocks until the call ends, which can take up to `conversation.max_call_sec` (600 seconds). With
-`--json` it also writes each progress event to stderr as one JSON line, starting with
-`{"event": "created", "call_id": "c7f3a2"}`. If your agent's shell kills the command before the call ends, the call
-carries on. Take the ID from that `created` line and run `ai-phone listen --call c7f3a2 --json` once the call is over;
-it prints the result with the transcript. While the call is still going, that `listen` exits 11 at once, so wait and try
-again (`ai-phone status` shows the call while it is up). The daemon keeps the last 20 calls.
-
-**Relay mode**: your agent holds the conversation itself, one turn at a time:
-
-```bash
-ai-phone call +15551234567 --relay --json     # returns once answered
-ai-phone say "Hi, I'd like to book a table for two at eight tonight."
-ai-phone listen --json                         # waits until they finish speaking
-ai-phone say "Sam."
-ai-phone hangup --say "That's all, thank you. Goodbye." --json
-```
-
-`ai-phone listen` with no call in progress waits for someone to call one of the agent's numbers (it first reports a
-relay call that ended since anyone last listened). When someone calls, ai-phone answers with `inbound.greeting` and
-`listen` prints `incoming call c9b1e0 on main from sip:+15551234567@sip.carrier.example` (the caller's SIP URI as the
-SIP stack reports it, sometimes with a display name, not a bare number); your agent carries on with `listen` and
-`say`. While a phone agent call is in progress (an outbound one, or an incoming call that arrived while nobody was
-listening), `listen` without `--call` exits 11 at once instead of waiting, so an agent that polls for incoming calls
-should pause before it tries again. While your agent is thinking, ai-phone says "One moment." so the line never goes silent, and "Still with you,
-one moment." after 10 seconds; after 25 seconds without a reply it apologises and hangs up. On an outbound relay call
-the 25 seconds count from the answer until your agent's first `say`, with no "One moment." before it, so say the first
-line straight away. Every outbound call starts with "Hi, this is an AI assistant calling." Emergency numbers are never
-dialled (a target whose digits look like one, such as extension 100 or 1000, is refused too; call such extensions by
-name), and `calls.daily_limit` caps outbound calls per day.
-
-With `--json`, each of these four commands (`call`, `listen`, `say`, `hangup`) prints exactly one JSON object on stdout
-(`call` also writes its progress events to stderr, one JSON object per line); a
-malformed command line (a missing or unknown option) is reported by the argument parser on stderr with exit code 2,
-and Ctrl-C while `listen`, `say` or `hangup` is waiting exits 130 (Ctrl-C during `call` hangs the call up and prints
-its result).
-
-| Exit code | Meaning |
+| Give it… | How it works |
 |---|---|
-| 0 | answered (relay), or the call ran and ended; `listen` got an event; `say` was spoken or interrupted; `hangup` ended the call |
-| 2 | bad usage (a missing or unknown option, `--prompt` with `--relay`, text too long) |
-| 5 | busy (the other end, or a call is already in progress here) |
-| 6 | no answer |
-| 7 | rejected, or cancelled by `hangup` while still ringing |
-| 8 | redirected |
-| 9 | ai-phone is not running, went away, or sent a reply this command does not understand; from `hangup`, also: the call had still not ended 40 seconds after the hangup (ai-phone waits 30 seconds for the call to end, including any `--say` text, hangs up again, then waits 10 more), so it may still be up |
-| 10 | `listen` timed out (the call, if any, goes on) |
-| 11 | no such call, no call in progress, call already ended, or `listen`/`say` on a phone agent call |
-| 12 | another `listen` is already waiting for calls |
-| 13 | emergency number |
-| 14 | daily outbound call limit reached |
-| 130 | interrupted with Ctrl-C |
+| **Its own number** | Buy or connect a number using your own Telnyx or Twilio account. |
+| **Your number** | Forward incoming calls to it; verify a number you own to use it as outgoing caller ID. |
+| **A SIP address** | Call it directly, including free local calls without a carrier. |
 
-Transcripts leave ai-phone only through the command that asked for them, and, if you chose a brain that is not on
-this Mac (`brain.kind: openai_compatible`, `claude` or `chatgpt`), through that endpoint — or through your own
-logged-in CLI, to Anthropic or OpenAI — during a phone agent call: what callers say and the conversation so far go
-there on every turn, with the call's instructions. If your agent runs on a cloud model, that service sees the
-transcript.
+## Get a dial tone
 
-## License
+You'll need an Apple Silicon Mac, [Homebrew](https://brew.sh) and [uv](https://docs.astral.sh/uv/).
 
-AGPL-3.0-or-later; see [LICENSE](LICENSE). `native/pjsua2/` carries PJSIP's GPLv2-or-later interface files;
-see its [README](native/pjsua2/README.md) and [license copy](native/pjsua2/COPYING).
+```bash
+git clone https://github.com/oxnw/ai-phone.git
+cd ai-phone
+./scripts/install.sh
+uv run ai-phone setup
+uv run ai-phone run
+```
+
+The setup wizard handles the choices: **receive calls, place calls, or both**; a brain recommended
+for your computer; a line; a voice; and what to say when someone calls. It downloads the models you
+need and lets you preview the voice.
+
+Leave `run` open and use call commands in another terminal, from the same repo folder.
+Receiving calls means keeping it running. Only making calls? Start it when you need it and stop it
+with Ctrl-C afterward. Setup doesn't install a background service.
+
+> **Try it without buying a number.** Enable incoming calls, choose **A SIP address**, and keep the
+> name `agent` in setup. With ai-phone running, open another terminal and call
+> `pjsua --local-port 5070 sip:agent@127.0.0.1`.
+
+Run `uv run ai-phone setup` again to change things, including **call directions** and **caller ID**.
+Restart the daemon after changing its settings. Prefer plain prompts? Add `--plain`.
+
+## Hand over the controls
+
+Any agent that can run shell commands can hold the conversation itself. Start a relay call, then
+alternate between speaking and listening:
+
+```bash
+uv run ai-phone call +15555550100 --relay --json
+uv run ai-phone say "Hi, I'd like to book a table for two." --json
+uv run ai-phone listen --json
+uv run ai-phone say "Eight o'clock, please." --json
+uv run ai-phone hangup --say "Thank you. Goodbye." --json
+```
+
+With no call in progress, `uv run ai-phone listen --json` waits for an incoming call.
+With `--json`, each command returns one JSON object on stdout; `call` also sends progress events
+to stderr. Say the first line promptly after an outbound relay call answers: an agent that leaves
+the caller waiting for 25 seconds is disconnected.
+
+The [command guide](docs/usage.md#agent-commands) covers timeouts, transcripts, call IDs and exit codes.
+
+## Pick the brain. Pick the voice.
+
+| Brain | Where the thinking happens |
+|---|---|
+| **Local model** · default | On your computer, directly through MLX. Setup recommends a model for your memory. |
+| **Claude** | Through your logged-in Claude Code CLI and subscription. |
+| **ChatGPT** | Through your logged-in Codex CLI and subscription. |
+| **Your own endpoint** | An OpenAI-compatible server you configure. |
+
+Speech recognition and synthesis stay local with every option. Choose **Phonon** for its bundled
+English voice, or **Kokoro** for American and British voices with adjustable speed. Both run directly
+through MLX; no separate speech server is needed.
+
+Local mode keeps model inference on your machine. Phone audio still travels to the SIP peer.
+If you choose a remote brain, the call's text, instructions and conversation history go to that
+provider; if an external agent uses a cloud model, its provider sees the transcripts you pass it.
+Carrier charges and subscription limits still apply.
+
+[Brain configuration and privacy details →](docs/usage.md#brains-and-privacy)
+
+## Under the receiver
+
+```text
+Caller → SIP/RTP → Parakeet → your chosen brain → Phonon / Kokoro → SIP/RTP → Caller
+                  hears         thinks              speaks
+```
+
+One Python daemon handles the call. PJSIP handles telephony; workers handle the models.
+Interruptions cancel the current reply and clear queued speech so the caller can take their turn.
+Models load before calls begin. During a call, network traffic is limited to SIP/RTP and the brain
+you configured, if it isn't local.
+
+[Architecture in five minutes](architecture-essentials.md) · [Full design](architecture.md)
+
+## How fast does it talk back?
+
+The latest local run completed **20/20 calls** on an Apple M5 Pro with 24 GB RAM, Qwen3.5 4B and
+Phonon, on **2026-10-27**:
+
+| Measurement | Median | p95 |
+|---|---:|---:|
+| First audible response | **1.50 s** | **1.94 s** |
+| TTS first chunk | 52 ms | 84 ms |
+
+First audible response is measured from the caller's last speech chunk to the first non-silent
+audio frame sent to the SIP stack, including endpoint wait. Network and handset buffering come on
+top. The host was under heavy memory pressure; this is a measured run, not a speed promise.
+
+All five interruption tests cancelled and resumed correctly. Four stopped within 300 ms; one took
+396 ms. The one-second response target and the interruption timing target remain unmet in this run.
+
+[Full Phonon results](docs/phonon-2026-10-27.md) · [Kokoro rerun](docs/latency-2026-10-26.md) ·
+[Earlier measurements](docs/usage.md#latency-history)
+
+## Keep digging
+
+Install and setup have been verified from a fresh clone, and local calls and interruptions have
+been exercised. Live carrier and end-to-end agent acceptance checks are still pending.
+
+- [Usage guide](docs/usage.md): numbers, forwarding, model configuration and the full CLI contract.
+- [Example configuration](config.example.yaml): the knobs, with comments.
+- [NAT checklist](docs/nat-checklist.md): getting calls through a real network.
+- [Architecture](architecture-essentials.md): start here if you want to work on the code.
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE). The bundled PJSIP interface files have their own
+[license notes](native/pjsua2/README.md) and [GPLv2-or-later license](native/pjsua2/COPYING).

@@ -13,7 +13,7 @@ KEY = r"[a-z][a-z0-9]*"
 # one pattern per place a reader is told which models exist; group 1 is the list, however it is punctuated there
 KEY_LISTS = {
     "config.example.yaml": re.compile(rf"#\s+({KEY}(?: \| {KEY})+) —"),       # "# t4 | t9 | … — or any"
-    "README.md": re.compile(rf"one of ({KEY}(?:, {KEY})+) \(the catalog"),
+    "docs/usage.md": re.compile(rf"one of ({KEY}(?:, {KEY})+) \(the catalog"),
     "architecture.md": re.compile(rf"made calls with it: (`{KEY}`(?:, `{KEY}`)+)\."),
 }
 MOVED = "if the wording moved, move this test's pattern with it"
