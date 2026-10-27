@@ -18,17 +18,17 @@ def home(tmp_path, monkeypatch):
 
 def test_pull_with_everything_present(home, monkeypatch, capsys):
     asked = []
-    monkeypatch.setattr(models, "missing", lambda tier, brain: asked.append((tier, brain)) or [])
+    monkeypatch.setattr(models, "missing", lambda tier, brain, engine: asked.append((tier, brain, engine)) or [])
     monkeypatch.setattr(models, "pull", lambda *a, **k: pytest.fail("nothing to download"))
     assert main(["models", "pull"]) == 0
     assert "All models are already downloaded." in capsys.readouterr().out
-    assert asked == [("t4", "local")]  # no config: the default brain, and auto picks t4 on 24 GB
+    assert asked == [("t4", "local", "kokoro")]  # no config: the default brain, and auto picks t4 on 24 GB
 
 
 def test_pull_downloads_what_is_missing(home, monkeypatch, capsys):
     (home / "config.yaml").write_text("brain:\n  kind: openai_compatible\n  base_url: http://127.0.0.1:1234/v1\n")
     pulled, asked = [], []
-    monkeypatch.setattr(models, "missing", lambda tier, brain: asked.append((tier, brain)) or [models.STT, models.TTS])
+    monkeypatch.setattr(models, "missing", lambda tier, brain, engine: asked.append((tier, brain, engine)) or [models.STT, models.TTS])
     monkeypatch.setattr(models, "download_size", lambda repos: 2_500_000_000)
     monkeypatch.setattr(models, "pull", lambda repos, report=None: pulled.append(repos))
     assert main(["models", "pull", "--tier", "t9"]) == 0
@@ -36,14 +36,14 @@ def test_pull_downloads_what_is_missing(home, monkeypatch, capsys):
     assert "Downloading 2 model(s), 2.5 GB, into the Hugging Face cache:" in out
     assert models.STT in out and models.TTS in out and "Done." in out
     assert pulled == [[models.STT, models.TTS]]
-    assert asked == [("t9", "openai_compatible")]
+    assert asked == [("t9", "openai_compatible", "kokoro")]
 
 
 def test_pull_reports_a_download_error(home, monkeypatch, capsys):
     def fail(repos, report=None):
         raise models.ModelsError("not enough disk space: 5.0 GB to download and 1.0 GB free (keep 1 GB spare)")
 
-    monkeypatch.setattr(models, "missing", lambda tier, brain: [models.TTS])
+    monkeypatch.setattr(models, "missing", lambda tier, brain, engine: [models.TTS])
     monkeypatch.setattr(models, "download_size", lambda repos: None)
     monkeypatch.setattr(models, "pull", fail)
     assert main(["models", "pull"]) == 3
@@ -58,18 +58,18 @@ def test_pull_works_with_a_config_that_does_not_load(home, monkeypatch, capsys):
     (home / "config.yaml").write_text("models: {tier: t9}\nbrain: {kind: openai_compatible, base_url: 'https://api.example.com/v1'}\n"
                                       "tts: {voice: bf_emma}\n")
     asked = []
-    monkeypatch.setattr(models, "missing", lambda tier, brain: asked.append((tier, brain)) or [])
+    monkeypatch.setattr(models, "missing", lambda tier, brain, engine: asked.append((tier, brain, engine)) or [])
     assert main(["models", "pull"]) == 0
     out = capsys.readouterr().out.splitlines()
     assert out[0] == ("warning: the config does not load (config.tts.voice: bf_emma is not installed; installed: af_heart); "
                       "using models.tier t9 and brain.kind openai_compatible from it")
-    assert asked == [("t9", "openai_compatible")]
+    assert asked == [("t9", "openai_compatible", "kokoro")]
     (home / "config.yaml").write_text("models: {tier: t99}\nbrain: [not: yaml\n")
     assert main(["models", "pull"]) == 0
     out = capsys.readouterr().out.splitlines()
     assert out[0].startswith("warning: the config does not load (config: ") and out[0].endswith("); using the defaults")
     assert len([ln for ln in out if ln.startswith("warning")]) == 1
-    assert asked[-1] == ("t4", "local")
+    assert asked[-1] == ("t4", "local", "kokoro")
 
 
 def test_a_subscription_config_that_does_not_load_downloads_no_language_model(home, monkeypatch, capsys):
@@ -80,11 +80,11 @@ def test_a_subscription_config_that_does_not_load_downloads_no_language_model(ho
     for kind in ("claude", "chatgpt"):
         (home / "config.yaml").write_text(f"brain: {{kind: {kind}, model: haiku}}\ntts: {{voice: bf_emma}}\n")
         asked = []
-        monkeypatch.setattr(models, "missing", lambda tier, brain: asked.append((tier, brain)) or [])
+        monkeypatch.setattr(models, "missing", lambda tier, brain, engine: asked.append((tier, brain, engine)) or [])
         assert main(["models", "pull"]) == 0
         out = capsys.readouterr().out.splitlines()
         assert out[0].endswith(f"using brain.kind {kind} from it"), out[0]
-        assert asked == [("t4", kind)]
+        assert asked == [("t4", kind, "kokoro")]
 
 
 @pytest.mark.parametrize("break_it", [
@@ -96,13 +96,13 @@ def test_pull_works_with_a_config_file_it_cannot_be_read_from(home, monkeypatch,
     that does not parse was already handled, one that cannot be opened at all printed a traceback."""
     break_it(home / "config.yaml")
     asked = []
-    monkeypatch.setattr(models, "missing", lambda tier, brain: asked.append((tier, brain)) or [])
+    monkeypatch.setattr(models, "missing", lambda tier, brain, engine: asked.append((tier, brain, engine)) or [])
     assert main(["models", "pull"]) == 0
     out = capsys.readouterr().out.splitlines()
     assert out[0].startswith("warning: the config does not load (config: ") and "cannot be read" in out[0]
     assert out[0].endswith("); using the defaults")
     assert "Traceback" not in "\n".join(out)
-    assert asked == [("t4", "local")]  # nothing in the file could be trusted: the defaults, and auto picks t4
+    assert asked == [("t4", "local", "kokoro")]  # nothing in the file could be trusted: the defaults, and auto picks t4
 
 
 def test_pull_stopped_with_ctrl_c_exits_at_once(home, monkeypatch, capsys):
@@ -118,7 +118,7 @@ def test_pull_stopped_with_ctrl_c_exits_at_once(home, monkeypatch, capsys):
         exits.append(code)
         raise SystemExit(code)
 
-    monkeypatch.setattr(models, "missing", lambda tier, brain: [models.TTS])
+    monkeypatch.setattr(models, "missing", lambda tier, brain, engine: [models.TTS])
     monkeypatch.setattr(models, "download_size", lambda repos: None)
     monkeypatch.setattr(models, "pull", interrupted)
     monkeypatch.setattr(os, "_exit", fake_exit)
@@ -206,7 +206,7 @@ def handled(root, logger, level) -> bool:
 
 @pytest.mark.parametrize("argv", [["models", "pull"], ["setup", "--plain"]])
 def test_request_lines_do_not_flood_the_screen(home, monkeypatch, argv):
-    monkeypatch.setattr(models, "missing", lambda tier, brain: [])
+    monkeypatch.setattr(models, "missing", lambda tier, brain, engine: [])
     monkeypatch.setitem(sys.modules, "ai_phone.setup", types.SimpleNamespace(run_setup=lambda plain: 0))
     with fresh_logging() as root:
         assert main(argv) == 0
@@ -242,7 +242,18 @@ def test_a_model_nobody_has_heard_of_is_a_clean_error(home, capsys, monkeypatch)
 
 def test_pull_takes_any_catalog_key_or_a_repo(home, monkeypatch, capsys):
     asked = []
-    monkeypatch.setattr(models, "missing", lambda tier, brain: asked.append((tier, brain)) or [])
+    monkeypatch.setattr(models, "missing", lambda tier, brain, engine: asked.append((tier, brain, engine)) or [])
     assert main(["models", "pull", "--tier", "gemma12b"]) == 0
     assert main(["models", "pull", "--tier", "org/my-own-4bit"]) == 0
-    assert asked == [("gemma12b", "local"), ("org/my-own-4bit", "local")]
+    assert asked == [("gemma12b", "local", "kokoro"), ("org/my-own-4bit", "local", "kokoro")]
+
+
+@pytest.mark.parametrize("voice", ["default", "invalid"])
+def test_pull_keeps_the_selected_speech_engine_even_when_config_needs_repair(home, monkeypatch, capsys, voice):
+    (home / "config.yaml").write_text(f"brain: {{kind: chatgpt}}\ntts: {{engine: phonon, voice: {voice}}}\n")
+    asked = []
+    monkeypatch.setattr(models, "missing", lambda tier, brain, engine: asked.append((tier, brain, engine)) or [])
+    assert main(["models", "pull"]) == 0
+    assert asked == [("t4", "chatgpt", "phonon")]
+    if voice == "invalid":
+        assert "tts.engine phonon" in capsys.readouterr().out

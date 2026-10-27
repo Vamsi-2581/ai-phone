@@ -370,3 +370,21 @@ def test_the_brain_kinds_cannot_drift_from_the_type_the_loader_checks():
     assert typing.get_args(typing.get_type_hints(BrainConfig)["kind"]) == BRAIN_KINDS
     assert set(SUBSCRIPTION_KINDS) <= set(BRAIN_KINDS)
     assert BrainConfig().kind in BRAIN_KINDS
+
+
+def test_old_configs_keep_kokoro_and_phonon_selects_its_bundled_voice(tmp_path):
+    assert _load(tmp_path, "tts: {voice: af_heart, speed: 1.2}\n").tts.engine == "kokoro"
+    cfg = _load(tmp_path, "tts: {engine: phonon, voice: default, speed: 1.0}\n")
+    assert (cfg.tts.engine, cfg.tts.voice, cfg.tts.speed) == ("phonon", "default", 1.0)
+
+
+@pytest.mark.parametrize("tts, field", [
+    ("engine: other", "engine"),
+    ("engine: phonon", "voice"),
+    ("engine: phonon, voice: af_heart", "voice"),
+    ("engine: phonon, voice: default, speed: 1.1", "speed"),
+    ("engine: kokoro, voice: default", "voice"),
+])
+def test_speech_options_are_validated_for_the_selected_engine(tmp_path, tts, field):
+    with pytest.raises(ConfigError, match=f"config.tts.{field}"):
+        _load(tmp_path, f"tts: {{{tts}}}\n")

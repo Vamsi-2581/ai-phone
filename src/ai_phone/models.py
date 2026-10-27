@@ -14,6 +14,9 @@ from typing import Callable
 
 STT = "mlx-community/parakeet-tdt-0.6b-v2"
 TTS = "mlx-community/Kokoro-82M-bf16"
+PHONON = "gradium/phonon-31m-en"
+PHONON_REVISION = "92741c5b07d085ff840e26fea8ce43110b87852f"
+PHONON_FILES = ("config.json", "model.safetensors", "tokenizer.json", "tokenizer.model", "default-voice.safetensors")
 BIG_MEMORY_GB = 32
 DOWNLOADING = ".ai-phone-downloading"  # in a repo's cache folder while `pull` has not finished it
 SHARD_RE = re.compile(r"-of-(\d+)\.safetensors$")
@@ -91,8 +94,25 @@ def fits(key: str, mem_gb: int) -> bool:
     return True if entry is None else entry.needs_gb <= mem_gb
 
 
-def needed(tier: str, brain_kind: str) -> list[str]:
-    return [STT, TTS] + ([repo_for(tier)] if brain_kind == "local" else [])
+def tts_repo(engine: str = "kokoro") -> str:
+    try:
+        return {"kokoro": TTS, "phonon": PHONON}[engine]
+    except KeyError:
+        raise ModelsError(f"unknown speech engine {engine!r}; use kokoro or phonon") from None
+
+
+def _revision(repo: str) -> dict[str, str]:
+    return {"revision": PHONON_REVISION} if repo == PHONON else {}
+
+
+def _snapshot_options(repo: str) -> dict:
+    # The Hub checks completeness against this selection even offline. GGUF and chat-template files
+    # belong to other runtimes; requiring them would reject a complete direct-MLX snapshot.
+    return {**_revision(repo), "allow_patterns": list(PHONON_FILES)} if repo == PHONON else {}
+
+
+def needed(tier: str, brain_kind: str, tts_engine: str = "kokoro") -> list[str]:
+    return [STT, tts_repo(tts_engine)] + ([repo_for(tier)] if brain_kind == "local" else [])
 
 
 def local_path(repo: str) -> Path | None:
@@ -104,7 +124,7 @@ def local_path(repo: str) -> Path | None:
     if (_repo_dir(repo) / DOWNLOADING).exists():
         return None
     try:
-        path = Path(snapshot_download(repo, local_files_only=True))
+        path = Path(snapshot_download(repo, local_files_only=True, **_snapshot_options(repo)))
     except LocalEntryNotFoundError:
         return None  # not downloaded: the ordinary answer, and the one `missing` asks for on every run
     except Exception as e:
@@ -112,6 +132,10 @@ def local_path(repo: str) -> Path | None:
         # and that is the difference somebody staring at "not downloaded" needs
         log.debug("%s: the Hugging Face cache would not answer: %s: %s", repo, type(e).__name__, e)
         return None
+    if repo == PHONON:
+        # A voice alone is also a safetensors file. Check the actual weights and tokenizer, so a partial
+        # snapshot cannot trigger Pocket TTS's fallback downloads when the worker starts offline.
+        return path if all((path / name).is_file() and (path / name).stat().st_size for name in PHONON_FILES) else None
     if not (path / "config.json").is_file() or not any(path.glob("*.safetensors")):
         return None
     return path if _weights_complete(path) else None
@@ -137,8 +161,8 @@ def _weights_complete(path: Path) -> bool:
     return len(present[total]) == total
 
 
-def missing(tier: str, brain_kind: str) -> list[str]:
-    return [r for r in needed(tier, brain_kind) if local_path(r) is None]
+def missing(tier: str, brain_kind: str, tts_engine: str = "kokoro") -> list[str]:
+    return [r for r in needed(tier, brain_kind, tts_engine) if local_path(r) is None]
 
 
 def _hub_root() -> Path:
@@ -169,7 +193,8 @@ def download_size(repos: list[str]) -> int | None:
     """Bytes still to fetch: the repos' total size less what the cache already holds. None when the Hub cannot be asked."""
     from huggingface_hub import HfApi
     try:
-        total = sum(sum(s.size or 0 for s in HfApi().model_info(r, files_metadata=True).siblings or []) for r in repos)
+        total = sum(sum(s.size or 0 for s in HfApi().model_info(r, files_metadata=True, **_revision(r)).siblings or []
+                        if r != PHONON or s.rfilename in PHONON_FILES) for r in repos)
     except Exception:
         return None
     return max(total - sum(_bytes_on_disk(r) for r in repos), 0)
@@ -210,7 +235,7 @@ def pull(repos: list[str], report: Callable[[int, int], None] | None = None, dow
             try:
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.touch()
-                download(repo)
+                download(repo, **_snapshot_options(repo))
             except Exception as e:
                 raise ModelsError(f"could not download {repo}: {type(e).__name__}: {str(e)[:160]}") from None
             marker.unlink(missing_ok=True)

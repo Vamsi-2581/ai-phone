@@ -352,3 +352,47 @@ def test_constants_match_the_backends():
     assert mlx_lm_backend.make_llm("org/anything").model_id == "org/anything"
     assert STT == inspect.signature(mlx_parakeet.ParakeetSTT).parameters["model_id"].default
     assert TTS == inspect.signature(mlx_kokoro.KokoroTTS).parameters["model_id"].default
+
+
+def test_phonon_selection_keeps_kokoro_out_of_required_models(monkeypatch):
+    monkeypatch.setattr(models, "local_path", lambda repo: None)
+    assert models.needed("t4", "local", "phonon") == [STT, models.PHONON, LLM["t4"]]
+    assert models.missing("t4", "chatgpt", "phonon") == [STT, models.PHONON]
+    with pytest.raises(ModelsError, match="unknown speech engine"):
+        models.tts_repo("other")
+
+
+def test_phonon_snapshot_requires_weights_tokenizers_and_voice_at_pinned_revision(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(models, "_hub_root", lambda: tmp_path)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo, **kw: calls.append((repo, kw)) or str(tmp_path))
+    for name in models.PHONON_FILES:
+        assert models.local_path(models.PHONON) is None
+        (tmp_path / name).write_bytes(b"data")
+    assert models.local_path(models.PHONON) == tmp_path
+    assert all(repo == models.PHONON and kw == {"local_files_only": True, "revision": models.PHONON_REVISION,
+                                               "allow_patterns": list(models.PHONON_FILES)}
+               for repo, kw in calls)
+    for name in models.PHONON_FILES:
+        (tmp_path / name).write_bytes(b"")
+        assert models.local_path(models.PHONON) is None
+        (tmp_path / name).write_bytes(b"data")
+
+
+def test_phonon_download_and_size_query_use_the_same_pinned_revision(tmp_path, monkeypatch):
+    calls = []
+
+    class Api:
+        def model_info(self, repo, **kw):
+            assert repo == models.PHONON
+            assert kw == {"files_metadata": True, "revision": models.PHONON_REVISION}
+            return types.SimpleNamespace(siblings=[types.SimpleNamespace(size=100, rfilename="model.safetensors"),
+                                                  types.SimpleNamespace(size=1000, rfilename="model.gguf")])
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+    monkeypatch.setattr(models, "_hub_root", lambda: tmp_path)
+    plenty_of_disk(monkeypatch)
+    assert models.download_size([models.PHONON]) == 100
+    models.pull([models.PHONON], download=lambda repo, **kw: calls.append((repo, kw)))
+    assert calls == [(models.PHONON, {"revision": models.PHONON_REVISION,
+                                    "allow_patterns": list(models.PHONON_FILES)})]

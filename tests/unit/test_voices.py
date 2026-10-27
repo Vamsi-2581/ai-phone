@@ -43,3 +43,19 @@ def test_voices_dir_is_inside_the_speech_model_snapshot(tmp_path, monkeypatch):
     assert voices.installed_voices() == ["bm_lewis"]
     monkeypatch.setattr(models, "local_path", lambda repo: None)
     assert voices.voices_dir() is None
+
+
+def test_phonon_has_one_bundled_voice_with_its_original_filename(tmp_path, monkeypatch):
+    from ai_phone import models
+    monkeypatch.setattr(models, "local_path", lambda repo: tmp_path if repo == models.PHONON else None)
+    assert voices.installed_voices(engine="phonon") == []
+    path = tmp_path / "default-voice.safetensors"
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"voice")
+    path.symlink_to(blob)
+    assert voices.installed_voices(engine="phonon") == ["default"]
+    assert voices.voice_path("default", engine="phonon") == path
+    assert voices.voice_path("af_heart", engine="phonon") is None
+    assert voices.default_voice("phonon") == "default"
+    assert voices.title("default", engine="phonon") == "Default"
+    assert voices.describe("default", engine="phonon") == "English · bundled voice"

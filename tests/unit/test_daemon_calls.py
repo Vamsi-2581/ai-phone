@@ -869,6 +869,33 @@ def test_the_llm_worker_runs_the_model_the_tier_names(tmp_path, monkeypatch):
     assert ("llm", "ai_phone.services.backends.fake:FakeLLM", None) in made  # the fake brain ignores the tier
 
 
+@pytest.mark.parametrize("engine, voice, factory", [
+    ("kokoro", "bf_emma", "ai_phone.services.backends.mlx_kokoro:KokoroTTS"),
+    ("phonon", "default", "ai_phone.services.backends.mlx_phonon:PhononTTS"),
+])
+@pytest.mark.parametrize("fake", [False, True])
+def test_daemon_selects_the_configured_speech_backend(tmp_path, monkeypatch, engine, voice, factory, fake):
+    import ai_phone.daemon
+    from ai_phone.config import TtsConfig
+
+    made = []
+
+    class Recorder:
+        def __init__(self, name, factory, *args, **kwargs):
+            made.append((name, factory, kwargs.get("factory_args")))
+
+        async def start(self):
+            raise RuntimeError("workers selected")
+
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    monkeypatch.setattr(ai_phone.daemon, "WorkerClient", Recorder)
+    cfg = Config(tts=TtsConfig(engine=engine, voice=voice))
+    with pytest.raises(SystemExit):
+        asyncio.run(Daemon(cfg, "t4", tmp_path, lan=True, fake=fake).run())
+    assert ("tts", "ai_phone.services.backends.fake:FakeTTS" if fake else factory,
+            None if fake else {"voice": voice, "speed": 1.0}) in made
+
+
 @pytest.mark.asyncio
 async def test_a_turn_still_speaking_when_the_call_ends_is_written_with_what_was_said(tmp_path, monkeypatch):
     """The teardown record goes through the controller, so it carries the agent's words and the ring counters; it

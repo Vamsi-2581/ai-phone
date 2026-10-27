@@ -7,10 +7,19 @@ pytestmark = pytest.mark.integration
 SYS = "You are ai-phone, a phone assistant. Answer in one short sentence."
 
 
-def test_streams_reply_without_thinking_and_reports_timings():
-    from ai_phone.services.backends.mlx_lm_backend import make_t9
+def cached_llm(tier):
+    from ai_phone import models
+    from ai_phone.services.backends.mlx_lm_backend import make_llm
 
-    llm = make_t9()
+    repo = models.repo_for(tier)
+    if models.local_path(repo) is None:
+        pytest.skip(f"not downloaded: {repo}")
+    return make_llm(repo)
+
+
+@pytest.mark.parametrize("tier", ["t4", "t9"])
+def test_streams_reply_without_thinking_and_reports_timings(tier):
+    llm = cached_llm(tier)
     t = llm.warmup(SYS)
     assert t["warm_ms"] > 0
     toks = list(llm.stream(3, [{"role": "system", "content": SYS}, {"role": "user", "content": "Say hello in five words."}], 60))
@@ -19,10 +28,9 @@ def test_streams_reply_without_thinking_and_reports_timings():
     assert llm.last_timings["tokens"] >= 3 and llm.last_timings["first_token_ms"] > 0
 
 
-def test_cancel_stops_stream_early():
-    from ai_phone.services.backends.mlx_lm_backend import make_t9
-
-    llm = make_t9()
+@pytest.mark.parametrize("tier", ["t4", "t9"])
+def test_cancel_stops_stream_early(tier):
+    llm = cached_llm(tier)
     llm.warmup(SYS)
     out = []
     for tok in llm.stream(4, [{"role": "system", "content": SYS}, {"role": "user", "content": "Count slowly from one to fifty."}], 200):

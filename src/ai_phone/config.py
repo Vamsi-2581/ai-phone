@@ -38,6 +38,8 @@ SIP_URI_RE = re.compile(rf"^sip:{_HOST}(?::[0-9]{{1,5}})?(?:;transport=(?:udp|tc
 AOR_RE = re.compile(rf"^sip:[A-Za-z0-9._-]{{1,64}}@{_HOST}(?::[0-9]{{1,5}})?$")
 DISPLAY_RE = re.compile(r"^[\x20\x21\x23-\x5b\x5d-\x7e]{1,64}$")  # printable ASCII without '"' and '\'
 CIDR_RE = re.compile(r"^[0-9a-fA-F:.]+(/[0-9]{1,3})?$")
+TtsEngine = Literal["kokoro", "phonon"]
+TTS_ENGINES = typing.get_args(TtsEngine)
 
 
 @dataclass
@@ -162,6 +164,7 @@ class BrainConfig:
 class TtsConfig:
     voice: str = "af_heart"  # an English Kokoro voice: af_/am_ American, bf_/bm_ British
     speed: float = 1.0
+    engine: TtsEngine = "kokoro"
 
 
 @dataclass
@@ -489,9 +492,13 @@ def validate_config(cfg: Config, env: Mapping[str, str] | None = None) -> list[s
             _require(bool(CLI_RE.fullmatch(br.cli)), "config.brain.cli: expected a command name or a path to one")
     from ai_phone import voices
     t = cfg.tts
-    _require(bool(voices.VOICE_RE.fullmatch(t.voice)), f"config.tts.voice: {t.voice!r} is not an English voice (like af_heart or bm_george)")
-    _require(0.5 <= t.speed <= 2.0, "config.tts.speed: must be between 0.5 and 2.0")
-    if t.voice != voices.DEFAULT:  # the default ships with every copy of the model; only look on disk for the others
+    if t.engine == "phonon":
+        _require(t.voice == voices.PHONON_DEFAULT, "config.tts.voice: Phonon uses the bundled voice 'default'")
+        _require(t.speed == 1.0, "config.tts.speed: Phonon supports only 1.0")
+    else:
+        _require(bool(voices.VOICE_RE.fullmatch(t.voice)), f"config.tts.voice: {t.voice!r} is not an English voice (like af_heart or bm_george)")
+        _require(0.5 <= t.speed <= 2.0, "config.tts.speed: must be between 0.5 and 2.0")
+    if t.engine == "kokoro" and t.voice != voices.DEFAULT:  # only Kokoro has a choice of installed voices
         installed = voices.installed_voices()
         if not installed:
             warnings.append(f"config.tts.voice: {t.voice} cannot be checked until the speech model is downloaded (ai-phone models pull)")

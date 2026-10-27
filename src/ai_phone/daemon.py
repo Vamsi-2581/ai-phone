@@ -26,6 +26,7 @@ from ai_phone.pipeline.vad import Endpointer, EnergyVad, SileroVad
 from ai_phone.secrets import load_secrets, redact
 from ai_phone.services.client import WorkerClient, is_secret_env
 from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, untag_frame
+from ai_phone.services.tts import tts_factory
 from ai_phone.telephony import events as ev
 from ai_phone.telephony.endpoint import BusyError, DialError, LineSpec, Telephony
 from ai_phone.telephony.rings import FrameRing
@@ -245,7 +246,7 @@ class Daemon:
         spec = llm_worker(self.cfg, self.tier, self.fake, default_prompt, self.secrets, wa)
         llm = WorkerClient("llm", spec["factory"], loop, None, None, spec["warm_args"],
                            factory_args=spec["factory_args"], keep_warm_sec=spec["keep_warm_sec"])
-        tts = WorkerClient("tts", F["tts"], loop, None, tts_out, dict(wa),
+        tts = WorkerClient("tts", F["tts"] if self.fake else tts_factory(self.cfg.tts.engine), loop, None, tts_out, dict(wa),
                            factory_args=None if self.fake else {"voice": self.cfg.tts.voice, "speed": self.cfg.tts.speed}, keep_warm_sec=kw)
         tel: Telephony | None = None
         control: ControlServer | None = None
