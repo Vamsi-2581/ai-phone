@@ -1,10 +1,12 @@
 import asyncio
 import json
 import os
+import time
+from pathlib import Path
 
 import pytest
 
-from ai_phone.services.backends.fake import FakeLLM
+from ai_phone.services.backends.fake import FakeLLM, FakeTTS
 from ai_phone.services.client import WorkerClient
 from ai_phone.services.errors import BrainError
 from ai_phone.services.ipc import STT_IN_FRAME, TTS_OUT_FRAME, tag_frame, untag_frame
@@ -75,6 +77,115 @@ async def test_tts_worker_writes_frames_to_ring():
     finally:
         out.close()
         out.unlink()
+
+
+class OrderedTTS(FakeTTS):
+    """Immediate numbered frames make loss, reordering and generator cleanup observable across the pipe."""
+    def __init__(self, closed_path=None):
+        super().__init__()
+        self.closed_path = closed_path
+
+    def stream(self, gen_id, seq, text):
+        try:
+            for i in range(int(text)):
+                if gen_id in self._cancelled:
+                    return
+                yield (i + 1).to_bytes(2, "little") * 320
+        finally:
+            if self.closed_path:
+                with Path(self.closed_path).open("a") as f:
+                    f.write(f"{gen_id}\n")
+
+
+ORDERED_TTS = "tests.unit.test_worker_ipc:OrderedTTS"
+
+
+async def _read_speech(client, ring, gen, *, delay=0.01):
+    frames, announced = [], 0
+    done = False
+    while not done or ring.available():
+        if not done:
+            event = await asyncio.wait_for(client.events.get(), 5)
+            assert event["ev"] != "error", event
+            assert event.get("gen") == gen
+            announced += event.get("nframes", 0)
+            done = event["ev"] == "done"
+        while (frame := ring.pop()) is not None:
+            frame_gen, payload = untag_frame(frame)
+            assert frame_gen == gen
+            frames.append(payload)
+            await asyncio.sleep(delay)
+    return frames, announced
+
+
+@pytest.mark.asyncio
+async def test_fast_tts_waits_for_small_ring_without_losing_or_reordering_frames():
+    ring = FrameRing(None, 2, frame_bytes=TTS_OUT_FRAME)  # smaller than a normal five-frame chunk notification
+    c = WorkerClient("tts", ORDERED_TTS, asyncio.get_running_loop(), None, ring, {})
+    try:
+        await c.start()
+        gen = c.next_gen()
+        c.send({"op": "tts.synth", "gen": gen, "seq": 0, "text": "40"})
+        frames, announced = await asyncio.wait_for(_read_speech(c, ring, gen), 8)
+        assert frames == [(i + 1).to_bytes(2, "little") * 320 for i in range(40)]
+        assert announced == 40 and ring.overruns == 0
+    finally:
+        await c.stop()
+        ring.close()
+        ring.unlink()
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_tts_ring_is_full_closes_generator_and_allows_next_generation(tmp_path):
+    ring = FrameRing(None, 2, frame_bytes=TTS_OUT_FRAME)
+    closed = tmp_path / "closed"
+    c = WorkerClient("tts", ORDERED_TTS, asyncio.get_running_loop(), None, ring, {},
+                     factory_args={"closed_path": str(closed)})
+    try:
+        await c.start()
+        gen = c.next_gen()
+        c.send({"op": "tts.synth", "gen": gen, "seq": 0, "text": "1000"})
+        await _collect(c, "chunk", gen)
+        assert ring.available() == 2
+        c.cancel(gen)
+        await _collect(c, "done", gen)
+        assert closed.read_text().splitlines() == [str(gen)]
+        assert ring.overruns == 0
+        ring.flush()
+        # A stale clause queued after cancellation is ignored, and the next generation still streams.
+        c.send({"op": "tts.synth", "gen": gen, "seq": 1, "text": "1000"})
+        new_gen = c.next_gen()
+        c.send({"op": "tts.synth", "gen": new_gen, "seq": 0, "text": "6"})
+        frames, _ = await _read_speech(c, ring, new_gen)
+        assert frames == [(i + 1).to_bytes(2, "little") * 320 for i in range(6)]
+        assert closed.read_text().splitlines() == [str(gen), str(new_gen)]
+    finally:
+        await c.stop()
+        ring.close()
+        ring.unlink()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_while_tts_ring_is_full_exits_without_forced_kill(tmp_path):
+    ring = FrameRing(None, 2, frame_bytes=TTS_OUT_FRAME)
+    closed = tmp_path / "closed"
+    c = WorkerClient("tts", ORDERED_TTS, asyncio.get_running_loop(), None, ring, {},
+                     factory_args={"closed_path": str(closed)})
+    try:
+        await c.start()
+        gen = c.next_gen()
+        c.send({"op": "tts.synth", "gen": gen, "seq": 0, "text": "1000"})
+        await _collect(c, "chunk", gen)
+        before = time.monotonic()
+        await c.stop()
+        assert time.monotonic() - before < 2
+        assert c._proc.exitcode == 0
+        assert closed.read_text().splitlines() == [str(gen)]
+    finally:
+        if c._proc is not None and c._proc.is_alive():
+            await c.stop()
+        ring.close()
+        ring.unlink()
 
 
 @pytest.mark.asyncio

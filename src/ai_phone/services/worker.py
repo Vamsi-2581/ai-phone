@@ -52,6 +52,52 @@ def _drain_cancel(conn, cancelled: set[int], backend, gen: int, pending: list[di
     return gen in cancelled
 
 
+def _tts_stopped(conn, cancelled: set[int], backend, gen: int, pending: list[dict]) -> bool:
+    if conn.poll(0):
+        _drain_cancel(conn, cancelled, backend, gen, pending)
+    return gen in cancelled or any(m.get("op") == "shutdown" for m in pending)
+
+
+def _synth(conn, backend, out: FrameRing, msg: dict, cancelled: set[int], pending: list[dict]) -> None:
+    """Apply backpressure in this worker, keeping the media thread free to consume at its own pace."""
+    gen, seq = msg["gen"], msg["seq"]
+    if _tts_stopped(conn, cancelled, backend, gen, pending):
+        return
+    source = backend.stream(gen, seq, msg["text"])
+    unannounced = 0
+    batch = min(5, out.frames)
+
+    def announce() -> None:
+        nonlocal unannounced
+        if unannounced:
+            ipc.send(conn, {"ev": "chunk", "gen": gen, "seq": seq, "nframes": unannounced})
+            unannounced = 0
+
+    try:
+        for frame in source:
+            if _tts_stopped(conn, cancelled, backend, gen, pending):
+                break
+            while out.available() >= out.frames:
+                # Startup phrase caching drains in response to events, including when the ring is smaller
+                # than the usual batch. Announce every queued frame before waiting for the consumer.
+                announce()
+                conn.poll(0.01)
+                if _tts_stopped(conn, cancelled, backend, gen, pending):
+                    break
+            if _tts_stopped(conn, cancelled, backend, gen, pending):
+                break
+            out.push(tag_frame(gen, frame))
+            unannounced += 1
+            if unannounced >= batch:
+                announce()
+    finally:
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
+    announce()
+    ipc.send(conn, {"ev": "done", "gen": gen, "seq": seq, "timings": getattr(backend, "last_timings", {})})
+
+
 def _keep_warm(kind: str, backend) -> float:
     """One tiny inference on an idle worker. On a host that is short of memory macOS compresses whatever was used least
     recently; a model that answers a call every few hours is exactly that, and the first turn then waits seconds for
@@ -194,17 +240,7 @@ def run_worker(kind: str, backend_factory: str, conn, audio_in_name, audio_out_n
                 ipc.send(conn, {"ev": "done", "gen": gen, "timings": getattr(backend, "last_timings", {})})
                 _trim_memory()
             elif op == "tts.synth":
-                n = 0
-                for frame in backend.stream(gen, msg["seq"], msg["text"]):
-                    if gen in cancelled or (conn.poll(0) and _drain_cancel(conn, cancelled, backend, gen, pending)):
-                        break
-                    aout.push(tag_frame(gen, frame))
-                    n += 1
-                    if n % 5 == 0:
-                        ipc.send(conn, {"ev": "chunk", "gen": gen, "seq": msg["seq"], "nframes": 5})
-                if n % 5:
-                    ipc.send(conn, {"ev": "chunk", "gen": gen, "seq": msg["seq"], "nframes": n % 5})
-                ipc.send(conn, {"ev": "done", "gen": gen, "seq": msg["seq"], "timings": getattr(backend, "last_timings", {})})
+                _synth(conn, backend, aout, msg, cancelled, pending)
                 _trim_memory()
     except BrainError as e:
         # A brain that will not warm up or will not prepare fails here, outside the per-turn handler. Only the kind

@@ -80,7 +80,8 @@ class TurnController:
         self.apology_frames, self.goodbye_frames = list(apology_frames), list(goodbye_frames)
         self.opening_frames, self.direction = opening_frames, direction
         self._brain_errors = 0  # consecutive brain failures in this call; reset by a completed turn
-        self._after_flush: list[bytes] = []  # cached frames queued while the PJSIP thread still owes us a flush
+        self._after_flush: list[bytes] = []  # cached frames waiting for a flush or room in the playback ring
+        self._tts_pending: bytes | None = None  # one tagged frame waiting for room, checked again after a gen change
         self._drain_deadline_ns: int | None = None  # ENDING_DRAIN: hang up once tx is empty or this passes
         self._rx_dump = open(f"{_DEBUG_RX}-{int(time.time())}.raw", "wb") if _DEBUG_RX else None
         self.replies = replies or ModelReplies()
@@ -106,6 +107,7 @@ class TurnController:
         for c in (self.stt, self.llm, self.tts):
             c.set_gen(g)
         self._seq, self._tts_done_seq, self._llm_done, self._reply_parts = 0, -1, False, []
+        self._tts_pending = None
         self._pending_stt = 0
         return g
 
@@ -275,8 +277,7 @@ class TurnController:
 
     async def run(self, stop: asyncio.Event) -> None:
         self.state = "OUTBOUND_OPENING" if self.opening_frames is not None else "GREETING"
-        for f in (self.opening_frames if self.opening_frames is not None else self.greeting):
-            self.tx.push(f)
+        self._queue_cached(self.opening_frames if self.opening_frames is not None else self.greeting)
         self._line("agent", self.opening_text)
         self._new_gen()
         self._start_ns = time.monotonic_ns()
@@ -288,16 +289,18 @@ class TurnController:
                 now = time.monotonic_ns()
                 while (f := self.rx.pop()) is not None:
                     self._on_frame(f, now)
-                self._pump_tts_out()
                 self._push_after_flush()
+                self._pump_tts_out()
                 self._drain_worker_events()
                 self._pump_says(now)
-                if self.state in OPENING and self.tx.available() == 0:
+                if self.state in OPENING and self.tx.available() == 0 and not self._after_flush:
                     self._greeting_over(now)
                 playing = getattr(self.port, "playing", None)
                 if playing is not None:
                     self.port.playing = self.state in OPENING or self.state == "SPEAKING"
-                if self.state == "SPEAKING" and self._llm_done and self._tts_done_seq >= self._seq - 1 and self.tx.available() == 0:
+                if (self.state == "SPEAKING" and self._llm_done and self._tts_done_seq >= self._seq - 1
+                        and self.tx.available() == 0 and self.tts_out.available() == 0
+                        and self._tts_pending is None and not self._after_flush):
                     self._finish_turn()
                 if self.state == "ENDING_DRAIN" and ((self.tx.available() == 0 and not self._after_flush and not self._flush_pending())
                                                      or now >= self._drain_deadline_ns):
@@ -314,8 +317,7 @@ class TurnController:
         idle_s = (now - self.last_activity_ns) / 1e9
         if self.state == "LISTENING" and not self._prompted and idle_s >= self.cfg.silence_prompt_sec \
                 and self._relay_wait_from is None:
-            for f in self.prompt_frames:
-                self.tx.push(f)
+            self._queue_cached(self.prompt_frames)
             self._prompted = True
             self.last_activity_ns = now
         elif self.state == "LISTENING" and self._prompted and idle_s >= self.cfg.silence_hangup_sec \
@@ -333,8 +335,7 @@ class TurnController:
         elapsed_s = (now - self._start_ns) / 1e9
         warn_at = self.cfg.max_call_sec - (30 if self.cfg.max_call_sec > 30 else 0.5)
         if not self._warned and elapsed_s >= warn_at:
-            for f in self.warning_frames:
-                self.tx.push(f)
+            self._queue_cached(self.warning_frames)
             self._warned = True
         if elapsed_s >= self.cfg.max_call_sec:
             self.request_end("max_duration")
@@ -423,8 +424,7 @@ class TurnController:
         if self._opening_pending:  # the model's first sentence follows the disclosure without a gap
             self.port.arm_t5()
             had_audio = bool(self._held)
-            for f in self._held:
-                self.tx.push(f)
+            self._queue_cached(self._held)
             self._held = []
             if self._llm_done and self._seq == 0:
                 self._finish_turn()  # the model had nothing to add
@@ -480,21 +480,21 @@ class TurnController:
         return bool(getattr(self.port, "flush_pending", False))
 
     def _queue_cached(self, frames: list[bytes]) -> None:
-        """Cached phrases pushed right after a flush request would be discarded by the deferred flush; hold them."""
-        if self._flush_pending():
-            self._after_flush.extend(frames)
-        else:
-            for f in frames:
-                self.tx.push(f)
+        """Preserve cached audio until the flush is acknowledged and playback has room for it."""
+        self._after_flush.extend(frames)
+        self._push_after_flush()
 
     def _push_after_flush(self) -> None:
         if self._after_flush and not self._flush_pending():
-            for f in self._after_flush:
+            count = min(len(self._after_flush), self.tx.frames - self.tx.available())
+            for f in self._after_flush[:count]:
                 self.tx.push(f)
-            self._after_flush = []
+            del self._after_flush[:count]
 
     def _flush_tx(self) -> None:
         """The PJSIP thread is the tx ring's consumer, so it performs the flush; a stub port flushes directly."""
+        self._after_flush = []
+        self._tts_pending = None
         req = getattr(self.port, "request_flush", None)
         if req is not None:
             req()
@@ -642,7 +642,12 @@ class TurnController:
 
     def _pump_tts_out(self) -> None:
         cur = self.tts.current_gen & 0xFFFFFFFF
-        while (f := self.tts_out.pop()) is not None:
+        while True:
+            f, self._tts_pending = self._tts_pending, None
+            if f is None:
+                f = self.tts_out.pop()
+            if f is None:
+                break
             g, payload = untag_frame(f)
             if g != cur:
                 continue  # audio from a cancelled generation is dropped here, whatever its timing
@@ -654,6 +659,9 @@ class TurnController:
             if self.state in OPENING:
                 self._held.append(payload)  # the model's opening waits for the disclosure to finish
             else:
+                if self._flush_pending() or self._after_flush or self.tx.available() >= self.tx.frames:
+                    self._tts_pending = f
+                    break
                 self.tx.push(payload)
         # accept the port's stamp only once this turn has sent TTS (t3), so a previous turn's stamp is never reused
         if (self.timer is not None and self.timer.t5 is None and self.timer.t3 is not None

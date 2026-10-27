@@ -171,17 +171,17 @@ class Daemon:
     async def _cache_phrase(self, tts: WorkerClient, ring: FrameRing, text: str) -> list[bytes]:
         gen = tts.next_gen()
         tts.send({"op": "tts.synth", "gen": gen, "seq": 0, "text": text})
+        frames = []
         while True:
             m = await asyncio.wait_for(tts.events.get(), 120)
             if m["ev"] == "error":
                 raise RuntimeError(f"TTS worker failed while caching a phrase: {m.get('message', '')[:200]}")
+            while (f := ring.pop()) is not None:
+                g, payload = untag_frame(f)
+                if g == (gen & 0xFFFFFFFF):
+                    frames.append(payload)
             if m["ev"] == "done" and m["gen"] == gen:
                 break
-        frames = []
-        while (f := ring.pop()) is not None:
-            g, payload = untag_frame(f)
-            if g == (gen & 0xFFFFFFFF):
-                frames.append(payload)
         return frames
 
     # ---- lines -----------------------------------------------------------------------------------

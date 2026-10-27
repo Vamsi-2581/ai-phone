@@ -28,6 +28,145 @@ class StubPort:
         self.first_nonsilent_ns = None
 
 
+class IdleWorker:
+    def __init__(self):
+        self.current_gen = 0
+        self.events = asyncio.Queue()
+
+    def set_gen(self, gen):
+        self.current_gen = gen
+
+    def cancel(self, gen):
+        pass
+
+    def send(self, msg):
+        pass
+
+
+@pytest.fixture
+def small_buffers():
+    rx, tx = FrameRing(None, 2), FrameRing(None, 2)
+    stt_in = FrameRing(None, 2, frame_bytes=STT_IN_FRAME)
+    tts_out = FrameRing(None, 10, frame_bytes=TTS_OUT_FRAME)
+    workers = [IdleWorker() for _ in range(3)]
+    turns = []
+    tc = TurnController(ConversationConfig(), StubPort(tx), *workers, rx, tx, stt_in, tts_out,
+                        Endpointer(EnergyVad()), [], "system", turns.append)
+    yield tc, turns
+    for ring in (rx, tx, stt_in, tts_out):
+        ring.close()
+        ring.unlink()
+
+
+def test_playback_full_keeps_tts_frames_in_order_without_overruns(small_buffers):
+    tc, _ = small_buffers
+    tc.state = "SPEAKING"
+    frames = [(i + 1).to_bytes(2, "little") * 320 for i in range(8)]
+    for frame in frames:
+        tc.tts_out.push(tag_frame(0, frame))
+    tc._pump_tts_out()
+    assert tc.tx.available() == 2 and tc._tts_pending is not None
+    heard = []
+    for _ in frames:
+        heard.append(tc.tx.pop())
+        tc._pump_tts_out()
+    assert heard == frames
+    assert tc.tx.overruns == 0 and tc.tts_out.overruns == 0
+    assert tc.tts_out.available() == 0 and tc._tts_pending is None
+
+
+def test_stale_pending_audio_is_discarded_even_while_playback_is_full(small_buffers):
+    tc, _ = small_buffers
+    tc.state = "SPEAKING"
+    old, new = b"\x01\x00" * 320, b"\x02\x00" * 320
+    tc.tx.push(old)
+    tc.tx.push(old)
+    tc.tts_out.push(tag_frame(0, old))
+    tc._pump_tts_out()
+    tc.tts.set_gen(1)  # pending frame is still tagged 0; the pump must not block on it
+    tc.tts_out.push(tag_frame(0, old))
+    tc.tts_out.push(tag_frame(1, new))
+    tc._pump_tts_out()
+    assert tc.tts_out.available() == 0
+    assert untag_frame(tc._tts_pending) == (1, new)
+    tc.tx.flush()
+    tc._pump_tts_out()
+    assert tc.tx.pop() == new and tc.tx.pop() is None
+
+
+@pytest.mark.asyncio
+async def test_done_waits_until_all_buffered_tts_has_played(small_buffers):
+    tc, turns = small_buffers
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        await asyncio.sleep(0.02)
+        tc.state = "SPEAKING"
+        tc.timer = TurnTimer(gen=tc.tts.current_gen)
+        tc._seq, tc._tts_done_seq, tc._llm_done = 1, 0, True
+        tc._reply_parts = ["Complete reply."]
+        frames = [(i + 1).to_bytes(2, "little") * 320 for i in range(8)]
+        for frame in frames:
+            tc.tts_out.push(tag_frame(tc.tts.current_gen, frame))
+        heard = []
+        for _ in frames:
+            await asyncio.sleep(0.02)
+            assert turns == []
+            heard.append(tc.tx.pop())
+        await asyncio.sleep(0.02)
+        assert heard == frames and len(turns) == 1
+        assert tc.state == "LISTENING" and tc.tx.overruns == 0
+    finally:
+        stop.set()
+        await runner
+
+
+@pytest.mark.asyncio
+async def test_long_cached_greeting_waits_for_playback_capacity(small_buffers):
+    tc, _ = small_buffers
+    tc.greeting = [(i + 1).to_bytes(2, "little") * 320 for i in range(8)]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(tc.run(stop))
+    try:
+        heard = []
+        for _ in tc.greeting:
+            await asyncio.sleep(0.02)
+            assert tc.state == "GREETING"
+            heard.append(tc.tx.pop())
+        await asyncio.sleep(0.02)
+        assert heard == tc.greeting and tc.tx.overruns == 0
+        assert tc.state == "LISTENING" and tc._after_flush == []
+    finally:
+        stop.set()
+        await runner
+
+
+def test_interrupt_discards_cached_audio_waiting_for_capacity(small_buffers):
+    tc, _ = small_buffers
+    tc._queue_cached([b"\x01\x00" * 320] * 8)
+    assert tc._after_flush
+    tc._flush_tx()
+    tc._push_after_flush()
+    assert tc.tx.available() == 0 and tc._after_flush == []
+
+
+def test_held_model_opening_replays_in_order_through_small_playback_ring(small_buffers):
+    tc, _ = small_buffers
+    frames = [(i + 1).to_bytes(2, "little") * 320 for i in range(8)]
+    tc.state, tc._opening_pending = "OUTBOUND_OPENING", True
+    tc._held = list(frames)
+    tc.timer = TurnTimer(gen=0)
+    tc._seq = 1
+    tc._greeting_over(time.monotonic_ns())
+    assert tc.state == "SPEAKING"
+    heard = []
+    for _ in frames:
+        heard.append(tc.tx.pop())
+        tc._push_after_flush()
+    assert heard == frames and tc.tx.overruns == 0
+    assert tc._held == [] and tc._after_flush == []
+
+
 def speech_frames(seconds, amp=0.5):
     n = int(seconds * 16000)
     t = np.arange(n) / 16000.0

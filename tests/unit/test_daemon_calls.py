@@ -9,6 +9,28 @@ from ai_phone.telephony import events as ev
 from ai_phone.telephony.endpoint import LineSpec
 
 
+@pytest.mark.asyncio
+async def test_caching_a_phrase_larger_than_the_worker_ring_drains_during_generation(tmp_path, monkeypatch):
+    from ai_phone.services.client import WorkerClient
+    from ai_phone.services.ipc import TTS_OUT_FRAME
+    from ai_phone.telephony.rings import FrameRing
+    from tests.unit.test_worker_ipc import ORDERED_TTS
+
+    monkeypatch.setenv("AI_PHONE_HOME", str(tmp_path))
+    ring = FrameRing(None, 2, frame_bytes=TTS_OUT_FRAME)
+    tts = WorkerClient("tts", ORDERED_TTS, asyncio.get_running_loop(), None, ring, {})
+    try:
+        await tts.start()
+        daemon = Daemon(Config(), "t4", tmp_path, lan=True, fake=True)
+        frames = await asyncio.wait_for(daemon._cache_phrase(tts, ring, "40"), 5)
+        assert frames == [(i + 1).to_bytes(2, "little") * 320 for i in range(40)]
+        assert ring.overruns == 0 and ring.available() == 0
+    finally:
+        await tts.stop()
+        ring.close()
+        ring.unlink()
+
+
 class Tel:
     def __init__(self, pj_id=7):
         self.pj_id, self.calls, self.hung, self.answered = pj_id, [], [], []
