@@ -9,7 +9,7 @@ one that is not on this Mac: your own endpoint, or the Claude or ChatGPT plan yo
 **Status: Milestone 1 (latency proof) passed; Milestone 4 (get started: install script and setup wizard) complete, verified from a fresh clone; Milestones 2 (lines) and 3 (agent tool) code complete, their live gates pending.**
 English only, one call at a time. See `architecture-essentials.md` for how it works.
 
-## Milestone 1 numbers (Apple M5 Pro, 24 GB, 4B tier, 20 LAN calls over 8 kHz PCMU)
+## Historical Milestone 1 numbers (2026-09-03, Apple M5 Pro, 24 GB, 4B tier)
 
 | Measure | p50 | p95 |
 |---|---|---|
@@ -17,11 +17,17 @@ English only, one call at a time. See `architecture-essentials.md` for how it wo
 | Barge-in stop after the caller starts talking (5 interruptions) | 219 ms | 259 ms |
 | Endpoint wait / STT / LLM to first clause / TTS first chunk / egress | 297 / 96 / 312 / 164 / 9 ms | |
 
-"First audible" is measured from the last voice-active 20 ms frame of the caller to the first
+"First audible" is measured from the last voice-active chunk of the caller to the first
 non-silent RTP frame handed to the SIP stack; it includes the 300 ms endpoint wait. Add the phone's
 own jitter buffer (60–100 ms) for mouth-to-ear. Measured while the host was also swapping about
-10 GB of other applications; a quiet machine does better. Callers who talk over the greeting are
-heard in full.
+10 GB of other applications, over 20 LAN calls using 8 kHz PCMU. Callers who talk over the greeting
+are heard in full.
+
+A current-code rerun on **2026-10-26**, using the same Mac and model tier over 20 loopback PCMU
+calls, measured **1074 ms p50 / 1719 ms p95**. All 20 turns completed, but this run missed the
+1000 ms p50 gate. The host still held about 20 GB in swap and paged during the run; current
+default phone instructions also differ from M1. The historical result is retained separately.
+See the [rerun measurements and conditions](docs/latency-2026-10-26.md).
 
 ## Try it (macOS, Apple Silicon)
 
