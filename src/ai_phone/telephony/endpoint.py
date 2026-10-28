@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 import re
+import weakref
 from dataclasses import dataclass, field
 
 from ai_phone.config import AOR_RE, DISPLAY_RE, E164_RE, SIP_URI_RE, SIP_USER_RE, USER_RE, Config, LineConfig, host_of
@@ -17,6 +18,9 @@ from ai_phone.telephony.policy import PeerSet, build_peer_set
 from ai_phone.telephony.rings import FrameRing
 
 log = logging.getLogger("ai-phone.telephony")
+
+# pjsip/sip_errno.h; this error constant is not exposed by the pjsua2 SWIG binding.
+_SESSION_TERMINATED = 171140
 
 
 @dataclass
@@ -241,6 +245,7 @@ class Telephony:
         with self._call_lock:
             c = self.current_call
             if c is not None and c.getId() == call_id:
+                self._drop_answer_timeout(c)
                 self.current_call = None
                 return True
             return False
@@ -344,11 +349,22 @@ class Telephony:
         return ac
 
     # ---- call control -------------------------------------------------------------------------
-    def answer(self, call_id: int) -> None:
-        if self.current_call is not None and self.current_call.getId() == call_id:
-            op = pj.CallOpParam()
-            op.statusCode = pj.PJSIP_SC_OK
-            self.current_call.answer(op)
+    def answer(self, call_id: int) -> bool:
+        """False when the caller cancelled; the queued ended event still releases the claim."""
+        call = self.current_call
+        if call is None or call.getId() != call_id or call.ended or not call.isActive():
+            return False
+        op = pj.CallOpParam()
+        op.statusCode = pj.PJSIP_SC_OK
+        try:
+            call.answer(op)
+        except pj.Error as error:
+            if error.status != _SESSION_TERMINATED:
+                raise  # unrelated failures must not masquerade as a caller cancellation
+            # CANCEL can win after isActive(). Handle it here so its SWIG traceback
+            # never unwinds the daemon into endpoint destruction while holding Call.
+            return False
+        return True
 
     def hangup(self, call_id: int, code: int = 200) -> None:
         if self.current_call is not None and self.current_call.getId() == call_id:
@@ -406,7 +422,15 @@ class Telephony:
 
     def _call_ended(self, call: AiCall) -> None:
         """PJSIP thread: DISCONNECTED. Only the answer timer is dropped here; release_call() ends the claim."""
-        self.loop.call_soon_threadsafe(self._drop_answer_timeout, call)
+        # The loop may drain this callback after stop() destroys PJSIP. Its queue
+        # must not keep a native Call alive beyond that destruction.
+        self.loop.call_soon_threadsafe(self._drop_ended_timeout, weakref.ref(call))
+
+    @staticmethod
+    def _drop_ended_timeout(call_ref: weakref.ReferenceType[AiCall]) -> None:
+        call = call_ref()
+        if call is not None:
+            Telephony._drop_answer_timeout(call)
 
     def stop(self) -> None:
         with self._call_lock:

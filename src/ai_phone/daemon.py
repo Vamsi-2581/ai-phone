@@ -320,13 +320,15 @@ class Daemon:
                 r.unlink()
 
     # ---- call events (main loop) ------------------------------------------------------------------------
-    def _on_incoming(self, e: ev.IncomingCall, tel) -> CallRecord:
+    def _on_incoming(self, e: ev.IncomingCall, tel) -> CallRecord | None:
         """Relay mode when an AI is waiting in `listen` and no call is in progress; phone agent mode otherwise."""
         log.info("incoming on %s from %s (%s)", e.line_id, e.from_uri, e.source_ip)
+        if not tel.answer(e.call_id):
+            log.info("incoming call %s on %s ended before it could be answered", e.call_id, e.line_id)
+            return None
         mode = "relay" if self.calls.listening and self.calls.current is None else "agent"
         rec = self.calls.new(mode, "in", e.line_id, e.from_uri)
         rec.pj_call_id = e.call_id
-        tel.answer(e.call_id)
         if mode == "relay":
             self.calls.deliver_incoming(rec)
         self.active_call = {"call_id": e.call_id, "call": rec.id, "mode": mode, "line_id": e.line_id,

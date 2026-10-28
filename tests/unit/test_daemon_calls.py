@@ -35,6 +35,7 @@ class Tel:
     def __init__(self, pj_id=7):
         self.pj_id, self.calls, self.hung, self.answered = pj_id, [], [], []
         self.current_call_id = None
+        self.answer_result = True
 
     def make_call(self, line_id, to, timeout_sec):
         self.calls.append((line_id, to))
@@ -45,6 +46,7 @@ class Tel:
 
     def answer(self, call_id):
         self.answered.append(call_id)
+        return self.answer_result
 
     def release_call(self, call_id):
         return True
@@ -185,6 +187,76 @@ async def test_listen_waits_for_an_incoming_call_and_only_one_listener(tmp_path,
     await asyncio.wait_for(first, 1)
     assert rec.mode == "relay" and tel.answered == [3]
     assert out1.msgs[-1] == {"ok": True, "kind": "incoming", "call_id": rec.id, "line": "agents", "remote": "sip:caller@10.0.0.2"}
+
+
+@pytest.mark.asyncio
+async def test_an_incoming_call_cancelled_before_answer_creates_no_record_or_active_state(tmp_path, monkeypatch):
+    d, tel = daemon(tmp_path, monkeypatch), Tel()
+    tel.answer_result = False
+    writes = []
+    monkeypatch.setattr(d, "_write_state", lambda: writes.append(d.active_call))
+
+    rec = d._on_incoming(ev.IncomingCall(3, "agents", "sip:a@10.0.0.2", "10.0.0.2"), tel)
+
+    assert rec is None and tel.answered == [3]
+    assert d.calls.current is None and d.calls._records == {}
+    assert d.active_call is None and d._controllers == {} and d._outbound is None
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_an_incoming_call_is_answered_before_its_record_is_published(tmp_path, monkeypatch):
+    d, tel = daemon(tmp_path, monkeypatch), Tel()
+    answer = tel.answer
+
+    def checked_answer(call_id):
+        assert d.calls.current is None and d.calls._records == {} and d.active_call is None
+        return answer(call_id)
+
+    monkeypatch.setattr(tel, "answer", checked_answer)
+    rec = d._on_incoming(ev.IncomingCall(3, "agents", "sip:a@10.0.0.2", "10.0.0.2"), tel)
+
+    assert rec is d.calls.current and rec.pj_call_id == 3 and rec.mode == "agent"
+    assert tel.answered == [3] and d.active_call["call"] == rec.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended_before_next_call", [True, False])
+async def test_cancelled_incoming_call_keeps_relay_listener_for_the_next_call(
+        tmp_path, monkeypatch, ended_before_next_call):
+    d, tel, out = daemon(tmp_path, monkeypatch), CallTel(), Sink()
+    listener = asyncio.create_task(d._control({"cmd": "listen", "timeout_sec": 2}, out, ctx(tel)))
+    await asyncio.sleep(0)
+    assert d.calls.listening
+    cancelled = ev.CallStateChanged(3, "agents", "ended", 487, "Request Terminated")
+
+    try:
+        tel.answer_result = False
+        assert d._on_incoming(ev.IncomingCall(3, "agents", "sip:a@10.0.0.2", "10.0.0.2"), tel) is None
+        await asyncio.sleep(0)
+        assert not listener.done() and d.calls.listening and out.msgs == []
+        assert d.calls._records == {} and d.calls.current is None and d.active_call is None
+
+        if ended_before_next_call:
+            d._on_call_ended(cancelled, tel)
+            assert tel.released == [3] and d.calls.unread_ended() is None
+            assert d.calls.listening and not listener.done() and out.msgs == []
+
+        tel.answer_result = True
+        rec = d._on_incoming(ev.IncomingCall(4, "agents", "sip:b@10.0.0.3", "10.0.0.3"), tel)
+        if not ended_before_next_call:
+            d._on_call_ended(cancelled, tel)
+
+        await asyncio.wait_for(listener, 1)
+        assert tel.answered == [3, 4] and tel.released == [3]
+        assert d.calls.current is rec and not rec.is_ended and rec.mode == "relay" and rec.pj_call_id == 4
+        assert d.calls._records == {rec.id: rec} and d.calls.unread_ended() is None
+        assert d.active_call["call"] == rec.id and not d.calls.listening
+        assert out.msgs == [{"ok": True, "kind": "incoming", "call_id": rec.id,
+                             "line": "agents", "remote": "sip:b@10.0.0.3"}]
+    finally:
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
 
 
 @pytest.mark.asyncio
